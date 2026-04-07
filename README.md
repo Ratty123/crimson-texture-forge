@@ -10,7 +10,7 @@ It is built for people who need one place to:
 - rebuild final DDS output with controlled format, size, and mip settings
 - compare original and rebuilt DDS files side by side
 
-The app is intentionally focused on **safe, read-only archive access** and **loose-file texture workflows**. It does **not** patch, repack, or write back into `.pamt` / `.paz` archives.
+The app is intentionally focused on **safe, read-only archive access** and **loose-file texture workflows**. It does **not** patch, repack, or write back into `.pamt` / `.paz` archives. (for now)
 
 ## What The App Is For
 
