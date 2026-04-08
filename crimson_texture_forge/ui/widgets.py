@@ -625,6 +625,7 @@ class QuickStartDialog(QDialog):
               <li><b>Setup</b>: Click <b>Init Workspace</b> to create a clean folder layout. If you later change paths manually, use <b>Create Folders</b> to create any missing directories.</li>
               <li><b>texconv</b>: Set the <b>texconv.exe</b> path or use the built-in download button. DDS preview, DDS-to-PNG conversion, compare previews, and final DDS rebuild all depend on texconv.</li>
               <li><b>Paths</b>: Set <b>Original DDS root</b>, <b>PNG root</b>, and <b>Output root</b>. If you plan to convert DDS to PNG before <b>chaiNNer</b>, also set <b>Staging PNG root</b> or let the app choose its default.</li>
+              <li><b>Settings</b>: Open the <b>Settings</b> tab if you want to adjust theme, archive cache startup behavior, remembered pane sizes, or cleanup confirmations.</li>
               <li><b>Scan</b>: In the Workflow tab, click <b>Scan</b> so the app can count the DDS files that match the current filter.</li>
               <li><b>DDS Output</b>: Enable <b>Convert DDS to PNG before processing</b> if you want texconv to create PNG files first. If <b>chaiNNer</b> is disabled, <b>Start</b> will stop after PNG conversion.</li>
               <li><b>Start small</b>: Run a small folder or filtered subset first, then verify the result in <b>Compare</b>.</li>

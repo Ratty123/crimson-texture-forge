@@ -338,16 +338,25 @@ def save_archive_scan_cache(
     cache_root.mkdir(parents=True, exist_ok=True)
     cache_path = resolve_archive_scan_cache_path(package_root, cache_root)
     base_dir, sources = _collect_archive_scan_sources(package_root)
+    resolved_base_dir = base_dir.resolve()
+    pamt_rel_cache: Dict[Path, str] = {}
 
     rows = []
     total_entries = len(entries)
     update_every = 50_000 if total_entries >= 500_000 else 10_000 if total_entries >= 100_000 else 2_000
     for index, entry in enumerate(entries, start=1):
         raise_if_cancelled(stop_event)
+        pamt_rel_text = pamt_rel_cache.get(entry.pamt_path)
+        if pamt_rel_text is None:
+            try:
+                pamt_rel_text = entry.pamt_path.resolve().relative_to(resolved_base_dir).as_posix()
+            except (OSError, ValueError):
+                pamt_rel_text = entry.pamt_path.name
+            pamt_rel_cache[entry.pamt_path] = pamt_rel_text
         rows.append(
             (
                 entry.path,
-                _archive_relative_source_path(base_dir, entry.pamt_path),
+                pamt_rel_text,
                 int(entry.offset),
                 int(entry.comp_size),
                 int(entry.orig_size),
@@ -927,26 +936,27 @@ def parse_archive_pamt(pamt_path: Path, paz_dir: Optional[Path] = None) -> List[
         for _folder_hash, name_offset, file_start_index, folder_file_count in folders
         if folder_file_count > 0
     )
+    paz_files = [resolved_paz_dir / f"{paz_indices[index]}.paz" for index in range(len(paz_indices))]
 
     entries: List[ArchiveEntry] = []
+    folder_cursor = 0
     for entry_index, (name_offset, paz_offset, comp_size, orig_size, paz_index, flags) in enumerate(files):
         relative_path = resolver.get_full_path(name_offset).replace("\\", "/").strip("/")
         guessed_dir = ""
-        for start, end, candidate_dir in folder_ranges:
+        while folder_cursor < len(folder_ranges) and entry_index >= folder_ranges[folder_cursor][1]:
+            folder_cursor += 1
+        if folder_cursor < len(folder_ranges):
+            start, end, candidate_dir = folder_ranges[folder_cursor]
             if start <= entry_index < end:
                 guessed_dir = candidate_dir
-                break
-            if start > entry_index:
-                break
         full_path = f"{guessed_dir}/{relative_path}".strip("/") if guessed_dir else relative_path
-        if paz_index >= len(paz_indices):
+        if paz_index >= len(paz_files):
             raise ValueError(f"Invalid PAZ index {paz_index} for {pamt_path}")
-        paz_file = resolved_paz_dir / f"{paz_indices[paz_index]}.paz"
         entries.append(
             ArchiveEntry(
                 path=full_path,
                 pamt_path=pamt_path,
-                paz_file=paz_file,
+                paz_file=paz_files[paz_index],
                 offset=paz_offset,
                 comp_size=comp_size,
                 orig_size=orig_size,
@@ -1220,12 +1230,25 @@ def archive_entry_structure_prefixes(entry: ArchiveEntry) -> Tuple[str, ...]:
 
 def build_archive_structure_children_map(entries: Sequence[ArchiveEntry]) -> Dict[str, List[Tuple[str, int]]]:
     child_counts: Dict[str, Dict[str, int]] = defaultdict(dict)
+    package_dir_cache: Dict[Path, str] = {}
 
     for entry in entries:
-        parts = archive_entry_folder_parts(entry)
+        package_dir = package_dir_cache.get(entry.pamt_path)
+        if package_dir is None:
+            package_dir = entry.pamt_path.parent.name.strip().lower() or "package"
+            package_dir_cache[entry.pamt_path] = package_dir
+        raw_parts = [
+            part.lower()
+            for part in entry.path.replace("\\", "/").split("/")
+            if part not in {"", ".", ".."}
+        ]
+        if raw_parts:
+            raw_parts.pop()
+        parts = [package_dir, *raw_parts]
         parent = ""
-        for index in range(len(parts)):
-            child_value = "/".join(parts[: index + 1])
+        child_value = ""
+        for part in parts:
+            child_value = f"{child_value}/{part}" if child_value else part
             parent_counts = child_counts[parent]
             parent_counts[child_value] = parent_counts.get(child_value, 0) + 1
             parent = child_value
@@ -1250,24 +1273,44 @@ def build_archive_tree_index(
     Dict[Tuple[str, ...], List[int]],
 ]:
     child_folder_sets: Dict[Tuple[str, ...], Dict[Tuple[str, ...], str]] = defaultdict(dict)
-    direct_files: Dict[Tuple[str, ...], List[int]] = defaultdict(list)
+    direct_files: Dict[Tuple[str, ...], List[Tuple[str, int]]] = defaultdict(list)
     folder_entry_indexes: Dict[Tuple[str, ...], List[int]] = defaultdict(list)
+    folder_key_cache: Dict[str, Tuple[str, ...]] = {"": ()}
+    folder_hierarchy_cache: Dict[Tuple[str, ...], Tuple[Tuple[Tuple[str, ...], Tuple[str, ...], str], ...]] = {(): ()}
 
     for index, entry in enumerate(entries):
-        parts = archive_entry_path_parts(entry)
-        if not parts:
+        normalized_path = entry.path.replace("\\", "/")
+        folder_text, _, basename = normalized_path.rpartition("/")
+        if not basename:
+            basename = normalized_path
+        folder_key = folder_key_cache.get(folder_text)
+        if folder_key is None:
+            folder_key = tuple(
+                part
+                for part in folder_text.split("/")
+                if part not in {"", ".", ".."}
+            )
+            folder_key_cache[folder_text] = folder_key
+        if not folder_key and basename in {"", ".", ".."}:
             continue
 
-        folder_key = parts[:-1]
-        direct_files[folder_key].append(index)
+        direct_files[folder_key].append((basename.lower(), index))
         folder_entry_indexes[()].append(index)
-
-        parent_key: Tuple[str, ...] = ()
-        for depth, part in enumerate(folder_key):
-            child_key = folder_key[: depth + 1]
+        hierarchy = folder_hierarchy_cache.get(folder_key)
+        if hierarchy is None:
+            parent_key: Tuple[str, ...] = ()
+            built_hierarchy: List[Tuple[Tuple[str, ...], Tuple[str, ...], str]] = []
+            child_key_parts: List[str] = []
+            for part in folder_key:
+                child_key_parts.append(part)
+                child_key = tuple(child_key_parts)
+                built_hierarchy.append((parent_key, child_key, part))
+                parent_key = child_key
+            hierarchy = tuple(built_hierarchy)
+            folder_hierarchy_cache[folder_key] = hierarchy
+        for parent_key, child_key, part in hierarchy:
             child_folder_sets[parent_key][child_key] = part
             folder_entry_indexes[child_key].append(index)
-            parent_key = child_key
 
     def folder_sort_key(item: Tuple[Tuple[str, ...], str]) -> Tuple[int, int, str]:
         _child_key, leaf = item
@@ -1285,11 +1328,15 @@ def build_archive_tree_index(
     direct_files_by_folder = {
         folder_key: sorted(
             indexes,
-            key=lambda idx: entries[idx].basename.lower(),
+            key=lambda item: item[0],
         )
         for folder_key, indexes in direct_files.items()
     }
-    return child_folders, direct_files_by_folder, dict(folder_entry_indexes)
+    direct_file_indexes = {
+        folder_key: [index for _basename, index in sorted_items]
+        for folder_key, sorted_items in direct_files_by_folder.items()
+    }
+    return child_folders, direct_file_indexes, dict(folder_entry_indexes)
 
 
 def prepare_archive_browser_state(

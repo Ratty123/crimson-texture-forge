@@ -1,55 +1,40 @@
 # Crimson Texture Forge
 
-Crimson Texture Forge is a Windows desktop tool for **Crimson Desert texture workflows**.
+Windows desktop tool for **Crimson Desert texture workflows** and supporting archive/text-search tasks.
 
 Project changelog: [CHANGELOG.md](CHANGELOG.md)
 
-It is built for people who need one place to:
+Crimson Texture Forge is built for modders who want one place to:
 
-- browse and extract assets from Crimson Desert archives
-- convert loose DDS files to PNG with `texconv`
-- optionally run an external upscale step through `chaiNNer`
+- browse and extract files from `.pamt` / `.paz` archives
+- bulk convert DDS to PNG with `texconv`
+- optionally run bulk upscaling through `chaiNNer`
 - rebuild final DDS output with controlled format, size, and mip settings
-- compare original and rebuilt DDS files side by side
+- compare original vs rebuilt DDS files
+- search archive or loose text-like files such as `.xml`, `.json`, `.cfg`, and `.lua`
 
-The app is intentionally focused on **safe, read-only archive access** and **loose-file texture workflows**. It does **not** patch, repack, or write back into `.pamt` / `.paz` archives. (for now)
+The app is intentionally focused on **read-only archive access** and **loose-file workflows**. It does **not** repack or write back into game archives.
 
-## What The App Is For
+## Highlights
 
-Crimson Texture Forge is meant for workflows like:
-
-1. Extract DDS textures from Crimson Desert archives
-2. Convert them to PNG
-3. Optionally upscale or edit those PNG files
-4. Rebuild DDS output with `texconv`
-5. Review the result in the built-in compare view
-
-It is useful whether you:
-
-- already have loose DDS files
-- want to extract DDS files from archives first
-- want to use `chaiNNer`
-- want to skip `chaiNNer` and only prepare PNG files
-
-## Core Features
-
-- Read-only `.pamt` / `.paz` archive browser
-- Archive extraction to normal folders
+- Read-only archive browser for Crimson Desert `.pamt` / `.paz`
+- Archive extraction to normal folders with preserved structure
 - Archive cache for faster repeated scans
-- Read-only text search across archive or loose text-like files, with syntax-colored preview, line numbers, local find controls, export, and encrypted archive XML support where decryption succeeds
-- DDS preview and compare support through `texconv`
-- Loose DDS scanning and filtering
+- Text Search tab with syntax-colored preview, line numbers, local find controls, and export of matched files
+- Support for searching many encrypted archive XML files through deterministic ChaCha20 decryption where supported
+- Loose DDS scan/filter workflow
 - Optional DDS-to-PNG conversion before processing
 - Optional `chaiNNer` stage before DDS rebuild
-- Configurable DDS output:
-  - match original format
-  - custom format
-  - original size, PNG size, or custom size
-  - original mip count, full chain, single mip, or custom mip count
-- Texture rules and include filters
+- DDS rebuild with configurable format, size, and mip behavior
+- Side-by-side compare view for original vs rebuilt DDS
 - Local auto-save config beside the EXE
-- Profile export/import
-- Diagnostic bundle export
+- Profile export/import and diagnostic bundle export
+
+## Recent Performance Work
+
+Archive refresh and cache build were heavily optimized.
+
+On the current large test archive set used during development, the refresh path dropped from **minutes** to **seconds** after fixing the real bottlenecks in `.pamt` parsing and cache generation. Exact timings depend on hardware and storage, but this was a substantial improvement rather than a minor tweak.
 
 ## Screenshots
 
@@ -77,93 +62,83 @@ It is useful whether you:
 
 ![Text Search](docs/screenshots/TextSearcher.png)
 
-## Safety And Scope
+## Quick Start
 
-What the app does:
+### Basic texture workflow
 
-- reads archive indexes and data
-- extracts selected files to normal folders
-- processes loose files in workspace folders
-- writes loose PNG/DDS output to folders you choose
+1. Run `CrimsonTextureForge-<version>-windows-portable.exe`.
+2. In `Workflow > Setup`, click `Init Workspace`.
+3. Configure or download `texconv.exe`.
+4. Set `Original DDS root`, `PNG root`, and `Output root`.
+5. Click `Scan`.
+6. If you want PNG files first, enable `Convert DDS to PNG before processing`.
+7. Click `Start`.
+8. Review the results in `Compare`.
 
-What the app does not do:
+### Archive to workflow
 
-- repack `.pamt` / `.paz`
-- modify game archives in place
-- guarantee that an external `chaiNNer` chain is valid
-- guarantee correct output for every texture type without user judgment
+1. Open `Archive Browser`.
+2. Set or auto-detect `Package root`.
+3. Click `Scan` or `Refresh`.
+4. Filter the archive entries.
+5. Use `DDS To Workflow` or extract selected DDS files to a normal folder.
+6. Return to `Workflow`, click `Scan`, and run a small test first.
 
-## Main Workflow Modes
+### Text search
 
-### 1. Loose DDS workflow
+1. Open `Text Search`.
+2. Choose `Archive files` after scanning archives, or `Loose folder` for extracted content.
+3. Enter a search string or regex.
+4. Set extensions such as `.xml;.json;.cfg`.
+5. Click `Search`.
+6. Preview matches with syntax colors, line numbers, and highlighted results.
+7. Export selected or all matched files while preserving folder structure.
 
-Use this if you already have DDS files in normal folders.
+## Main Tabs
 
-Typical flow:
+### Workflow
 
-1. Open `Setup`
-2. Click `Init Workspace`
-3. Set or download `texconv.exe`
-4. Set `Original DDS root`, `PNG root`, and `Output root`
-5. Click `Scan`
-6. If you want PNG files first, enable `Convert DDS to PNG before processing`
-7. Click `Start`
-8. Review results in `Compare`
+Use this for DDS/PNG processing:
 
-### 2. Archive Browser to workflow
+- loose DDS scanning and filtering
+- optional DDS-to-PNG conversion
+- optional `chaiNNer` run
+- DDS rebuild through `texconv`
+- compare original vs rebuilt DDS
 
-Use this if your source DDS files are still inside Crimson Desert archives.
+### Archive Browser
 
-Typical flow:
+Use this for read-only archive work:
 
-1. Open `Archive Browser`
-2. Set or auto-detect `Package root`
-3. Click `Scan` or `Refresh`
-4. Filter the archive tree
-5. Use `DDS To Workflow` or extract DDS files to a normal folder
-6. Switch to `Workflow`
-7. Click `Scan`
-8. Run a small test first
+- scan or refresh `.pamt` / `.paz`
+- filter by package, folder, path, extension, role, and size
+- preview supported assets
+- extract selected files to normal folders
+- send DDS files directly into the workflow
 
-### 3. Optional chaiNNer workflow
+### Text Search
 
-If enabled, Crimson Texture Forge launches `chaiNNer`, waits for it to finish, and only then continues with DDS rebuild.
+Use this as a supporting modding utility:
 
-Typical flow:
+- search archive or loose text-like files
+- decrypt supported encrypted XML entries when possible
+- preview results in an editor-style view
+- export matched files with folder structure preserved
 
-1. Set up the normal workflow first
-2. Set or download `chaiNNer.exe`
-3. Create and test your `.chn` chain in `chaiNNer` itself first
-4. Install the backends/packages your chain needs inside `chaiNNer`
-5. Enable `Run chaiNNer before DDS rebuild`
-6. If your chain expects PNG input, enable `Convert DDS to PNG before processing`
-7. Point the chain at `${staging_png_root}`, `${png_root}`, or another matching folder
-8. Run a small test first
+### Settings
 
-### 4. Text Search utility
+Global persistent preferences live here, including:
 
-Use this if you want to inspect text-like files such as `.xml`, `.txt`, `.json`, `.cfg`, or `.lua` without leaving the app.
+- theme
+- auto-load archive browser on startup
+- prefer cache on startup
+- restore last active tab
+- remember splitter sizes
+- safety prompts for cleanup actions
 
-Typical flow:
+## Optional chaiNNer Workflow
 
-1. Open `Text Search`
-2. Choose `Archive files` after scanning archives, or `Loose folder` for a normal extracted folder
-3. Enter a search string or regex
-4. Set extensions such as `.xml;.json`
-5. Run `Search`
-6. Select a result to preview it with syntax colors, line numbers, and highlighted matches
-7. Export selected or all matches while preserving folder structure
-
-Notes:
-
-- archive-side XML search now attempts deterministic ChaCha20 decryption for supported encrypted XML entries
-- the preview pane includes local `Find`, `Prev`, `Next`, `Wrap`, and font-size controls
-- results are shown as `File Name | Matches | Package | Path | Ext` so file names stay readable while full paths remain available
-- extremely large text files may still fall back to a simpler preview mode to keep the viewer responsive
-
-## Important ChaiNNer Notes
-
-`chaiNNer` is **optional** and **external**.
+`chaiNNer` is optional and external.
 
 Crimson Texture Forge can:
 
@@ -175,31 +150,30 @@ Crimson Texture Forge can:
 Crimson Texture Forge cannot:
 
 - build your chain for you
-- install your model nodes automatically
-- guarantee that your chain is valid
-- guarantee that a chain that works in GUI will also behave identically in CLI mode
+- install your nodes or backends for you
+- guarantee a chain is valid
+- guarantee that GUI and CLI behavior will be identical
 
-Before using `chaiNNer`, make sure you understand:
+Before using `chaiNNer`:
 
-1. You must install `chaiNNer` separately.
-2. You should launch `chaiNNer` directly at least once.
-3. You must install any required dependencies for your chain inside `chaiNNer`, such as:
+1. Install `chaiNNer` separately.
+2. Launch it directly at least once.
+3. Install the backends your chain needs, such as:
    - PyTorch
    - NCNN
    - ONNX / ONNX Runtime
-4. You must provide your own `.chn` chain.
-5. Your chain must include the model and nodes you want to use.
-6. Your chain must read the correct input type from the correct folder.
+4. Create and test your own `.chn` chain first.
+5. Make sure the chain reads the correct input type from the correct folder.
 
-If your chain expects PNG files:
+If your chain expects PNG input:
 
 - enable `Convert DDS to PNG before processing`
-- make the chain read `${staging_png_root}` or another PNG folder
+- point the chain at `${staging_png_root}`, `${png_root}`, or another matching PNG folder
 
 If your chain reads DDS directly:
 
-- verify that behavior in `chaiNNer` itself first
-- do not enable DDS-to-PNG conversion unless your chain is meant to use PNG output
+- verify that in `chaiNNer` itself first
+- do not enable DDS-to-PNG conversion unless the chain is meant to use PNG output
 
 Supported override tokens:
 
@@ -216,135 +190,47 @@ Final DDS output is built with `texconv`.
 You can:
 
 - match the original DDS format
-- pick a custom output format
-- keep original size
-- keep PNG size
-- use a custom size
-- match original mip count
-- generate a full mip chain
-- force single mip
-- use a custom mip count
+- choose a custom format
+- keep original size, PNG size, or use a custom size
+- match original mip count, generate a full mip chain, force a single mip, or use a custom mip count
 
 You can also apply:
 
 - include filters
 - per-pattern texture rules
 
-This is useful for handling different texture classes differently, such as:
+## Safety And Scope
 
-- albedo / color maps
-- normals
-- masks / material maps
-- UI textures
+What the app does:
 
-## Archive Browser
+- reads archive indexes and data
+- extracts selected files to normal folders
+- processes loose files in workspace folders
+- writes loose PNG/DDS output to folders you choose
 
-The archive browser is read-only and is intended for:
+What the app does not do:
 
-- scanning archive indexes
-- filtering by package/folder/path
-- previewing supported assets
-- extracting selected files
-- handing DDS files off into the workflow
+- repack `.pamt` / `.paz`
+- modify game archives in place
+- guarantee correct output for every texture type without user judgment
 
-It supports:
-
-- `Scan`
-  Uses saved archive cache when valid
-- `Refresh`
-  Ignores cache and rebuilds it from current `.pamt` files
-- package and folder filtering
-- dynamic structure filters
-- preview for many DDS and text-like assets
-- selective extraction to loose folders
-- `DDS To Workflow`
-  Extracts DDS files directly into the workflow root
-
-Notes:
-
-- archive support is read-only
-- some unusual DDS preview cases are still best-effort
-- large archive sets can still take time to scan or refresh
-
-## Compare View
-
-Use the `Compare` tab after a build to inspect:
-
-- original DDS vs rebuilt DDS
-- metadata on both sides
-- zoom and pan
-- output quality differences
-
-This is intended to make quick QA easier before you scale up to a larger batch.
-
-## Important Paths
-
-- `Original DDS root`
-  Loose DDS files used as the source scan set
-- `PNG root`
-  PNG files used for rebuild or manual preparation
-- `Staging PNG root`
-  Intermediate PNG folder used when DDS-to-PNG conversion is enabled before `chaiNNer`
-- `Output root`
-  Final rebuilt DDS output
-- `Extract root`
-  Archive extraction target when not extracting directly into the workflow
-
-## First-Run Checklist
-
-1. Use `Init Workspace`
-2. Configure or download `texconv.exe`
-3. Set the workflow paths
-4. If needed, scan archives and extract a small DDS subset first
-5. Click `Scan`
-6. Run a small test before doing a full batch
-7. Review the result in `Compare`
-8. Only then scale up
-
-## Config, Cache, Profiles, Diagnostics
+## Local Config, Cache, Profiles, Diagnostics
 
 The app stores its local state beside the EXE.
 
 Main local files/folders:
 
 - `CrimsonTextureForge.cfg`
-  Local app settings
 - `archive_cache`
-  Cached archive scan data
 
 The app also supports:
 
 - profile export/import
 - diagnostic bundle export
 
-Diagnostic bundles are useful for issue reports because they can include:
-
-- current config snapshot
-- live log
-- archive log
-- chain validation summary
-- documentation references
-
-## Dependencies
-
-### Python packages used by the app
-
-- `PySide6`
-- `PyInstaller`
-- `lz4`
-
-Build requirements are listed in `requirements-build.txt`.
-
-### External tools used by the app
-
-- `texconv.exe` from Microsoft DirectXTex
-- `chaiNNer` for the optional upscaling stage
-
-These tools are external projects with their own licenses and release cycles.
-
 ## Privacy And Network Behavior
 
-Crimson Texture Forge does **not** include built-in telemetry, analytics, auto-update checks, or background "phone home" behavior for normal offline use.
+Crimson Texture Forge does **not** include built-in telemetry, analytics, auto-update checks, or background network calls for normal offline use.
 
 The app only makes direct network requests when you explicitly trigger download actions such as:
 
@@ -354,38 +240,35 @@ The app only makes direct network requests when you explicitly trigger download 
 Also note:
 
 - opening external links from the app is user-initiated and handled by your default browser
-- if you launch a newly built Windows EXE, Windows, SmartScreen, certificate validation, or antivirus tools may still perform their own reputation or certificate checks outside the app itself
+- Windows, SmartScreen, certificate validation, or antivirus tools may still perform their own reputation/certificate checks around a newly built EXE
 
 ## Known Limitations
 
-- Archive browsing is read-only only; this app does not repack archives.
-- Archive preview support is best-effort for some unusual or partially reconstructed DDS cases.
-- Very large archive scans and cache rebuilds can still take time.
-- `chaiNNer` remains an external dependency and is only as reliable as the chain and dependencies you provide.
-- Some chain behavior cannot be fully inferred from the `.chn` file alone.
-- Final DDS quality still depends on source PNG quality, chosen `texconv` settings, and texture type.
+- Archive access is read-only.
+- Archive preview for some unusual DDS cases is still best-effort.
+- `chaiNNer` reliability depends on the chain and dependencies you provide.
+- Some chain behavior cannot be fully inferred from a `.chn` file alone.
+- Final DDS quality depends on source PNG quality, chosen rebuild settings, and texture type.
 
-## Packaging
+## Dependencies
 
-Build helper:
+### Python packages used by the app
 
-- `build_pyside6_app.ps1`
+- `PySide6`
+- `PyInstaller`
+- `lz4`
+- `cryptography`
 
-Current packaging target:
+Build requirements are listed in `requirements-build.txt`.
 
-- `--windowed --onefile`
-- release-style output filename: `CrimsonTextureForge-<version>-windows-portable.exe`
+### External tools used by the app
+
+- `texconv.exe` from Microsoft DirectXTex
+- `chaiNNer` for the optional upscaling stage
 
 ## Development
 
-Typical local setup:
-
-1. Create a virtual environment
-2. Install requirements
-3. Run from source
-4. Build the EXE when needed
-
-Example:
+Example local setup:
 
 ```powershell
 python -m venv .venv
@@ -414,11 +297,11 @@ Archive support and compatibility work were informed by community reverse-engine
 - [Lazorr](https://forums.nexusmods.com/profile/194233100-lazorr/) and [Crimson Desert Unpacker](https://www.nexusmods.com/crimsondesert/mods/62)
 - [IzeDev](https://www.nexusmods.com/profile/IzeDev) and [Crimson Browser & Mod Manager](https://www.nexusmods.com/crimsondesert/mods/84)
 
-Please also see:
+See also:
 
 - `LICENSE`
 - `THIRD_PARTY_NOTICES.md`
 
 ## License
 
-This repository is currently published under the `MIT` license. See `LICENSE`.
+This repository is published under the `MIT` license. See `LICENSE`.

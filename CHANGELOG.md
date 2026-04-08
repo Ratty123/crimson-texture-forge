@@ -14,6 +14,20 @@ The format is intentionally simple:
 ### Added
 - Placeholder for future changes.
 
+## [0.3.0] - 2026-04-08
+
+### Added
+- New global `Settings` tab for persistent app-wide preferences such as theme, startup behavior, layout memory, and cleanup confirmations.
+
+### Changed
+- Archive refresh and cache-building performance were optimized significantly by fixing the real bottlenecks in `.pamt` parsing and cache generation.
+- Archive tree/browser-state preparation was also reduced further during cached loads.
+- README was reorganized into a shorter, more scannable structure.
+
+### Fixed
+- Removed the experimental 3D/model viewer path from the live app so the shipped workflow stays focused and stable.
+- Removed the top-menu theme picker now that theme selection lives in `Settings`.
+
 ## [0.2.1] - 2026-04-08
 
 ### Changed

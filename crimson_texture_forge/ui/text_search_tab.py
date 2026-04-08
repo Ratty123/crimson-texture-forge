@@ -163,10 +163,10 @@ class TextSearchTab(QWidget):
         root_layout.setContentsMargins(10, 10, 10, 10)
         root_layout.setSpacing(10)
 
-        main_splitter = QSplitter(Qt.Horizontal)
-        main_splitter.setChildrenCollapsible(False)
-        main_splitter.setHandleWidth(8)
-        root_layout.addWidget(main_splitter, stretch=1)
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(8)
+        root_layout.addWidget(self.main_splitter, stretch=1)
 
         controls_group = QGroupBox("Text Search")
         controls_layout = QVBoxLayout(controls_group)
@@ -274,7 +274,7 @@ class TextSearchTab(QWidget):
         self.log_view.document().setMaximumBlockCount(5000)
         log_layout.addWidget(self.log_view)
         controls_layout.addWidget(log_group, stretch=1)
-        main_splitter.addWidget(controls_group)
+        self.main_splitter.addWidget(controls_group)
 
         results_group = QGroupBox("Results")
         results_layout = QVBoxLayout(results_group)
@@ -295,7 +295,7 @@ class TextSearchTab(QWidget):
         self.results_tree.header().resizeSection(0, 260)
         self.results_tree.header().resizeSection(3, 360)
         results_layout.addWidget(self.results_tree, stretch=1)
-        main_splitter.addWidget(results_group)
+        self.main_splitter.addWidget(results_group)
 
         preview_group = QGroupBox("Preview")
         preview_layout = QVBoxLayout(preview_group)
@@ -344,14 +344,14 @@ class TextSearchTab(QWidget):
         preview_layout.addWidget(self.preview_detail_label)
         preview_layout.addLayout(preview_toolbar)
         preview_layout.addWidget(self.preview_text_edit, stretch=1)
-        main_splitter.addWidget(preview_group)
+        self.main_splitter.addWidget(preview_group)
         controls_group.setMinimumWidth(360)
         results_group.setMinimumWidth(300)
         preview_group.setMinimumWidth(420)
-        main_splitter.setStretchFactor(0, 2)
-        main_splitter.setStretchFactor(1, 2)
-        main_splitter.setStretchFactor(2, 4)
-        main_splitter.setSizes([430, 380, 860])
+        self.main_splitter.setStretchFactor(0, 2)
+        self.main_splitter.setStretchFactor(1, 2)
+        self.main_splitter.setStretchFactor(2, 4)
+        self.main_splitter.setSizes([430, 380, 860])
 
         self.log_highlighter = LogHighlighter(self.log_view.document(), theme_key)
         log_font = QFont("Consolas")
@@ -404,6 +404,13 @@ class TextSearchTab(QWidget):
         self.log_highlighter.set_theme(theme_key)
         self.preview_text_edit.set_theme(theme_key)
         self._refresh_preview_selections(focus_current=False)
+
+    def set_splitter_sizes(self, sizes: Sequence[int]) -> None:
+        if sizes:
+            self.main_splitter.setSizes([int(value) for value in sizes])
+
+    def splitter_sizes(self) -> List[int]:
+        return self.main_splitter.sizes()
 
     def set_external_busy(self, busy: bool) -> None:
         self.external_busy = busy

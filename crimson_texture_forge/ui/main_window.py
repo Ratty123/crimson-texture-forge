@@ -23,7 +23,6 @@ def run_gui() -> int:
     try:
         from PySide6.QtCore import QSettings, Qt, QThread, QTimer, QUrl, QObject, Signal, Slot
         from PySide6.QtGui import (
-            QActionGroup,
             QDesktopServices,
             QFont,
             QIcon,
@@ -74,6 +73,7 @@ def run_gui() -> int:
         PreviewScrollArea,
         QuickStartDialog,
     )
+    from crimson_texture_forge.ui.settings_tab import SettingsTab
     from crimson_texture_forge.ui.text_search_tab import TextSearchTab
 
     def resolve_settings_file_path() -> Path:
@@ -468,17 +468,6 @@ def run_gui() -> int:
             self.help_menu = menu_bar.addMenu("Help")
             self.quick_start_menu_action = self.help_menu.addAction("Quick Start")
             self.about_menu_action = self.help_menu.addAction("About")
-            self.theme_menu = menu_bar.addMenu("Theme")
-            self.theme_action_group = QActionGroup(self)
-            self.theme_action_group.setExclusive(True)
-            self.theme_actions_by_key: Dict[str, object] = {}
-            for theme_key, theme in UI_THEME_SCHEMES.items():
-                action = self.theme_menu.addAction(theme["label"])
-                action.setCheckable(True)
-                action.setData(theme_key)
-                action.triggered.connect(lambda _checked=False, key=theme_key: self._handle_theme_changed(key))
-                self.theme_action_group.addAction(action)
-                self.theme_actions_by_key[theme_key] = action
 
             central = QWidget()
             central.setObjectName("AppRoot")
@@ -1304,7 +1293,12 @@ def run_gui() -> int:
                 lambda message, is_error: self.set_status_message(message, error=is_error)
             )
             self.main_tabs.addTab(self.text_search_tab, "Text Search")
-
+            self.settings_tab = SettingsTab(
+                settings=self.settings,
+                theme_key=self.current_theme_key,
+            )
+            self.settings_tab.theme_changed.connect(self._handle_theme_changed)
+            self.main_tabs.addTab(self.settings_tab, "Settings")
             self.setCentralWidget(central)
 
             self.export_profile_action.triggered.connect(self.export_profile)
@@ -1420,6 +1414,7 @@ def run_gui() -> int:
                 self.restoreGeometry(geometry)
             QTimer.singleShot(0, self._apply_responsive_window_defaults)
             QTimer.singleShot(120, self._show_first_run_guide_if_needed)
+            QTimer.singleShot(260, self._maybe_autoload_archive_on_startup)
 
         def focus_quick_start_sections(self, *, include_chainner: bool) -> None:
             self.main_tabs.setCurrentWidget(self.workflow_tab)
@@ -1783,24 +1778,106 @@ def run_gui() -> int:
             layout.addWidget(browse_button, row, 2)
             return browse_button
 
-        def _set_theme_menu_selection(self, theme_key: str) -> None:
-            resolved = theme_key if theme_key in UI_THEME_SCHEMES else DEFAULT_UI_THEME
-            for action_theme_key, action in self.theme_actions_by_key.items():
-                action.blockSignals(True)
-                action.setChecked(action_theme_key == resolved)
-                action.blockSignals(False)
-
         def _handle_theme_changed(self, theme_key: Optional[str] = None) -> None:
             resolved_theme_key = theme_key if theme_key in UI_THEME_SCHEMES else self.current_theme_key
             app = QApplication.instance()
             if app is None:
                 return
             self.current_theme_key = apply_app_theme(app, resolved_theme_key)
-            self._set_theme_menu_selection(self.current_theme_key)
             self.log_highlighter.set_theme(self.current_theme_key)
             self.archive_log_highlighter.set_theme(self.current_theme_key)
             self.text_search_tab.set_theme(self.current_theme_key)
+            self.settings_tab.set_theme_selection(self.current_theme_key)
             self._save_settings()
+
+        def _preference_bool(self, key: str, default: bool) -> bool:
+            return self._read_bool(f"preferences/{key}", default)
+
+        def _load_saved_splitter_sizes(self, key: str) -> Optional[List[int]]:
+            raw_value = self.settings.value(key)
+            if raw_value in (None, ""):
+                return None
+            if isinstance(raw_value, str):
+                parts = [part.strip() for part in raw_value.split(",") if part.strip()]
+            elif isinstance(raw_value, (list, tuple)):
+                parts = list(raw_value)
+            else:
+                return None
+            sizes: List[int] = []
+            for part in parts:
+                try:
+                    value = int(part)
+                except (TypeError, ValueError):
+                    return None
+                if value <= 0:
+                    return None
+                sizes.append(value)
+            return sizes or None
+
+        def _apply_default_splitter_sizes(self, total_width: int) -> None:
+            self.workflow_splitter.setSizes(
+                [
+                    max(360, int(total_width * 0.34)),
+                    max(400, int(total_width * 0.66)),
+                ]
+            )
+            self.compare_splitter.setSizes(
+                [
+                    max(260, int(total_width * 0.26)),
+                    max(480, int(total_width * 0.74)),
+                ]
+            )
+            self.archive_splitter.setSizes(
+                [
+                    max(360, int(total_width * 0.23)),
+                    max(300, int(total_width * 0.29)),
+                    max(340, int(total_width * 0.48)),
+                ]
+            )
+            self.text_search_tab.set_splitter_sizes([430, 380, 860])
+
+        def _apply_saved_splitter_sizes_if_enabled(self, total_width: int) -> None:
+            if not self._preference_bool("remember_splitter_sizes", True):
+                self._apply_default_splitter_sizes(total_width)
+                return
+
+            applied = False
+            for splitter, setting_key in (
+                (self.workflow_splitter, "ui/workflow_splitter_sizes"),
+                (self.compare_splitter, "ui/compare_splitter_sizes"),
+                (self.archive_splitter, "ui/archive_splitter_sizes"),
+            ):
+                sizes = self._load_saved_splitter_sizes(setting_key)
+                if sizes:
+                    splitter.setSizes(sizes)
+                    applied = True
+
+            text_search_sizes = self._load_saved_splitter_sizes("ui/text_search_splitter_sizes")
+            if text_search_sizes:
+                self.text_search_tab.set_splitter_sizes(text_search_sizes)
+                applied = True
+
+            if not applied:
+                self._apply_default_splitter_sizes(total_width)
+
+        def _maybe_autoload_archive_on_startup(self) -> None:
+            if self.show_quick_start_on_launch:
+                return
+            if not self._preference_bool("auto_load_archive_on_startup", False):
+                return
+            if self.worker_thread is not None or self.archive_entries:
+                return
+
+            package_root_text = self.archive_package_root_edit.text().strip()
+            if not package_root_text:
+                return
+            package_root = Path(package_root_text).expanduser()
+            if not package_root.exists():
+                self.append_archive_log(f"Startup archive auto-load skipped: package root does not exist: {package_root}")
+                return
+
+            self.append_archive_log("Startup archive auto-load is enabled.")
+            self.scan_archives(force_refresh=not self._preference_bool("prefer_archive_cache_on_startup", True))
 
         def _apply_responsive_window_defaults(self) -> None:
             screen = self.screen() or QApplication.primaryScreen()
@@ -1822,25 +1899,7 @@ def run_gui() -> int:
                 min(max(y, available.top()), max_y),
             )
             total_width = max(self.width() - 64, self.minimumWidth())
-            self.workflow_splitter.setSizes(
-                [
-                    max(360, int(total_width * 0.34)),
-                    max(400, int(total_width * 0.66)),
-                ]
-            )
-            self.compare_splitter.setSizes(
-                [
-                    max(260, int(total_width * 0.26)),
-                    max(480, int(total_width * 0.74)),
-                ]
-            )
-            self.archive_splitter.setSizes(
-                [
-                    max(360, int(total_width * 0.23)),
-                    max(300, int(total_width * 0.29)),
-                    max(340, int(total_width * 0.48)),
-                ]
-            )
+            self._apply_saved_splitter_sizes_if_enabled(total_width)
 
         def _add_combo_choice(self, combo: QComboBox, label: str, value: str) -> None:
             combo.addItem(label, value)
@@ -1907,6 +1966,10 @@ def run_gui() -> int:
             self.dds_mip_mode_combo.currentIndexChanged.connect(self._apply_dds_output_state)
             self.compare_sync_pan_checkbox.toggled.connect(self._save_settings)
             self.main_tabs.currentChanged.connect(self._handle_main_tab_changed)
+            self.workflow_splitter.splitterMoved.connect(lambda *_args: self._save_settings())
+            self.compare_splitter.splitterMoved.connect(lambda *_args: self._save_settings())
+            self.archive_splitter.splitterMoved.connect(lambda *_args: self._save_settings())
+            self.text_search_tab.main_splitter.splitterMoved.connect(lambda *_args: self._save_settings())
             self.setup_section.toggled.connect(self._save_settings)
             self.paths_section.toggled.connect(self._save_settings)
             self.settings_section.toggled.connect(self._save_settings)
@@ -1921,7 +1984,6 @@ def run_gui() -> int:
 
         def _handle_main_tab_changed(self, index: int) -> None:
             self._save_settings()
-
         def _save_settings(self) -> None:
             if not self._settings_ready:
                 return
@@ -1968,6 +2030,11 @@ def run_gui() -> int:
             self.settings.setValue("chainner/override_json", self.chainner_override_edit.toPlainText())
             self.settings.setValue("ui/main_tab_index", self.main_tabs.currentIndex())
             self.settings.setValue("ui/compare_sync_pan", self.compare_sync_pan_checkbox.isChecked())
+            if self._preference_bool("remember_splitter_sizes", True):
+                self.settings.setValue("ui/workflow_splitter_sizes", ",".join(str(value) for value in self.workflow_splitter.sizes()))
+                self.settings.setValue("ui/compare_splitter_sizes", ",".join(str(value) for value in self.compare_splitter.sizes()))
+                self.settings.setValue("ui/archive_splitter_sizes", ",".join(str(value) for value in self.archive_splitter.sizes()))
+                self.settings.setValue("ui/text_search_splitter_sizes", ",".join(str(value) for value in self.text_search_tab.splitter_sizes()))
             self.settings.setValue("sections/setup_expanded", self.setup_section.toggle_button.isChecked())
             self.settings.setValue("sections/paths_expanded", self.paths_section.toggle_button.isChecked())
             self.settings.setValue("sections/settings_expanded", self.settings_section.toggle_button.isChecked())
@@ -1981,7 +2048,6 @@ def run_gui() -> int:
             self.current_theme_key = str(self.settings.value("appearance/theme", self.current_theme_key or DEFAULT_UI_THEME))
             if self.current_theme_key not in UI_THEME_SCHEMES:
                 self.current_theme_key = DEFAULT_UI_THEME
-            self._set_theme_menu_selection(self.current_theme_key)
             self.original_dds_edit.setText(
                 self.settings.value("paths/original_dds_root", defaults.original_dds_root)
             )
@@ -2078,7 +2144,10 @@ def run_gui() -> int:
             self.chainner_override_edit.setPlainText(
                 self.settings.value("chainner/override_json", defaults.chainner_override_json)
             )
-            saved_main_tab = int(self.settings.value("ui/main_tab_index", 0))
+            if self._preference_bool("restore_last_active_tab", True):
+                saved_main_tab = int(self.settings.value("ui/main_tab_index", 0))
+            else:
+                saved_main_tab = 0
             self.main_tabs.setCurrentIndex(max(0, min(saved_main_tab, self.main_tabs.count() - 1)))
             self.compare_sync_pan_checkbox.setChecked(self._read_bool("ui/compare_sync_pan", False))
             self.setup_section.set_expanded(self._read_bool("sections/setup_expanded", False))
@@ -2349,6 +2418,9 @@ def run_gui() -> int:
                 unique_targets.append((label, path))
 
             for label, path in unique_targets:
+                if not self._preference_bool("confirm_workflow_output_cleanup", True):
+                    self.append_log(f"Keeping existing contents in {label}: {path} (cleanup confirmation disabled)")
+                    continue
                 decision = self._prompt_clear_directory_before_start(label, path)
                 if decision is None:
                     self.set_status_message("Start cancelled.")
@@ -3290,6 +3362,9 @@ def run_gui() -> int:
             entries: Sequence[ArchiveEntry],
             output_root: Path,
         ) -> Optional[Tuple[bool, str]]:
+            if not self._preference_bool("confirm_archive_extract_cleanup", True):
+                return False, "overwrite"
+
             clear_root = False
             collision_mode = "overwrite"
 
@@ -3595,6 +3670,7 @@ def run_gui() -> int:
             self.archive_preview_text_edit.setEnabled(not busy)
             self.archive_preview_info_edit.setEnabled(not busy)
             self.text_search_tab.set_external_busy(busy)
+            self.settings_tab.setEnabled(not busy)
             self.archive_preview_loose_toggle_button.setEnabled(
                 not busy and self.archive_preview_loose_toggle_button.isVisible()
             )
