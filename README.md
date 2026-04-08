@@ -30,12 +30,6 @@ The app is intentionally focused on **read-only archive access** and **loose-fil
 - Local auto-save config beside the EXE
 - Profile export/import and diagnostic bundle export
 
-## Recent Performance Work
-
-Archive refresh and cache build were heavily optimized.
-
-On the current large test archive set used during development, the refresh path dropped from **minutes** to **seconds** after fixing the real bottlenecks in `.pamt` parsing and cache generation. Exact timings depend on hardware and storage, but this was a substantial improvement rather than a minor tweak.
-
 ## Screenshots
 
 ### Archive Browser
