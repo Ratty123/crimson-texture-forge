@@ -1468,6 +1468,7 @@ def run_gui() -> int:
             <h3>Credits and References</h3>
             <ul>
               <li><a href=\"https://github.com/lazorr410/crimson-desert-unpacker\">lazorr410/crimson-desert-unpacker</a> for archive format reference.</li>
+              <li><a href=\"https://www.nexusmods.com/crimsondesert/mods/84\">Crimson Browser &amp; Mod Manager</a> for archive behavior and compatibility reference.</li>
               <li><a href=\"https://github.com/microsoft/DirectXTex/releases\">Microsoft DirectXTex releases</a> for texconv.</li>
               <li><a href=\"https://chainner.app/\">chaiNNer</a> for the optional upscaling stage.</li>
             </ul>
