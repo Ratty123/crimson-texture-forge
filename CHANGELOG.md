@@ -21,6 +21,7 @@ The format is intentionally simple:
 
 ### Changed
 - Archive refresh and cache-building performance were optimized significantly by fixing the real bottlenecks in `.pamt` parsing and cache generation.
+- On the large development archive set used during testing, full refresh + cache build dropped from roughly `315s` to about `4s` (about `99%` faster), while cached tree preparation dropped from about `3.7s` to `2.0s`.
 - Archive tree/browser-state preparation was also reduced further during cached loads.
 - README was reorganized into a shorter, more scannable structure.
 
