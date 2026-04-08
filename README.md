@@ -342,6 +342,20 @@ Build requirements are listed in `requirements-build.txt`.
 
 These tools are external projects with their own licenses and release cycles.
 
+## Privacy And Network Behavior
+
+Crimson Texture Forge does **not** include built-in telemetry, analytics, auto-update checks, or background "phone home" behavior for normal offline use.
+
+The app only makes direct network requests when you explicitly trigger download actions such as:
+
+- `Download chaiNNer`
+- `Download texconv`
+
+Also note:
+
+- opening external links from the app is user-initiated and handled by your default browser
+- if you launch a newly built Windows EXE, Windows, SmartScreen, certificate validation, or antivirus tools may still perform their own reputation or certificate checks outside the app itself
+
 ## Known Limitations
 
 - Archive browsing is read-only only; this app does not repack archives.
