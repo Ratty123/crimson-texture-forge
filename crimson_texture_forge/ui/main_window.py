@@ -1435,34 +1435,39 @@ def run_gui() -> int:
             license_path = Path(__file__).resolve().parents[2] / "LICENSE"
             return f"""
             <h3>{APP_TITLE} v{APP_VERSION}</h3>
-            <p>A Windows desktop tool for Crimson Desert texture workflows: read-only archive browsing, DDS-to-PNG conversion, optional external upscaling through <b>chaiNNer</b>, DDS rebuild with <b>texconv</b>, side-by-side compare review, and read-only text search across archive or loose files.</p>
+            <p>A Windows desktop tool for Crimson Desert texture workflows and supporting archive/text-search tasks.</p>
             <h3>What It Covers</h3>
             <ul>
               <li>Read-only <code>.pamt/.paz</code> archive browsing and selective extraction</li>
-              <li>Loose DDS workflow scanning, DDS-to-PNG conversion, rebuild, and compare</li>
+              <li>Loose DDS workflow scanning, DDS-to-PNG conversion, DDS rebuild, and compare</li>
               <li>Text Search with encrypted XML support, syntax-colored preview, and export of matched files</li>
               <li>Optional <b>chaiNNer</b> stage before DDS rebuild</li>
-              <li>Local config and archive cache stored beside the EXE</li>
+              <li>Persistent global settings, local config, and archive cache stored beside the EXE</li>
+            </ul>
+            <h3>External Requirements</h3>
+            <ul>
+              <li><b>texconv</b> is required for DDS preview, DDS-to-PNG conversion, compare previews, and final DDS rebuild.</li>
+              <li><b>chaiNNer</b> is optional and external.</li>
             </ul>
             <h3>Important chaiNNer Notes</h3>
             <ul>
-              <li><b>chaiNNer</b> is optional and external to this app.</li>
-              <li>You must install and maintain <b>chaiNNer</b> separately.</li>
-              <li>You must install the backends/packages your chain needs inside <b>chaiNNer</b>, such as <b>PyTorch</b>, <b>NCNN</b>, or <b>ONNX Runtime</b>.</li>
-              <li>You must provide and test your own <code>.chn</code> chain.</li>
-              <li>If you enable DDS-to-PNG conversion before processing, your chain must read PNG input from the correct folder.</li>
+              <li>Install and maintain <b>chaiNNer</b> separately.</li>
+              <li>Install the backends your chain needs inside <b>chaiNNer</b>, such as <b>PyTorch</b>, <b>NCNN</b>, or <b>ONNX Runtime</b>.</li>
+              <li>Provide and test your own <code>.chn</code> chain.</li>
+              <li>If DDS-to-PNG conversion is enabled, make sure the chain reads PNG input from the correct folder.</li>
             </ul>
             <h3>Dependencies</h3>
             <ul>
               <li><a href=\"https://doc.qt.io/qtforpython-6/\">PySide6 / Qt for Python</a></li>
               <li><a href=\"https://pyinstaller.org/\">PyInstaller</a></li>
               <li><a href=\"https://github.com/python-lz4/python-lz4\">python-lz4</a></li>
+              <li><a href=\"https://cryptography.io/\">cryptography</a></li>
               <li><a href=\"https://github.com/microsoft/DirectXTex\">DirectXTex / texconv</a></li>
               <li><a href=\"https://chainner.app/download/\">chaiNNer</a></li>
             </ul>
             <h3>Credits and References</h3>
             <ul>
-              <li><a href=\"https://github.com/lazorr410/crimson-desert-unpacker\">lazorr410/crimson-desert-unpacker</a> for archive format reference.</li>
+              <li><a href=\"https://www.nexusmods.com/crimsondesert/mods/62\">Crimson Desert Unpacker</a> for archive format reference and behavior comparison.</li>
               <li><a href=\"https://www.nexusmods.com/crimsondesert/mods/84\">Crimson Browser &amp; Mod Manager</a> for archive behavior and compatibility reference.</li>
               <li><a href=\"https://github.com/microsoft/DirectXTex/releases\">Microsoft DirectXTex releases</a> for texconv.</li>
               <li><a href=\"https://chainner.app/\">chaiNNer</a> for the optional upscaling stage.</li>
@@ -1477,11 +1482,11 @@ def run_gui() -> int:
             <ul>
               <li>Archive previews are best-effort for unusual or game-specific DDS cases.</li>
               <li><b>chaiNNer</b> remains an external dependency and chain behavior is only as reliable as the chain you provide.</li>
-              <li>Large initial archive scans and cache rebuilds can still take time because Crimson Desert package indexes are large.</li>
+              <li>Large archive sets still take noticeable time to prepare, even after the recent refresh/cache optimizations.</li>
             </ul>
             <h3>Notes</h3>
             <p>The archive browser is read-only. It extracts to loose files only and never writes back to <code>.pamt</code> or <code>.paz</code>.</p>
-            <p>For the full setup flow, usage notes, credits, and troubleshooting guidance, open the Quick Start guide or the README.</p>
+            <p>For full setup flow, usage notes, and troubleshooting guidance, open the Quick Start guide or the README.</p>
             """
 
         def show_about_dialog(self) -> None:

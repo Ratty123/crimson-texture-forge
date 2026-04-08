@@ -613,54 +613,50 @@ class QuickStartDialog(QDialog):
         self.browser.setReadOnly(True)
         self.browser.setHtml(
             """
-            <h3>What this app does</h3>
-            <p><b>Crimson Texture Forge</b> is a read-only archive browser plus a loose-file texture workflow for DDS-to-PNG conversion, optional external upscaling, DDS rebuild, and comparison.</p>
+            <h3>Overview</h3>
+            <p><b>Crimson Texture Forge</b> is a read-only archive and loose-file workflow tool for Crimson Desert. Its main jobs are archive extraction, DDS-to-PNG conversion, optional external upscaling, DDS rebuild, compare review, and text search.</p>
             <ul>
               <li><b>Archive Browser</b>: scan <b>.pamt/.paz</b>, preview supported assets, filter, and extract to normal folders.</li>
               <li><b>Workflow</b>: scan loose DDS files, optionally convert DDS to PNG with <b>texconv</b>, optionally run <b>chaiNNer</b>, rebuild DDS, and compare results.</li>
-              <li><b>Text Search</b>: search archive or loose text-like files such as <b>.xml</b>, preview matching files with highlights, and export matched files while preserving folder structure.</li>
+              <li><b>Text Search</b>: search archive or loose text-like files such as <b>.xml</b>, preview matches with syntax colors, and export results while preserving folder structure.</li>
+              <li><b>Settings</b>: store persistent global preferences such as theme, startup cache behavior, remembered layouts, and cleanup confirmations.</li>
             </ul>
             <h3>Recommended first setup</h3>
             <ol>
-              <li><b>Setup</b>: Click <b>Init Workspace</b> to create a clean folder layout. If you later change paths manually, use <b>Create Folders</b> to create any missing directories.</li>
-              <li><b>texconv</b>: Set the <b>texconv.exe</b> path or use the built-in download button. DDS preview, DDS-to-PNG conversion, compare previews, and final DDS rebuild all depend on texconv.</li>
-              <li><b>Paths</b>: Set <b>Original DDS root</b>, <b>PNG root</b>, and <b>Output root</b>. If you plan to convert DDS to PNG before <b>chaiNNer</b>, also set <b>Staging PNG root</b> or let the app choose its default.</li>
-              <li><b>Settings</b>: Open the <b>Settings</b> tab if you want to adjust theme, archive cache startup behavior, remembered pane sizes, or cleanup confirmations.</li>
-              <li><b>Scan</b>: In the Workflow tab, click <b>Scan</b> so the app can count the DDS files that match the current filter.</li>
-              <li><b>DDS Output</b>: Enable <b>Convert DDS to PNG before processing</b> if you want texconv to create PNG files first. If <b>chaiNNer</b> is disabled, <b>Start</b> will stop after PNG conversion.</li>
-              <li><b>Start small</b>: Run a small folder or filtered subset first, then verify the result in <b>Compare</b>.</li>
+              <li>Open <b>Setup</b> and click <b>Init Workspace</b>.</li>
+              <li>Configure or download <b>texconv.exe</b>. DDS preview, DDS-to-PNG conversion, compare previews, and final DDS rebuild depend on it.</li>
+              <li>Set <b>Original DDS root</b>, <b>PNG root</b>, and <b>Output root</b>.</li>
+              <li>If you want PNG files before rebuild, enable <b>Convert DDS to PNG before processing</b>.</li>
+              <li>Click <b>Scan</b> in the Workflow tab.</li>
+              <li>Run a small subset first, then review the output in <b>Compare</b>.</li>
             </ol>
             <h3>Optional chaiNNer stage</h3>
-            <p><b>chaiNNer</b> is optional and external. If you enable it, this app runs <b>chaiNNer</b> first and only starts the DDS rebuild after it has finished.</p>
+            <p><b>chaiNNer</b> is optional and external. If enabled, this app runs <b>chaiNNer</b> first and only starts DDS rebuild after it finishes.</p>
             <ul>
-              <li>Download or point the app at a working <b>chaiNNer.exe</b>.</li>
-              <li>Open <b>chaiNNer</b> separately at least once and install the packages your chain needs, such as <b>PyTorch</b>, <b>NCNN</b>, or <b>ONNX/ONNX Runtime</b>, depending on the nodes you use.</li>
-              <li>Create and test your own <b>.chn</b> chain in <b>chaiNNer</b> first.</li>
-              <li>Your chain must include its own upscaler model and nodes. This app does not build the chain for you.</li>
-              <li>If your chain reads loose PNG files, enable <b>Convert DDS to PNG before processing</b> and make the chain read <b>${staging_png_root}</b> or another PNG folder.</li>
-              <li>If your chain is already set up to read DDS directly and works in <b>chaiNNer</b>, you can keep that workflow, but test it in <b>chaiNNer</b> first.</li>
-              <li>The app can pass path tokens through chaiNNer overrides: <b>${original_dds_root}</b>, <b>${staging_png_root}</b>, <b>${png_root}</b>, <b>${output_root}</b>, <b>${texconv_path}</b>.</li>
+              <li>Install and test <b>chaiNNer</b> separately first.</li>
+              <li>Install the backends your chain needs, such as <b>PyTorch</b>, <b>NCNN</b>, or <b>ONNX Runtime</b>.</li>
+              <li>Create and validate your own <b>.chn</b> chain in <b>chaiNNer</b>.</li>
+              <li>If your chain expects PNG input, enable DDS-to-PNG conversion and point the chain at <b>${staging_png_root}</b>, <b>${png_root}</b>, or another matching PNG folder.</li>
+              <li>If your chain reads DDS directly, verify that in <b>chaiNNer</b> itself first.</li>
             </ul>
-            <h3>Archive browser</h3>
-            <p>The archive browser is read-only. It can scan <b>.pamt/.paz</b>, filter files, preview supported assets, and extract selected files or DDS trees into normal workspace folders.</p>
+            <h3>Archive Browser</h3>
+            <p>The archive browser is read-only. Use it to scan <b>.pamt/.paz</b>, filter files, preview supported assets, and extract DDS or other files into normal folders.</p>
             <ul>
               <li><b>Scan</b> uses a saved archive cache when it is valid.</li>
               <li><b>Refresh</b> ignores the cache and rebuilds it from the current <b>.pamt</b> files.</li>
               <li><b>DDS To Workflow</b> extracts archive DDS files into your loose workflow so you can scan and rebuild them like normal files.</li>
             </ul>
-            <h3>Compare and review</h3>
-            <p>Use the <b>Compare</b> tab to review original vs rebuilt DDS side by side. You can zoom, pan, inspect metadata, and refresh the compare list after new output is written.</p>
-            <h3>Text search utility</h3>
-            <p>Use the <b>Text Search</b> tab when you want to inspect text-like files outside the texture workflow. It can search archive entries or loose folders, decrypt supported encrypted archive XML, preview matches in an editor-style view with line numbers and syntax colors, and export matched files with their folder structure intact.</p>
-            <h3>Where settings are stored</h3>
-            <p>The app auto-saves settings to a local config file beside the EXE and also keeps archive scan cache data in a local cache folder beside it.</p>
-            <h3>Common causes of failure</h3>
+            <h3>Text Search</h3>
+            <p>The <b>Text Search</b> tab is a supporting utility for `.xml`, `.json`, `.cfg`, `.lua`, and similar files. It can search archive or loose files, decrypt supported encrypted XML, preview full text with syntax colors and line numbers, and export matched files.</p>
+            <h3>Common failure causes</h3>
             <ul>
               <li><b>Missing texconv</b>: previews, DDS-to-PNG conversion, and DDS rebuild will fail until <b>texconv.exe</b> is configured.</li>
               <li><b>Wrong chaiNNer chain paths</b>: hardcoded folders inside the chain can make chaiNNer read or save to the wrong place.</li>
               <li><b>No matching PNG outputs</b>: if chaiNNer finishes but nothing lands in <b>PNG root</b>, the DDS rebuild step has nothing to convert.</li>
               <li><b>Wrong chaiNNer input type</b>: if DDS-to-PNG conversion is enabled but the chain still reads DDS from the original folder, the workflow will not behave as expected.</li>
             </ul>
+            <h3>Local state</h3>
+            <p>The app auto-saves its settings beside the EXE and also stores archive scan cache beside it.</p>
             """
         )
         layout.addWidget(self.browser, stretch=1)
