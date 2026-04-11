@@ -4838,14 +4838,12 @@ def run_gui() -> int:
             )
 
             if preferred_view == "image" and preview_image_path:
-                pixmap = QPixmap(preview_image_path)
-                if not pixmap.isNull():
-                    self.archive_preview_label.set_preview_pixmap(pixmap, title or "Preview image")
-                    self.archive_preview_stack.setCurrentWidget(self.archive_preview_scroll)
-                    self.archive_preview_tabs.setCurrentIndex(0)
-                    self._set_archive_preview_image_controls_enabled(True)
-                    self._apply_archive_preview_zoom()
-                    return
+                self.archive_preview_label.set_preview_image_path(preview_image_path, title or "Preview image")
+                self.archive_preview_stack.setCurrentWidget(self.archive_preview_scroll)
+                self.archive_preview_tabs.setCurrentIndex(0)
+                self._set_archive_preview_image_controls_enabled(True)
+                self._apply_archive_preview_zoom()
+                return
 
             if preferred_view == "text":
                 self.archive_preview_text_edit.setPlainText(result.preview_text or "No text preview available.")

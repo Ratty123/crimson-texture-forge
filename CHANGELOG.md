@@ -11,6 +11,9 @@ The format is intentionally simple:
 
 ## [Unreleased/In testing]
 
+### Fixed
+- Archive Browser DDS preview is less likely to freeze the app while browsing cached archives because image preview loading now avoids eagerly materializing the full preview pixmap on the UI thread.
+
 ## [0.4.0] - 2026-04-11
 
 ### Added

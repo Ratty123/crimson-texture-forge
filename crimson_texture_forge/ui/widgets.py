@@ -7,6 +7,7 @@ from PySide6.QtCore import QRect, QSize, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
+    QImageReader,
     QPainter,
     QPixmap,
     QSyntaxHighlighter,
@@ -41,6 +42,8 @@ class PreviewLabel(QLabel):
         self.setWordWrap(True)
         self.setObjectName("PreviewLabel")
         self._source_pixmap: Optional[QPixmap] = None
+        self._source_image_path: str = ""
+        self._source_image_size = QSize()
         self._zoom_factor = 1.0
         self._fit_to_view = True
         self._fit_scale = 1.0
@@ -53,6 +56,8 @@ class PreviewLabel(QLabel):
 
     def clear_preview(self, message: str) -> None:
         self._source_pixmap = None
+        self._source_image_path = ""
+        self._source_image_size = QSize()
         self._drag_active = False
         self.setPixmap(QPixmap())
         self.setText(message)
@@ -85,12 +90,27 @@ class PreviewLabel(QLabel):
 
     def set_preview_pixmap(self, pixmap: QPixmap, fallback_text: str) -> None:
         self._source_pixmap = pixmap
+        self._source_image_path = ""
+        self._source_image_size = pixmap.size()
+        self._apply_scaled_pixmap(fallback_text)
+
+    def set_preview_image_path(self, image_path: str, fallback_text: str) -> None:
+        self._source_pixmap = None
+        self._source_image_path = image_path
+        reader = QImageReader(image_path)
+        size = reader.size()
+        self._source_image_size = size if size.isValid() else QSize()
         self._apply_scaled_pixmap(fallback_text)
 
     def current_display_scale(self) -> float:
-        if self._source_pixmap is None or self._source_pixmap.isNull() or self._source_pixmap.width() <= 0:
+        source_width = 0
+        if self._source_pixmap is not None and not self._source_pixmap.isNull():
+            source_width = self._source_pixmap.width()
+        elif self._source_image_size.isValid():
+            source_width = self._source_image_size.width()
+        if source_width <= 0:
             return 1.0
-        return max(0.1, self.width() / float(self._source_pixmap.width()))
+        return max(0.1, self.width() / float(source_width))
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
@@ -163,7 +183,9 @@ class PreviewLabel(QLabel):
             self.unsetCursor()
 
     def _apply_scaled_pixmap(self, fallback_text: str) -> None:
-        if self._source_pixmap is None or self._source_pixmap.isNull():
+        has_source_pixmap = self._source_pixmap is not None and not self._source_pixmap.isNull()
+        has_source_path = bool(self._source_image_path)
+        if not has_source_pixmap and not has_source_path:
             self.setPixmap(QPixmap())
             self.setText(fallback_text)
             self._update_cursor()
@@ -174,15 +196,33 @@ class PreviewLabel(QLabel):
             width = max(1, int(round((viewport.width() - 6) * self._fit_scale)))
             height = max(1, int(round((viewport.height() - 6) * self._fit_scale)))
         else:
-            width = max(1, int(round(self._source_pixmap.width() * self._zoom_factor)))
-            height = max(1, int(round(self._source_pixmap.height() * self._zoom_factor)))
+            if has_source_pixmap:
+                source_size = self._source_pixmap.size()
+            else:
+                source_size = self._source_image_size
+            width = max(1, int(round(source_size.width() * self._zoom_factor)))
+            height = max(1, int(round(source_size.height() * self._zoom_factor)))
 
-        scaled = self._source_pixmap.scaled(
-            width,
-            height,
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
+        if has_source_pixmap:
+            scaled = self._source_pixmap.scaled(
+                width,
+                height,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+        else:
+            reader = QImageReader(self._source_image_path)
+            if self._source_image_size.isValid():
+                target_size = self._source_image_size.scaled(width, height, Qt.KeepAspectRatio)
+                if target_size.isValid():
+                    reader.setScaledSize(target_size)
+            image = reader.read()
+            if image.isNull():
+                self.setPixmap(QPixmap())
+                self.setText(fallback_text)
+                self._update_cursor()
+                return
+            scaled = QPixmap.fromImage(image)
         self.setText("")
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumSize(0, 0)
