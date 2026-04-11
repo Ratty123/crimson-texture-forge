@@ -7,6 +7,7 @@ import pickle
 import re
 import shutil
 import struct
+import subprocess
 import tempfile
 import time
 from collections import defaultdict
@@ -33,10 +34,61 @@ from crimson_texture_forge.constants import *
 from crimson_texture_forge.models import *
 from crimson_texture_forge.core.common import *
 from crimson_texture_forge.core.pipeline import ensure_dds_preview_png, parse_dds
+from crimson_texture_forge.core.upscale_profiles import classify_texture_type
 
 _PATHC_COLLECTION_CACHE: Dict[str, Tuple[str, "PathcCollection"]] = {}
 _ARCHIVE_SCAN_CACHE_MAGIC = b"CTFARCH1"
 _ARCHIVE_SCAN_CACHE_VERSION = 2
+
+_COMMON_TECHNICAL_DDS_EXCLUDE_PATTERNS: Tuple[str, ...] = (
+    "*_n.dds",
+    "*_nm.dds",
+    "*_nrm.dds",
+    "*_normal.dds",
+    "*_normalmap.dds",
+    "*_sp.dds",
+    "*_spec.dds",
+    "*_specular.dds",
+    "*_m.dds",
+    "*_mask.dds",
+    "*_orm.dds",
+    "*_rma.dds",
+    "*_mra.dds",
+    "*_arm.dds",
+    "*_ao.dds",
+    "*_metal.dds",
+    "*_metallic.dds",
+    "*_rough.dds",
+    "*_roughness.dds",
+    "*_gloss.dds",
+    "*_smooth.dds",
+    "*_height.dds",
+    "*_hgt.dds",
+    "*_disp.dds",
+    "*_displacement.dds",
+    "*_dmap.dds",
+    "*_bump.dds",
+    "*_parallax.dds",
+    "*_pom.dds",
+    "*_ssdm.dds",
+    "*_vector.dds",
+    "*_dr.dds",
+    "*_op.dds",
+    "*_wn.dds",
+    "*_flow.dds",
+    "*_velocity.dds",
+    "*_pos.dds",
+    "*_position.dds",
+    "*_pivot.dds",
+    "*_depth.dds",
+    "*_ma.dds",
+    "*_mg.dds",
+    "*_o.dds",
+    "*_emi.dds",
+    "*_emc.dds",
+    "*_subsurface.dds",
+    "*_d.dds",
+)
 _ARCHIVE_SCAN_CACHE_SUPPORTED_VERSIONS = {1, 2}
 CHACHA20_HASH_INITVAL = 0x000C5EDE
 CHACHA20_IV_XOR = 0x60616263
@@ -1065,19 +1117,19 @@ def normalize_archive_extension_filter(extension_filter: str) -> str:
 
 def archive_entry_role(entry: ArchiveEntry) -> str:
     path_lower = entry.path.lower()
-    basename_lower = entry.basename.lower()
     extension = entry.extension
 
     if extension in ARCHIVE_MODEL_EXTENSIONS or extension in {".hkx"}:
         return "model"
-    if "/ui/" in path_lower or basename_lower.startswith("ui_"):
+    if "/ui/" in path_lower or entry.basename.lower().startswith("ui_"):
         return "ui"
     if "impostor" in path_lower:
         return "impostor"
     if extension in ARCHIVE_IMAGE_EXTENSIONS or "/texture/" in path_lower:
-        if any(token in basename_lower for token in ("_n.", "_normal", "_nrm", "_normalmap")):
+        texture_type = classify_texture_type(entry.path)
+        if texture_type == "normal":
             return "normal"
-        if any(token in basename_lower for token in ("_sp.", "_rough", "_metal", "_mask", "_orm", "_ao", "_depth", "_disp")):
+        if texture_type in {"mask", "roughness", "height", "vector", "emissive"}:
             return "material"
         return "image"
     if extension in ARCHIVE_TEXT_EXTENSIONS:
@@ -1126,20 +1178,43 @@ def archive_entry_matches_advanced_filters(
     return True
 
 
+def _split_archive_filter_patterns(text: str) -> Tuple[str, ...]:
+    if not text:
+        return ()
+    raw_parts = re.split(r"[;\r\n,]+", text)
+    parts = [part.strip().lower() for part in raw_parts if part and part.strip()]
+    return tuple(parts)
+
+
+def _archive_entry_matches_text_pattern(path_lower: str, basename_lower: str, pattern: str) -> bool:
+    if not pattern:
+        return False
+    if any(char in pattern for char in "*?[]"):
+        return fnmatch.fnmatch(path_lower, pattern) or fnmatch.fnmatch(basename_lower, pattern)
+    return pattern in path_lower or pattern in basename_lower
+
+
 def filter_archive_entries(
     entries: Sequence[ArchiveEntry],
     *,
     filter_text: str,
+    exclude_filter_text: str,
     extension_filter: str,
     package_filter_text: str,
     structure_filter: str,
     role_filter: str,
+    exclude_common_technical_suffixes: bool,
     min_size_kb: int,
     previewable_only: bool,
 ) -> List[ArchiveEntry]:
     normalized_extension = normalize_archive_extension_filter(extension_filter)
     text = filter_text.strip().lower()
-    wildcard_filter = any(char in text for char in "*?[]")
+    include_patterns = _split_archive_filter_patterns(text)
+    wildcard_pattern = include_patterns[0] if include_patterns else ""
+    wildcard_filter = len(include_patterns) == 1 and any(char in include_patterns[0] for char in "*?[]")
+    exclude_patterns = list(_split_archive_filter_patterns(exclude_filter_text))
+    if exclude_common_technical_suffixes:
+        exclude_patterns.extend(_COMMON_TECHNICAL_DDS_EXCLUDE_PATTERNS)
     package_filter = package_filter_text.strip().lower()
     min_size_bytes = min_size_kb * 1024 if min_size_kb > 0 else 0
     normalized_structure = normalize_archive_structure_filter_value(structure_filter)
@@ -1154,10 +1229,24 @@ def filter_archive_entries(
         if text:
             path_lower = entry.path.lower()
             basename_lower = entry.basename.lower()
-            if wildcard_filter:
-                if not (fnmatch.fnmatch(path_lower, text) or fnmatch.fnmatch(basename_lower, text)):
+            if len(include_patterns) > 1:
+                if not any(_archive_entry_matches_text_pattern(path_lower, basename_lower, pattern) for pattern in include_patterns):
+                    continue
+            elif wildcard_filter:
+                if not (fnmatch.fnmatch(path_lower, wildcard_pattern) or fnmatch.fnmatch(basename_lower, wildcard_pattern)):
                     continue
             elif text not in path_lower and text not in basename_lower:
+                continue
+
+            if exclude_patterns and any(
+                _archive_entry_matches_text_pattern(path_lower, basename_lower, pattern)
+                for pattern in exclude_patterns
+            ):
+                continue
+        elif exclude_patterns:
+            path_lower = entry.path.lower()
+            basename_lower = entry.basename.lower()
+            if any(_archive_entry_matches_text_pattern(path_lower, basename_lower, pattern) for pattern in exclude_patterns):
                 continue
 
         if package_filter:
@@ -1343,10 +1432,12 @@ def prepare_archive_browser_state(
     entries: Sequence[ArchiveEntry],
     *,
     filter_text: str,
+    exclude_filter_text: str,
     extension_filter: str,
     package_filter_text: str,
     structure_filter: str,
     role_filter: str,
+    exclude_common_technical_suffixes: bool,
     min_size_kb: int,
     previewable_only: bool,
     build_structure_children: bool = True,
@@ -1364,10 +1455,12 @@ def prepare_archive_browser_state(
     filtered_entries = filter_archive_entries(
         entries,
         filter_text=filter_text,
+        exclude_filter_text=exclude_filter_text,
         extension_filter=extension_filter,
         package_filter_text=package_filter_text,
         structure_filter=structure_filter,
         role_filter=role_filter,
+        exclude_common_technical_suffixes=exclude_common_technical_suffixes,
         min_size_kb=min_size_kb,
         previewable_only=previewable_only,
     )
@@ -1780,15 +1873,55 @@ def directory_has_contents(path: Path) -> bool:
         return False
 
 
+def _background_delete_directory(path: Path) -> None:
+    if not path.exists():
+        return
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen(
+            ["cmd.exe", "/d", "/c", "rmdir", "/s", "/q", str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+        return
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def clear_directory_contents(path: Path) -> None:
     resolved = path.resolve()
     if resolved == Path(resolved.anchor):
         raise ValueError(f"Refusing to clear root directory: {resolved}")
-    for child in resolved.iterdir():
-        if child.is_dir():
-            shutil.rmtree(child)
-        else:
-            child.unlink()
+    resolved.mkdir(parents=True, exist_ok=True)
+    children = list(resolved.iterdir())
+    if not children:
+        return
+
+    trash_root = Path(
+        tempfile.mkdtemp(
+            prefix=f"__ctf_pending_delete_{resolved.name}_",
+            dir=str(resolved.parent),
+        )
+    )
+
+    try:
+        for child in children:
+            target = trash_root / child.name
+            suffix = 1
+            while target.exists():
+                target = trash_root / f"{child.name}.{suffix}"
+                suffix += 1
+            try:
+                child.replace(target)
+            except OSError:
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+        _background_delete_directory(trash_root)
+    except Exception:
+        shutil.rmtree(trash_root, ignore_errors=True)
+        raise
 
 
 def count_existing_archive_targets(entries: Sequence[ArchiveEntry], output_root: Path) -> int:

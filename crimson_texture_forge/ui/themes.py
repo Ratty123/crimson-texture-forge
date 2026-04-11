@@ -263,8 +263,8 @@ def build_app_stylesheet(theme_key: str) -> str:
     QGroupBox {{
         border: 1px solid {theme["border"]};
         border-radius: 5px;
-        margin-top: 13px;
-        padding-top: 10px;
+        margin-top: 18px;
+        padding-top: 12px;
         font-weight: 600;
         background: {theme["surface"]};
     }}
@@ -272,7 +272,8 @@ def build_app_stylesheet(theme_key: str) -> str:
         subcontrol-origin: margin;
         subcontrol-position: top left;
         left: 12px;
-        padding: 0 6px;
+        top: 1px;
+        padding: 1px 8px 2px 8px;
         color: {theme["text_strong"]};
         background: {theme["surface"]};
     }}
@@ -357,8 +358,8 @@ def build_app_stylesheet(theme_key: str) -> str:
         background: {theme["button"]};
         border: 1px solid {theme["button_border"]};
         border-radius: 4px;
-        padding: 6px 12px;
-        min-height: 18px;
+        padding: 7px 12px;
+        min-height: 22px;
     }}
     QPushButton:hover {{
         background: {theme["button_hover"]};
@@ -390,7 +391,7 @@ def build_app_stylesheet(theme_key: str) -> str:
         border-radius: 4px;
         background: {theme["field"]};
         text-align: center;
-        min-height: 18px;
+        min-height: 24px;
     }}
     QProgressBar::chunk {{
         border-radius: 3px;
@@ -424,7 +425,7 @@ def build_app_stylesheet(theme_key: str) -> str:
         border-radius: 5px;
         background: {theme["preview_bg"]};
         color: {theme["text_muted"]};
-        padding: 12px;
+        padding: 8px;
     }}
     QTabWidget::pane {{
         border: 1px solid {theme["border"]};
@@ -435,7 +436,8 @@ def build_app_stylesheet(theme_key: str) -> str:
     QTabBar::tab {{
         background: {theme["surface_alt"]};
         color: {theme["text_muted"]};
-        padding: 7px 14px;
+        padding: 8px 14px 9px 14px;
+        min-height: 24px;
         border: 1px solid {theme["border"]};
         border-bottom: none;
         border-top-left-radius: 4px;

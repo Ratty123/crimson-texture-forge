@@ -129,6 +129,7 @@ class TextSearchWorker(QObject):
 class TextSearchTab(QWidget):
     status_message_requested = Signal(str, bool)
     SYNTAX_HIGHLIGHT_CHAR_LIMIT = 2_000_000
+    AUTO_PREVIEW_RESULT_LIMIT = 4000
 
     def __init__(
         self,
@@ -309,8 +310,12 @@ class TextSearchTab(QWidget):
         self.preview_detail_label = QLabel("")
         self.preview_detail_label.setObjectName("HintLabel")
         self.preview_detail_label.setWordWrap(True)
-        preview_toolbar = QHBoxLayout()
-        preview_toolbar.setSpacing(8)
+        preview_toolbar = QVBoxLayout()
+        preview_toolbar.setSpacing(6)
+        preview_search_row = QHBoxLayout()
+        preview_search_row.setSpacing(8)
+        preview_options_row = QHBoxLayout()
+        preview_options_row.setSpacing(8)
         self.preview_find_edit = QLineEdit()
         self.preview_find_edit.setPlaceholderText("Find in preview")
         self.preview_find_prev_button = QPushButton("Prev")
@@ -323,6 +328,7 @@ class TextSearchTab(QWidget):
         self.preview_font_larger_button = QPushButton("A+")
         self.preview_find_status_label = QLabel("No preview loaded.")
         self.preview_find_status_label.setObjectName("HintLabel")
+        self.preview_find_status_label.setWordWrap(True)
         for button in (
             self.preview_find_prev_button,
             self.preview_find_next_button,
@@ -330,14 +336,16 @@ class TextSearchTab(QWidget):
             self.preview_font_larger_button,
         ):
             button.setMinimumWidth(42)
-        preview_toolbar.addWidget(self.preview_find_edit, stretch=1)
-        preview_toolbar.addWidget(self.preview_find_prev_button)
-        preview_toolbar.addWidget(self.preview_find_next_button)
-        preview_toolbar.addWidget(self.preview_find_case_checkbox)
-        preview_toolbar.addWidget(self.preview_wrap_checkbox)
-        preview_toolbar.addWidget(self.preview_font_smaller_button)
-        preview_toolbar.addWidget(self.preview_font_larger_button)
-        preview_toolbar.addWidget(self.preview_find_status_label)
+        preview_search_row.addWidget(self.preview_find_edit, stretch=1)
+        preview_search_row.addWidget(self.preview_find_prev_button)
+        preview_search_row.addWidget(self.preview_find_next_button)
+        preview_options_row.addWidget(self.preview_find_case_checkbox)
+        preview_options_row.addWidget(self.preview_wrap_checkbox)
+        preview_options_row.addWidget(self.preview_font_smaller_button)
+        preview_options_row.addWidget(self.preview_font_larger_button)
+        preview_options_row.addWidget(self.preview_find_status_label, stretch=1)
+        preview_toolbar.addLayout(preview_search_row)
+        preview_toolbar.addLayout(preview_options_row)
         self.preview_text_edit = CodePreviewEditor(theme_key=theme_key)
         preview_layout.addWidget(self.preview_title_label)
         preview_layout.addWidget(self.preview_meta_label)
@@ -554,6 +562,33 @@ class TextSearchTab(QWidget):
                 results.append(self.search_results[raw])
         return results
 
+    def current_result(self) -> Optional[TextSearchResult]:
+        item = self.results_tree.currentItem()
+        if item is None:
+            return None
+        raw = item.data(0, Qt.UserRole)
+        if isinstance(raw, int) and 0 <= raw < len(self.search_results):
+            return self.search_results[raw]
+        return None
+
+    def current_result_path(self) -> str:
+        result = self.current_result()
+        return result.relative_path if result is not None else ""
+
+    def current_results(self) -> List[TextSearchResult]:
+        return list(self.search_results)
+
+    def apply_regex_preset(self, pattern: str, extensions_text: str = "", path_hint: str = "") -> None:
+        self.regex_checkbox.setChecked(True)
+        self.query_edit.setText(pattern)
+        if extensions_text.strip():
+            self.extensions_edit.setText(extensions_text.strip())
+        if path_hint.strip():
+            self.path_filter_edit.setText(path_hint.strip())
+        self.source_combo.setCurrentIndex(max(0, self.source_combo.findData("archive")))
+        self._save_settings()
+        self.status_message_requested.emit("Regex preset applied to Text Search.", False)
+
     def start_search(self) -> None:
         if self.external_busy or self.search_thread is not None:
             return
@@ -657,7 +692,11 @@ class TextSearchTab(QWidget):
         self.search_results = data.get("results", []) if isinstance(data.get("results"), list) else []
         stats = data.get("stats")
         self.last_search_stats = stats if isinstance(stats, TextSearchRunStats) else TextSearchRunStats(source_kind="archive", candidate_count=0, searched_count=0)
+        auto_preview_enabled = len(self.search_results) <= self.AUTO_PREVIEW_RESULT_LIMIT
+        self.results_tree.blockSignals(True)
+        self.results_tree.setUpdatesEnabled(False)
         self.results_tree.clear()
+        new_items: List[QTreeWidgetItem] = []
         for index, result in enumerate(self.search_results):
             file_name = Path(result.relative_path).name or result.relative_path
             item = QTreeWidgetItem(
@@ -674,12 +713,22 @@ class TextSearchTab(QWidget):
             item.setToolTip(3, result.relative_path)
             item.setToolTip(4, result.extension)
             item.setData(0, Qt.UserRole, index)
-            self.results_tree.addTopLevelItem(item)
-        if self.search_results:
+            new_items.append(item)
+        if new_items:
+            self.results_tree.addTopLevelItems(new_items)
+        self.results_tree.setUpdatesEnabled(True)
+        self.results_tree.blockSignals(False)
+        if self.search_results and auto_preview_enabled:
             self.results_tree.setCurrentItem(self.results_tree.topLevelItem(0))
         else:
-            self.preview_title_label.setText("No matches")
-            self.preview_meta_label.setText("No matching file was found for the current query.")
+            if self.search_results:
+                self.preview_title_label.setText("Large result set")
+                self.preview_meta_label.setText("Select a file to preview. Auto-preview is disabled for large result sets to keep the UI responsive.")
+                self.preview_detail_label.setText("")
+            else:
+                self.preview_title_label.setText("No matches")
+                self.preview_meta_label.setText("No matching file was found for the current query.")
+                self.preview_detail_label.setText("")
             self.preview_detail_label.setText("")
             self.preview_text_edit.setPlainText("")
             self.preview_text_edit.set_match_selections([])
@@ -697,6 +746,8 @@ class TextSearchTab(QWidget):
             summary += f" Decrypted {self.last_search_stats.decrypted_count:,} archive file(s) during search."
         if self.last_search_stats.skipped_read_error_count:
             summary += f" {self.last_search_stats.skipped_read_error_count:,} file(s) could not be read."
+        if self.search_results and not auto_preview_enabled:
+            summary += " Auto-preview was skipped because the result set is very large."
         self.results_summary_label.setText(summary)
         self.search_progress_label.setText("Search complete.")
         self.search_progress_bar.setRange(0, 1)

@@ -4,7 +4,9 @@ import csv
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -12,7 +14,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from crimson_texture_forge.constants import *
 from crimson_texture_forge.models import *
@@ -349,6 +351,243 @@ def download_texconv_executable(
     return copy_url_to_file(download_url, destination_path, on_log=on_log)
 
 
+def discover_latest_realesrgan_ncnn_asset() -> Tuple[str, str]:
+    request = urllib.request.Request(REALESRGAN_NCNN_RELEASES_API_URL, headers={"User-Agent": APP_NAME})
+    releases = json.load(urllib.request.urlopen(request))
+    if not isinstance(releases, list):
+        raise ValueError("Unexpected response from Real-ESRGAN NCNN releases API.")
+
+    for release in releases:
+        if release.get("draft"):
+            continue
+        assets = release.get("assets", [])
+        if not isinstance(assets, list):
+            continue
+        for asset in assets:
+            name = str(asset.get("name", ""))
+            lowered = name.lower()
+            if not lowered.endswith(".zip"):
+                continue
+            if "windows" not in lowered and "win" not in lowered:
+                continue
+            if "realesrgan" not in lowered:
+                continue
+            url = asset.get("browser_download_url")
+            if isinstance(url, str) and url:
+                return url, name
+
+    raise ValueError("Could not find a Windows Real-ESRGAN NCNN portable zip in the official releases.")
+
+
+def download_realesrgan_ncnn_portable(
+    install_dir: Path,
+    *,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> Tuple[Path, Path]:
+    install_root = install_dir.expanduser().resolve()
+    install_root.mkdir(parents=True, exist_ok=True)
+    download_url, asset_name = discover_latest_realesrgan_ncnn_asset()
+    if on_log:
+        on_log(f"Found Real-ESRGAN NCNN package: {asset_name}")
+        on_log(f"Download URL: {download_url}")
+
+    temp_zip = Path(tempfile.mkdtemp(prefix="crimson_texture_forge_realesrgan_dl_")) / asset_name
+    try:
+        copy_url_to_file(download_url, temp_zip, on_log=on_log)
+        if on_log:
+            on_log(f"Extracting Real-ESRGAN NCNN into {install_root}")
+        with zipfile.ZipFile(temp_zip, "r") as archive:
+            archive.extractall(install_root)
+    finally:
+        try:
+            temp_zip.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            temp_zip.parent.rmdir()
+        except OSError:
+            pass
+
+    exe_candidates = sorted(
+        path for path in install_root.rglob("*.exe")
+        if path.name.lower() in {"realesrgan-ncnn-vulkan.exe", "realesrgan-ncnn.exe"}
+    )
+    if not exe_candidates:
+        raise ValueError("Downloaded Real-ESRGAN NCNN package did not contain the expected executable.")
+    exe_path = exe_candidates[0]
+
+    model_dir = exe_path.parent / "models"
+    if not model_dir.exists() or not model_dir.is_dir():
+        model_candidates = sorted(path for path in install_root.rglob("models") if path.is_dir())
+        if model_candidates:
+            model_dir = model_candidates[0]
+        else:
+            model_dir.mkdir(parents=True, exist_ok=True)
+            readme_path = model_dir / "README.txt"
+            if not readme_path.exists():
+                readme_path.write_text(
+                    "Place Real-ESRGAN NCNN model files here (.param + .bin pairs).\n"
+                    "The current official Windows portable package does not bundle models,\n"
+                    "so use the app's 'Import NCNN Models' action or copy model files here manually.\n",
+                    encoding="utf-8",
+                )
+            if on_log:
+                on_log(
+                    "The downloaded Real-ESRGAN NCNN package did not include bundled models. "
+                    "A model folder was created for you; import .param/.bin model files next."
+                )
+
+    return exe_path, model_dir
+
+
+def import_model_assets_to_directory(
+    sources: Sequence[Path],
+    destination_dir: Path,
+    *,
+    allowed_suffixes: Sequence[str],
+    on_log: Optional[Callable[[str], None]] = None,
+) -> List[Path]:
+    destination_root = destination_dir.expanduser().resolve()
+    destination_root.mkdir(parents=True, exist_ok=True)
+    allowed = {suffix.lower() for suffix in allowed_suffixes}
+    copied: List[Path] = []
+
+    def copy_candidate(candidate: Path) -> None:
+        if candidate.suffix.lower() not in allowed:
+            return
+        target = destination_root / candidate.name
+        shutil.copy2(candidate, target)
+        copied.append(target)
+        if on_log:
+            on_log(f"Imported model file: {target.name}")
+
+    for source in sources:
+        candidate = source.expanduser().resolve()
+        if not candidate.exists():
+            raise ValueError(f"Selected model source does not exist: {candidate}")
+        if candidate.is_dir():
+            for path in sorted(candidate.rglob("*")):
+                if path.is_file():
+                    copy_candidate(path)
+            continue
+        if candidate.is_file() and candidate.suffix.lower() == ".zip":
+            with zipfile.ZipFile(candidate, "r") as archive:
+                for member in archive.infolist():
+                    if member.is_dir():
+                        continue
+                    member_path = Path(member.filename)
+                    if member_path.suffix.lower() not in allowed:
+                        continue
+                    target = destination_root / member_path.name
+                    with archive.open(member, "r") as source_handle, target.open("wb") as target_handle:
+                        shutil.copyfileobj(source_handle, target_handle)
+                    copied.append(target)
+                    if on_log:
+                        on_log(f"Imported model file: {target.name}")
+            continue
+        if candidate.is_file():
+            copy_candidate(candidate)
+
+    if not copied:
+        raise ValueError(
+            f"No supported model files were found. Expected one of: {', '.join(sorted(allowed))}"
+        )
+    return copied
+
+
+def _iter_model_source_member_paths(sources: Sequence[Path]) -> List[Path]:
+    discovered: List[Path] = []
+    for source in sources:
+        candidate = source.expanduser().resolve()
+        if not candidate.exists():
+            raise ValueError(f"Selected model source does not exist: {candidate}")
+        if candidate.is_dir():
+            for path in sorted(candidate.rglob("*")):
+                if path.is_file():
+                    discovered.append(path.relative_to(candidate))
+            continue
+        if candidate.is_file() and candidate.suffix.lower() == ".zip":
+            with zipfile.ZipFile(candidate, "r") as archive:
+                for member in archive.infolist():
+                    if not member.is_dir():
+                        discovered.append(Path(member.filename))
+            continue
+        if candidate.is_file():
+            discovered.append(Path(candidate.name))
+    return discovered
+
+
+def validate_ncnn_model_import_sources(sources: Sequence[Path]) -> List[str]:
+    member_paths = _iter_model_source_member_paths(sources)
+    param_stems = {path.stem for path in member_paths if path.suffix.lower() == ".param"}
+    bin_stems = {path.stem for path in member_paths if path.suffix.lower() == ".bin"}
+    pairs = sorted(param_stems & bin_stems)
+    if not pairs:
+        raise ValueError(
+            "No matching NCNN model pairs were found. Expected at least one .param + .bin pair "
+            "with the same base name, for example 'realesr-animevideov3.param' and "
+            "'realesr-animevideov3.bin'."
+        )
+    return pairs
+
+
+def validate_onnx_model_import_sources(sources: Sequence[Path]) -> List[str]:
+    member_paths = _iter_model_source_member_paths(sources)
+    models = sorted({path.name for path in member_paths if path.suffix.lower() == ".onnx"})
+    if not models:
+        raise ValueError(
+            "No .onnx files were found in the selected source. Choose a folder, zip, or file set "
+            "that contains one or more ONNX model files."
+        )
+    return models
+
+
+def resolve_python_package_install_interpreter() -> Optional[Path]:
+    current_executable = Path(sys.executable).expanduser()
+    if current_executable.name.lower().startswith("python") and current_executable.exists():
+        return current_executable
+
+    repo_root = Path(__file__).resolve().parents[2]
+    venv_python = repo_root / ".venv" / "Scripts" / "python.exe"
+    if venv_python.exists():
+        return venv_python
+    return None
+
+
+def install_python_packages(
+    python_executable: Path,
+    packages: Sequence[str],
+    *,
+    on_log: Optional[Callable[[str], None]] = None,
+) -> str:
+    if not python_executable.exists():
+        raise ValueError(f"Python executable does not exist: {python_executable}")
+    if not packages:
+        raise ValueError("No Python packages were requested for installation.")
+
+    cmd = [str(python_executable), "-m", "pip", "install", "--upgrade", *packages]
+    if on_log:
+        on_log(f"Running: {' '.join(cmd)}")
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=creationflags,
+    )
+    if on_log:
+        for line in split_log_lines(proc.stdout):
+            on_log(f"pip: {line}")
+        for line in split_log_lines(proc.stderr):
+            on_log(f"pip: {line}")
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or f"pip failed with exit code {proc.returncode}"
+        raise ValueError(detail)
+    return str(python_executable)
+
+
 def _looks_like_windows_path(value: object) -> bool:
     return isinstance(value, str) and bool(re.match(r"^[A-Za-z]:[\\/]", value.strip()))
 
@@ -627,7 +866,20 @@ def normalize_chainner_console_line(raw_line: str) -> str:
     return text.strip()
 
 
+def should_suppress_chainner_noise_message(message: str) -> bool:
+    lowered = message.lower().strip()
+    if not lowered:
+        return True
+    return (
+        "body not consumed" in lowered
+        or "log.catcherrors is deprecated" in lowered
+        or ("request: get /sse" in lowered and "body not consumed" in lowered)
+    )
+
+
 def should_emit_chainner_log_line(message: str) -> bool:
+    if should_suppress_chainner_noise_message(message):
+        return False
     lowered = message.lower()
     return (
         lowered.startswith("read chain file")
@@ -705,6 +957,8 @@ class ChainnerLogMonitor:
     def _handle_line(self, raw_line: str) -> None:
         message = normalize_chainner_log_line(raw_line)
         if not message:
+            return
+        if should_suppress_chainner_noise_message(message):
             return
 
         progress_match = CHAINNER_PROGRESS_RE.search(message)
@@ -893,13 +1147,13 @@ def run_chainner_stage(
         png_progress_monitor.flush()
         for line in split_log_lines(stdout):
             message = normalize_chainner_console_line(line)
-            if not message or message in chainner_log_monitor.seen_messages:
+            if not message or should_suppress_chainner_noise_message(message) or message in chainner_log_monitor.seen_messages:
                 continue
             if on_log:
                 on_log(f"chaiNNer: {message}")
         for line in split_log_lines(stderr):
             message = normalize_chainner_console_line(line)
-            if not message or message in chainner_log_monitor.seen_messages:
+            if not message or should_suppress_chainner_noise_message(message) or message in chainner_log_monitor.seen_messages:
                 continue
             if on_log:
                 on_log(f"chaiNNer: {message}")

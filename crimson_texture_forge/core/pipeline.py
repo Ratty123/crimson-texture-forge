@@ -5,6 +5,7 @@ import fnmatch
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import struct
@@ -12,13 +13,73 @@ import sys
 import tempfile
 import threading
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
+
+try:
+    from PIL import Image as PilImage
+except Exception:  # pragma: no cover - optional preview helper
+    PilImage = None  # type: ignore[assignment]
 
 from crimson_texture_forge.constants import *
 from crimson_texture_forge.models import *
 from crimson_texture_forge.core.common import *
 from crimson_texture_forge.core.chainner import *
+from crimson_texture_forge.core.realesrgan_ncnn import *
+from crimson_texture_forge.core.upscale_onnx import *
+from crimson_texture_forge.core.upscale_profiles import (
+    classify_texture_type,
+    copy_mod_ready_loose_tree,
+    derive_texture_group_key,
+    is_png_intermediate_high_risk,
+    is_technical_texture_type,
+    suggest_texture_upscale_decision,
+    TexturePreviewSample,
+    TextureUpscaleDecision,
+)
+
+_DDS_ALPHA_CAPABLE_FORMATS = {
+    "R8G8B8A8_UNORM",
+    "R8G8B8A8_UNORM_SRGB",
+    "B8G8R8A8_UNORM",
+    "B8G8R8A8_UNORM_SRGB",
+    "BC1_UNORM",
+    "BC1_UNORM_SRGB",
+    "BC2_UNORM",
+    "BC2_UNORM_SRGB",
+    "BC3_UNORM",
+    "BC3_UNORM_SRGB",
+    "BC7_UNORM",
+    "BC7_UNORM_SRGB",
+    "R16G16B16A16_FLOAT",
+    "R16G16B16A16_SNORM",
+    "R32G32B32A32_FLOAT",
+}
+_LOOSE_SEMANTIC_SIDECAR_EXTENSIONS = {
+    ".xml",
+    ".material",
+    ".shader",
+    ".json",
+    ".lua",
+    ".txt",
+    ".ini",
+    ".cfg",
+    ".yaml",
+    ".yml",
+}
+_LOOSE_SIDECAR_TEXT_LIMIT = 196_608
+
+
+@dataclass(slots=True)
+class TextureProcessingPlanEntry:
+    dds_path: Path
+    relative_path: Path
+    dds_info: DdsInfo
+    decision: TextureUpscaleDecision
+    action: str
+    action_reason: str
+    requires_png_processing: bool
 
 def parse_dds(dds_path: Path) -> DdsInfo:
     with dds_path.open("rb") as handle:
@@ -53,6 +114,8 @@ def parse_dds(dds_path: Path) -> DdsInfo:
 
     texconv_format: Optional[str] = None
 
+    has_alpha = bool(pf_flags & DDPF_ALPHAPIXELS)
+
     if pf_flags & DDPF_FOURCC:
         if fourcc == b"DX10":
             if len(blob) < 148:
@@ -65,8 +128,13 @@ def parse_dds(dds_path: Path) -> DdsInfo:
         else:
             texconv_format = LEGACY_FOURCC_TO_TEXCONV.get(fourcc)
             if not texconv_format:
+                numeric_fourcc = read_u32_le(fourcc, 0)
+                texconv_format = LEGACY_NUMERIC_FOURCC_TO_TEXCONV.get(numeric_fourcc)
+            if not texconv_format:
                 pretty_fourcc = fourcc.decode("ascii", errors="replace")
-                raise ValueError(f"Unsupported legacy FOURCC format: {pretty_fourcc!r}")
+                raise ValueError(
+                    f"Unsupported legacy FOURCC format: {pretty_fourcc!r} (numeric={read_u32_le(fourcc, 0)})"
+                )
     elif pf_flags & DDPF_RGB:
         if rgb_bit_count == 32:
             if (r_mask, g_mask, b_mask, a_mask) == (
@@ -100,12 +168,16 @@ def parse_dds(dds_path: Path) -> DdsInfo:
     else:
         raise ValueError(f"Unsupported DDS pixel format flags: {pf_flags:#x}")
 
+    if texconv_format in _DDS_ALPHA_CAPABLE_FORMATS:
+        has_alpha = True
+
     return DdsInfo(
         width=width,
         height=height,
         mip_count=max(1, mip_count),
         texconv_format=texconv_format,
         source_path=dds_path,
+        has_alpha=has_alpha,
     )
 
 
@@ -120,6 +192,23 @@ def read_png_dimensions(png_path: Path) -> Tuple[int, int]:
             raise ValueError("PNG IHDR chunk is missing or invalid.")
         width, height = struct.unpack(">II", handle.read(8))
         return width, height
+
+
+def png_has_alpha_channel(png_path: Path) -> bool:
+    with png_path.open("rb") as handle:
+        signature = handle.read(8)
+        if signature != PNG_MAGIC:
+            raise ValueError("Not a PNG file or PNG signature is invalid.")
+        ihdr_len = struct.unpack(">I", handle.read(4))[0]
+        chunk_type = handle.read(4)
+        if chunk_type != b"IHDR" or ihdr_len != 13:
+            raise ValueError("PNG IHDR chunk is missing or invalid.")
+        handle.read(8)
+        handle.read(1)
+        color_type = handle.read(1)
+        if len(color_type) != 1:
+            raise ValueError("PNG IHDR color type is missing.")
+        return color_type[0] in {4, 6}
 
 
 def max_mips_for_size(width: int, height: int) -> int:
@@ -150,6 +239,18 @@ def ensure_existing_file(path: Path, label: str) -> Path:
     if not path.exists() or not path.is_file():
         raise ValueError(f"{label} does not exist or is not a file: {path}")
     return path
+
+
+def require_existing_dir(path: Optional[Path], label: str) -> Path:
+    if path is None:
+        raise ValueError(f"{label} is not set.")
+    return ensure_existing_dir(path, label)
+
+
+def require_existing_file(path: Optional[Path], label: str) -> Path:
+    if path is None:
+        raise ValueError(f"{label} is not set.")
+    return ensure_existing_file(path, label)
 
 
 def parse_filter_patterns(raw_text: str) -> Tuple[str, ...]:
@@ -265,6 +366,8 @@ def build_texconv_command(
     resize_width: Optional[int],
     resize_height: Optional[int],
     overwrite_existing_dds: bool,
+    color_args: Optional[Sequence[str]] = None,
+    extra_args: Optional[Sequence[str]] = None,
 ) -> List[str]:
     cmd = [str(texconv_path), "-nologo"]
 
@@ -287,8 +390,280 @@ def build_texconv_command(
     if resize_width is not None and resize_height is not None:
         cmd.extend(["-w", str(resize_width), "-h", str(resize_height)])
 
+    if color_args:
+        cmd.extend(str(arg) for arg in color_args if str(arg).strip())
+    if extra_args:
+        cmd.extend(str(arg) for arg in extra_args if str(arg).strip())
+
     cmd.append(str(png_path))
     return cmd
+
+
+def resolve_default_mod_ready_export_root(output_root: Path) -> Path:
+    return output_root.parent / f"{output_root.name}_{MOD_READY_EXPORT_DIRNAME}"
+
+
+def common_workspace_root_from_config(config: AppConfig) -> Optional[Path]:
+    candidates: List[Path] = []
+    for raw in (
+        config.original_dds_root,
+        config.png_root,
+        config.output_root,
+        config.dds_staging_root,
+        config.archive_extract_root,
+        config.mod_ready_export_root,
+    ):
+        text = str(raw).strip()
+        if not text:
+            continue
+        candidates.append(Path(text).expanduser())
+
+    if len(candidates) < 2:
+        return None
+
+    try:
+        common = Path(os.path.commonpath([str(path) for path in candidates]))
+    except ValueError:
+        return None
+
+    if common.name.lower() in {
+        "input_dds",
+        "png_upscaled",
+        "dds_final",
+        "png_staged_input",
+        "archive_extract",
+        MOD_READY_EXPORT_DIRNAME.lower(),
+    }:
+        return common.parent
+    return common
+
+
+def suggested_workspace_paths(base_dir: Path) -> Dict[str, Path]:
+    base = base_dir.expanduser().resolve()
+    tools_root = base / "tools"
+    chainner_dir = tools_root / "chaiNNer"
+    ncnn_dir = tools_root / "realesrgan_ncnn"
+    onnx_models_dir = tools_root / "onnx_models"
+    output_root = base / "dds_final"
+    return {
+        "original_dds_root": base / "input_dds",
+        "png_root": base / "png_upscaled",
+        "dds_staging_root": base / "png_staged_input",
+        "output_root": output_root,
+        "archive_extract_root": base / "archive_extract",
+        "tools_root": tools_root,
+        "texconv_path": tools_root / "texconv.exe",
+        "chainner_dir": chainner_dir,
+        "chainner_exe_path": chainner_dir / "chaiNNer.exe",
+        "ncnn_dir": ncnn_dir,
+        "ncnn_exe_path": ncnn_dir / "realesrgan-ncnn-vulkan.exe",
+        "ncnn_model_dir": ncnn_dir / "models",
+        "onnx_model_dir": onnx_models_dir,
+        "mod_ready_export_root": resolve_default_mod_ready_export_root(output_root),
+        "csv_log_path": base / "build_log.csv",
+    }
+
+
+def create_workspace_structure(base_dir: Path) -> Dict[str, Path]:
+    paths = suggested_workspace_paths(base_dir)
+    for key in (
+        "original_dds_root",
+        "png_root",
+        "dds_staging_root",
+        "output_root",
+        "archive_extract_root",
+        "tools_root",
+        "chainner_dir",
+        "ncnn_dir",
+        "ncnn_model_dir",
+        "onnx_model_dir",
+        "mod_ready_export_root",
+    ):
+        paths[key].mkdir(parents=True, exist_ok=True)
+    return paths
+
+
+def create_missing_directories_for_config(config: AppConfig) -> List[Path]:
+    created: List[Path] = []
+
+    def ensure_dir(path: Path) -> None:
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+            created.append(path)
+
+    for raw in (
+        config.original_dds_root,
+        config.png_root,
+        config.output_root,
+        config.dds_staging_root,
+        config.archive_extract_root,
+        config.mod_ready_export_root,
+        config.ncnn_model_dir,
+        config.onnx_model_dir,
+    ):
+        text = str(raw).strip()
+        if text:
+            ensure_dir(Path(text).expanduser().resolve())
+
+    if config.csv_log_enabled and config.csv_log_path.strip():
+        ensure_dir(Path(config.csv_log_path).expanduser().resolve().parent)
+
+    for raw in (
+        config.texconv_path,
+        config.chainner_exe_path,
+        config.chainner_chain_path,
+        config.ncnn_exe_path,
+    ):
+        text = str(raw).strip()
+        if text:
+            ensure_dir(Path(text).expanduser().resolve().parent)
+
+    return created
+
+
+def _srgb_variant(texconv_format: str) -> str:
+    mapping = {
+        "R8G8B8A8_UNORM": "R8G8B8A8_UNORM_SRGB",
+        "B8G8R8A8_UNORM": "B8G8R8A8_UNORM_SRGB",
+        "BC1_UNORM": "BC1_UNORM_SRGB",
+        "BC2_UNORM": "BC2_UNORM_SRGB",
+        "BC3_UNORM": "BC3_UNORM_SRGB",
+        "BC7_UNORM": "BC7_UNORM_SRGB",
+    }
+    return mapping.get(texconv_format, texconv_format)
+
+
+def _linear_variant(texconv_format: str) -> str:
+    mapping = {
+        "R8G8B8A8_UNORM_SRGB": "R8G8B8A8_UNORM",
+        "B8G8R8A8_UNORM_SRGB": "B8G8R8A8_UNORM",
+        "BC1_UNORM_SRGB": "BC1_UNORM",
+        "BC2_UNORM_SRGB": "BC2_UNORM",
+        "BC3_UNORM_SRGB": "BC3_UNORM",
+        "BC7_UNORM_SRGB": "BC7_UNORM",
+    }
+    return mapping.get(texconv_format, texconv_format)
+
+
+def apply_automatic_texture_rule_adjustments(
+    output_settings: DdsOutputSettings,
+    rel_path: Path,
+    dds_info: DdsInfo,
+    *,
+    has_alpha: bool,
+    preset: str,
+    sidecar_texts: Sequence[str] = (),
+    semantic_decision: Optional[TextureUpscaleDecision] = None,
+) -> DdsOutputSettings:
+    decision = semantic_decision or suggest_texture_upscale_decision(
+        rel_path.as_posix(),
+        preset=preset,
+        original_texconv_format=dds_info.texconv_format,
+        has_alpha=has_alpha,
+        sidecar_texts=sidecar_texts,
+        enable_automatic_rules=True,
+    )
+    next_settings = DdsOutputSettings(
+        texconv_format=output_settings.texconv_format,
+        mip_count=output_settings.mip_count,
+        width=output_settings.width,
+        height=output_settings.height,
+        resize_to_dimensions=output_settings.resize_to_dimensions,
+        notes=list(output_settings.notes),
+        texconv_color_args=list(output_settings.texconv_color_args),
+        texconv_extra_args=list(output_settings.texconv_extra_args),
+    )
+    current_format = next_settings.texconv_format.upper()
+    recommended = decision.recommended_texconv_format.upper()
+
+    updated_format = current_format
+    if decision.texture_type in {"color", "ui", "emissive", "impostor"}:
+        srgb_candidate = _srgb_variant(current_format)
+        if srgb_candidate != current_format:
+            updated_format = srgb_candidate
+        elif current_format == dds_info.texconv_format.upper() and recommended.endswith("_SRGB"):
+            updated_format = recommended
+    elif decision.texture_type == "normal":
+        if current_format.endswith("_SRGB") or current_format not in {"BC5_UNORM", "BC5_SNORM"}:
+            updated_format = recommended
+    elif decision.texture_type == "height":
+        linear_candidate = _linear_variant(current_format)
+        if "FLOAT" in dds_info.texconv_format.upper():
+            updated_format = dds_info.texconv_format.upper()
+        elif linear_candidate != current_format:
+            updated_format = linear_candidate
+        elif current_format.endswith("_SRGB") or current_format not in {"BC4_UNORM", "BC4_SNORM", "R8G8B8A8_UNORM", "B8G8R8A8_UNORM"}:
+            updated_format = recommended
+    elif decision.texture_type == "vector":
+        linear_candidate = _linear_variant(current_format)
+        if "FLOAT" in dds_info.texconv_format.upper():
+            updated_format = dds_info.texconv_format.upper()
+        elif linear_candidate != current_format:
+            updated_format = linear_candidate
+        elif current_format.endswith("_SRGB") or current_format != dds_info.texconv_format.upper():
+            updated_format = recommended
+    elif decision.texture_type == "roughness":
+        if current_format.endswith("_SRGB") or current_format not in {"BC4_UNORM", "BC4_SNORM"}:
+            updated_format = recommended
+    elif decision.texture_type == "mask":
+        linear_candidate = _linear_variant(current_format)
+        if linear_candidate != current_format:
+            updated_format = linear_candidate
+        elif current_format.endswith("_SRGB"):
+            updated_format = recommended
+
+    if updated_format != current_format:
+        next_settings.texconv_format = updated_format
+        next_settings.notes.append(
+            f"automatic texture rule: {decision.texture_type}/{decision.semantic_subtype} -> {updated_format}"
+        )
+    next_settings.texconv_color_args.clear()
+    if decision.recommended_colorspace == "srgb":
+        if next_settings.texconv_format.upper().endswith("_SRGB"):
+            next_settings.texconv_color_args.extend(["-srgb"])
+        else:
+            next_settings.texconv_color_args.extend(["-srgbi"])
+    elif decision.recommended_colorspace == "linear":
+        next_settings.texconv_color_args.extend(["--ignore-srgb"])
+
+    next_settings.texconv_extra_args = [
+        arg
+        for arg in next_settings.texconv_extra_args
+        if str(arg).strip().lower() not in {
+            "-sepalpha",
+            "--separate-alpha",
+            "--keep-coverage",
+            "-pmalpha",
+            "--premultiplied-alpha",
+        }
+    ]
+    if decision.alpha_mode in {"cutout"} and next_settings.mip_count > 1:
+        next_settings.texconv_extra_args.extend(["--keep-coverage", "0.5"])
+        next_settings.notes.append("auto-rule: alpha-tested cutout texture will preserve alpha coverage during mip generation.")
+    if decision.alpha_mode == "channel_data" and decision.preserve_alpha:
+        next_settings.texconv_extra_args.append("--separate-alpha")
+        next_settings.notes.append("auto-rule: alpha channel appears to store data, so separate-alpha mip handling is enabled.")
+    if decision.alpha_mode == "premultiplied":
+        next_settings.notes.append("auto-rule: possible premultiplied alpha detected; verify final blend behavior manually.")
+
+    for note in decision.notes:
+        prefixed = f"auto-rule: {note}"
+        if prefixed not in next_settings.notes:
+            next_settings.notes.append(prefixed)
+    if decision.texture_type in {"height", "vector"}:
+        if output_settings.width != dds_info.width or output_settings.height != dds_info.height:
+            next_settings.notes.append(
+                f"auto-rule: {decision.texture_type} map is using resized PNG dimensions; verify that the semantic data still makes sense."
+            )
+        if is_png_intermediate_high_risk(decision.texture_type, dds_info.texconv_format):
+            next_settings.notes.append(
+                f"auto-rule: {decision.texture_type} map may lose precision through PNG intermediates; compare carefully against the source."
+            )
+    if decision.semantic_subtype in {"orm", "rma", "mra", "arm", "packed_mask", "opacity_mask"}:
+        next_settings.notes.append(
+            f"auto-rule: packed-channel semantic '{decision.semantic_subtype}' detected; preserve exact channel meaning when reviewing results."
+        )
+    return next_settings
 
 
 def _validate_choice(value: str, allowed: Sequence[str], label: str) -> str:
@@ -372,6 +747,8 @@ def apply_texture_rule_to_output_settings(
         height=settings.height,
         resize_to_dimensions=settings.resize_to_dimensions,
         notes=list(settings.notes),
+        texconv_color_args=list(settings.texconv_color_args),
+        texconv_extra_args=list(settings.texconv_extra_args),
     )
 
     if rule.format_value and rule.format_value != DDS_FORMAT_MODE_MATCH_ORIGINAL:
@@ -469,8 +846,8 @@ def parse_texture_rules(raw_text: str) -> Tuple[TextureRule, ...]:
     return tuple(rules)
 
 
-def resolve_default_staging_png_root(png_root: Path, enable_chainner: bool) -> Path:
-    if not enable_chainner:
+def resolve_default_staging_png_root(png_root: Path, use_separate_output_root: bool) -> Path:
+    if not use_separate_output_root:
         return png_root
     return png_root.parent / f"{png_root.name}_staged_input"
 
@@ -528,6 +905,8 @@ def build_incremental_manifest_entry(
         "resize": output_settings.resize_to_dimensions,
         "width": output_settings.width,
         "height": output_settings.height,
+        "color_args": list(output_settings.texconv_color_args),
+        "extra_args": list(output_settings.texconv_extra_args),
     }
 
 
@@ -550,19 +929,377 @@ def manifest_entry_matches(
     return True
 
 
+def _read_loose_sidecar_text(path: Path) -> str:
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return ""
+    if not raw:
+        return ""
+    if len(raw) > _LOOSE_SIDECAR_TEXT_LIMIT:
+        raw = raw[:_LOOSE_SIDECAR_TEXT_LIMIT]
+    for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be", "latin-1"):
+        try:
+            return raw.decode(encoding, errors="ignore")
+        except Exception:
+            continue
+    return ""
+
+
+def _build_loose_sidecar_index(root: Path) -> Tuple[Dict[str, List[Path]], Dict[str, List[Path]]]:
+    by_group: Dict[str, List[Path]] = defaultdict(list)
+    by_folder: Dict[str, List[Path]] = defaultdict(list)
+    if not root.exists() or not root.is_dir():
+        return {}, {}
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in _LOOSE_SEMANTIC_SIDECAR_EXTENSIONS:
+            continue
+        try:
+            rel_text = path.relative_to(root).as_posix()
+        except Exception:
+            continue
+        by_group[derive_texture_group_key(rel_text)].append(path)
+        by_folder[str(path.relative_to(root).parent).replace("\\", "/")].append(path)
+    return dict(by_group), dict(by_folder)
+
+
+def _collect_loose_sidecar_texts(
+    root: Path,
+    relative_path: Path,
+    *,
+    sidecars_by_group: Dict[str, List[Path]],
+    sidecars_by_folder: Dict[str, List[Path]],
+    text_cache: Dict[Path, str],
+    limit: int = 6,
+) -> List[str]:
+    rel_text = relative_path.as_posix()
+    group_key = derive_texture_group_key(rel_text)
+    folder_key = str(relative_path.parent).replace("\\", "/")
+    candidates: List[Path] = []
+    seen: set[Path] = set()
+    for path in sidecars_by_group.get(group_key, []):
+        if path not in seen:
+            candidates.append(path)
+            seen.add(path)
+    for path in sidecars_by_folder.get(folder_key, []):
+        if path not in seen:
+            candidates.append(path)
+            seen.add(path)
+    snippets: List[str] = []
+    target_name = relative_path.name.lower()
+    target_stem = relative_path.stem.lower()
+    for path in candidates[:limit]:
+        text = text_cache.get(path)
+        if text is None:
+            text = _read_loose_sidecar_text(path)
+            text_cache[path] = text
+        lowered = text.lower()
+        if lowered and (target_name in lowered or target_stem in lowered or derive_texture_group_key(path.relative_to(root).as_posix()).lower() == group_key.lower()):
+            snippets.append(text)
+    return snippets
+
+
+def _collect_texture_preview_sample(image_path: Path) -> Optional[TexturePreviewSample]:
+    if PilImage is None:
+        return None
+    try:
+        image_module = cast(Any, PilImage)
+        with image_module.open(image_path) as image_handle:
+            image = cast(Any, image_handle)
+            working = image.convert("RGBA")
+            resampling = getattr(getattr(image_module, "Resampling", image_module), "BICUBIC", getattr(image_module, "BICUBIC", 3))
+            if max(working.size) > 64:
+                working.thumbnail((64, 64), resampling)
+            pixels = cast(List[Tuple[int, int, int, int]], list(working.getdata()))
+    except Exception:
+        return None
+
+    if not pixels:
+        return None
+
+    sample_count = len(pixels)
+    sum_r = sum_g = sum_b = sum_a = 0.0
+    sum_luma = 0.0
+    sum_chroma = 0.0
+    min_luma = 255.0
+    max_luma = 0.0
+    opaque_count = 0
+    transparent_count = 0
+
+    for r, g, b, a in pixels:
+        luma = (0.2126 * r) + (0.7152 * g) + (0.0722 * b)
+        chroma = float(max(r, g, b) - min(r, g, b))
+        sum_r += r
+        sum_g += g
+        sum_b += b
+        sum_a += a
+        sum_luma += luma
+        sum_chroma += chroma
+        min_luma = min(min_luma, luma)
+        max_luma = max(max_luma, luma)
+        if a >= 250:
+            opaque_count += 1
+        if a <= 5:
+            transparent_count += 1
+
+    return TexturePreviewSample(
+        mean_r=sum_r / sample_count,
+        mean_g=sum_g / sample_count,
+        mean_b=sum_b / sample_count,
+        mean_a=sum_a / sample_count,
+        luma_mean=sum_luma / sample_count,
+        luma_range=max_luma - min_luma,
+        mean_chroma=sum_chroma / sample_count,
+        opaque_fraction=opaque_count / sample_count,
+        transparent_fraction=transparent_count / sample_count,
+    )
+
+
+def _preview_sample_for_unknown_dds(texconv_path: Path, dds_path: Path, texture_type: str) -> Optional[TexturePreviewSample]:
+    if texture_type != "unknown":
+        return None
+    try:
+        preview_path = ensure_dds_preview_png(texconv_path, dds_path)
+    except Exception:
+        return None
+    return _collect_texture_preview_sample(preview_path)
+
+
+def build_texture_processing_plan(
+    normalized: NormalizedConfig,
+    dds_files: Sequence[Path],
+) -> List[TextureProcessingPlanEntry]:
+    sidecars_by_group, sidecars_by_folder = _build_loose_sidecar_index(normalized.original_dds_root)
+    sidecar_text_cache: Dict[Path, str] = {}
+    family_members_by_group: Dict[str, List[str]] = defaultdict(list)
+    for dds_path in dds_files:
+        rel_text = dds_path.relative_to(normalized.original_dds_root).as_posix()
+        family_members_by_group[derive_texture_group_key(rel_text)].append(rel_text)
+    plan: List[TextureProcessingPlanEntry] = []
+    for dds_path in dds_files:
+        rel_path = dds_path.relative_to(normalized.original_dds_root)
+        rel_display = rel_path.as_posix()
+        family_members = tuple(family_members_by_group.get(derive_texture_group_key(rel_display), ()))
+        coarse_texture_type = classify_texture_type(rel_display)
+        dds_info = parse_dds(dds_path)
+        sidecar_texts = _collect_loose_sidecar_texts(
+            normalized.original_dds_root,
+            rel_path,
+            sidecars_by_group=sidecars_by_group,
+            sidecars_by_folder=sidecars_by_folder,
+            text_cache=sidecar_text_cache,
+        )
+        preview_sample = _preview_sample_for_unknown_dds(normalized.texconv_path, dds_path, coarse_texture_type)
+        decision = suggest_texture_upscale_decision(
+            rel_display,
+            preset=normalized.upscale_texture_preset,
+            original_texconv_format=dds_info.texconv_format,
+            has_alpha=dds_info.has_alpha,
+            sidecar_texts=sidecar_texts,
+            enable_automatic_rules=normalized.enable_automatic_texture_rules,
+            family_members=family_members,
+            preview_sample=preview_sample,
+        )
+
+        if normalized.upscale_backend == UPSCALE_BACKEND_NONE:
+            action = "rebuild_from_png"
+            action_reason = "using the existing or staged PNG as DDS rebuild input"
+            requires_png_processing = True
+        elif not decision.should_upscale:
+            action = "preserve_original"
+            action_reason = f"preset excludes {decision.texture_type}/{decision.semantic_subtype}"
+            requires_png_processing = False
+        elif normalized.enable_automatic_texture_rules and decision.preserve_original_due_to_intermediate:
+            action = "preserve_original"
+            action_reason = f"automatic rules preserve {decision.texture_type}/{decision.semantic_subtype}"
+            requires_png_processing = False
+        else:
+            action = "upscale_then_rebuild"
+            if decision.intermediate_policy == "risky_png":
+                action_reason = f"upscale then rebuild, but PNG intermediate is risky for {decision.texture_type}/{decision.semantic_subtype}"
+            else:
+                action_reason = f"upscale then rebuild as {decision.texture_type}/{decision.semantic_subtype}"
+            requires_png_processing = True
+
+        plan.append(
+            TextureProcessingPlanEntry(
+                dds_path=dds_path,
+                relative_path=rel_path,
+                dds_info=dds_info,
+                decision=decision,
+                action=action,
+                action_reason=action_reason,
+                requires_png_processing=requires_png_processing,
+            )
+        )
+    return plan
+
+
+def _summarize_policy_size(
+    normalized: NormalizedConfig,
+    entry: TextureProcessingPlanEntry,
+) -> str:
+    dds_info = entry.dds_info
+    if entry.action == "preserve_original":
+        return f"{dds_info.width}x{dds_info.height} (unchanged)"
+    if normalized.dds_size_mode == DDS_SIZE_MODE_ORIGINAL:
+        return f"{dds_info.width}x{dds_info.height} (match original)"
+    if normalized.dds_size_mode == DDS_SIZE_MODE_CUSTOM:
+        return f"{normalized.dds_custom_width}x{normalized.dds_custom_height} (custom)"
+    if normalized.upscale_backend in {UPSCALE_BACKEND_REALESRGAN_NCNN, UPSCALE_BACKEND_ONNX_RUNTIME} and entry.requires_png_processing:
+        estimated_width = max(1, dds_info.width * max(1, normalized.ncnn_scale))
+        estimated_height = max(1, dds_info.height * max(1, normalized.ncnn_scale))
+        return f"{estimated_width}x{estimated_height} (estimated {normalized.ncnn_scale}x direct backend PNG)"
+    if normalized.upscale_backend == UPSCALE_BACKEND_NONE and normalized.enable_dds_staging:
+        return "staged PNG size (resolved from DDS-to-PNG conversion)"
+    return "final PNG size (resolved at rebuild time)"
+
+
+def _summarize_policy_mips(
+    normalized: NormalizedConfig,
+    entry: TextureProcessingPlanEntry,
+) -> str:
+    dds_info = entry.dds_info
+    if entry.action == "preserve_original":
+        return f"{dds_info.mip_count} (unchanged)"
+    if normalized.dds_mip_mode == DDS_MIP_MODE_MATCH_ORIGINAL:
+        return f"{dds_info.mip_count} (match original)"
+    if normalized.dds_mip_mode == DDS_MIP_MODE_SINGLE:
+        return "1 (single mip)"
+    if normalized.dds_mip_mode == DDS_MIP_MODE_CUSTOM:
+        return f"{normalized.dds_custom_mip_count} (custom)"
+    return "full chain"
+
+
+def build_texture_policy_preview_payload(
+    normalized: NormalizedConfig,
+    dds_files: Sequence[Path],
+    *,
+    processing_plan: Sequence[TextureProcessingPlanEntry] = (),
+) -> Dict[str, object]:
+    plan = list(processing_plan) if processing_plan else build_texture_processing_plan(normalized, dds_files)
+    rows: List[Dict[str, object]] = []
+    action_counts: Dict[str, int] = defaultdict(int)
+    semantic_counts: Dict[str, int] = defaultdict(int)
+    for entry in plan:
+        final_action = entry.action
+        final_reason = entry.action_reason
+        output_format = entry.dds_info.texconv_format
+        detail_notes = list(entry.decision.notes)
+        if entry.action != "preserve_original":
+            output_settings = resolve_dds_output_settings(
+                normalized,
+                entry.dds_info,
+                entry.dds_info.width,
+                entry.dds_info.height,
+            )
+            rule = find_matching_texture_rule(entry.relative_path, normalized.texture_rules)
+            if rule is not None:
+                updated_settings, rule_message = apply_texture_rule_to_output_settings(output_settings, rule)
+                detail_notes.append(rule_message)
+                if updated_settings is None:
+                    final_action = "skip_by_rule"
+                    final_reason = rule_message
+                else:
+                    output_settings = updated_settings
+            if final_action != "skip_by_rule" and normalized.enable_automatic_texture_rules:
+                output_settings = apply_automatic_texture_rule_adjustments(
+                    output_settings,
+                    entry.relative_path,
+                    entry.dds_info,
+                    has_alpha=entry.dds_info.has_alpha,
+                    preset=normalized.upscale_texture_preset,
+                    semantic_decision=entry.decision,
+                )
+            if final_action == "skip_by_rule":
+                output_format = "-"
+            else:
+                output_format = output_settings.texconv_format
+                detail_notes.extend(output_settings.notes)
+        action_counts[final_action] += 1
+        semantic_counts[entry.decision.semantic_subtype] += 1
+        rows.append(
+            {
+                "path": entry.relative_path.as_posix(),
+                "texture_type": entry.decision.texture_type,
+                "semantic_subtype": entry.decision.semantic_subtype,
+                "semantic_confidence": entry.decision.semantic_confidence,
+                "alpha_mode": entry.decision.alpha_mode,
+                "packed_channels": list(entry.decision.packed_channels),
+                "intermediate_policy": entry.decision.intermediate_policy,
+                "original_format": entry.dds_info.texconv_format,
+                "planned_format": output_format,
+                "size_policy": _summarize_policy_size(normalized, entry),
+                "mip_policy": _summarize_policy_mips(normalized, entry),
+                "action": final_action,
+                "action_reason": final_reason,
+                "requires_png_processing": entry.requires_png_processing,
+                "source_evidence": list(entry.decision.source_evidence),
+                "notes": detail_notes,
+            }
+        )
+
+    return {
+        "rows": rows,
+        "summary": {
+            "total_files": len(plan),
+            "actions": dict(sorted(action_counts.items())),
+            "semantic_subtypes": dict(sorted(semantic_counts.items())),
+            "backend": normalized.upscale_backend,
+            "png_root": str(normalized.png_root),
+            "output_root": str(normalized.output_root),
+            "staging_root": str(normalized.dds_staging_root) if normalized.dds_staging_root else "",
+        },
+    }
+
+
 def build_preflight_report_lines(
     normalized: NormalizedConfig,
     dds_files: Sequence[Path],
     *,
+    processing_plan: Sequence[TextureProcessingPlanEntry] = (),
     chain_analysis: Optional[ChainnerChainAnalysis] = None,
     texture_rules: Sequence[TextureRule] = (),
 ) -> List[str]:
     total_dds_bytes = 0
+    texture_type_counts: Dict[str, int] = defaultdict(int)
+    semantic_subtype_counts: Dict[str, int] = defaultdict(int)
+    action_counts: Dict[str, int] = defaultdict(int)
+    high_risk_examples: List[str] = []
+    high_precision_examples: List[str] = []
+    plan_by_rel: Dict[str, TextureProcessingPlanEntry] = {
+        entry.relative_path.as_posix(): entry for entry in processing_plan
+    }
+    policy_examples: List[str] = []
     for path in dds_files:
         try:
             total_dds_bytes += path.stat().st_size
         except OSError:
             continue
+        rel_text = path.relative_to(normalized.original_dds_root).as_posix()
+        plan_entry = plan_by_rel.get(rel_text)
+        if plan_entry is not None:
+            texture_type = plan_entry.decision.texture_type
+            semantic_subtype = plan_entry.decision.semantic_subtype
+            action_counts[plan_entry.action] += 1
+            semantic_subtype_counts[semantic_subtype] += 1
+            if len(policy_examples) < 8:
+                policy_examples.append(
+                    f"{rel_text} -> {plan_entry.action} [{texture_type}/{semantic_subtype}]"
+                )
+        else:
+            texture_type = classify_texture_type(rel_text)
+            semantic_subtype = texture_type
+        texture_type_counts[texture_type] += 1
+        if len(high_risk_examples) < 5 and texture_type in {"height", "vector"}:
+            high_risk_examples.append(rel_text)
+        if len(high_precision_examples) < 5:
+            try:
+                info = plan_entry.dds_info if plan_entry is not None else parse_dds(path)
+            except Exception:
+                info = None
+            if info is not None and ("FLOAT" in info.texconv_format or "SNORM" in info.texconv_format):
+                high_precision_examples.append(f"{rel_text} [{info.texconv_format}]")
 
     lines = [
         "Preflight report:",
@@ -570,19 +1307,30 @@ def build_preflight_report_lines(
         f"- Original DDS root: {normalized.original_dds_root}",
         f"- PNG root: {normalized.png_root}",
         f"- Output root: {normalized.output_root}",
+        f"- Upscaling backend: {normalized.upscale_backend}",
         f"- DDS staging: {'enabled' if normalized.enable_dds_staging else 'disabled'}",
     ]
 
     if normalized.enable_dds_staging and normalized.dds_staging_root is not None:
         lines.append(f"- DDS staging root: {normalized.dds_staging_root}")
-        if normalized.enable_chainner:
+        if normalized.upscale_backend == UPSCALE_BACKEND_CHAINNER:
             lines.append(
                 "Warning: DDS-to-PNG conversion is enabled before chaiNNer. "
-                "Your chain must read PNG files from the staging root or another matching PNG folder, "
-                "and it must not keep reading DDS from Original DDS root unless that is intentional."
+                "PNG-input chains should read PNG files from the staging root or another matching PNG folder. "
+                "DDS-direct chains can ignore the staged PNGs if that is intentional."
             )
-        if normalized.enable_chainner and "${staging_png_root}" not in normalized.chainner_override_json:
+        if normalized.upscale_backend == UPSCALE_BACKEND_CHAINNER and "${staging_png_root}" not in normalized.chainner_override_json:
             lines.append("- Warning: staging is enabled, but your chaiNNer overrides do not reference ${staging_png_root}.")
+        if normalized.upscale_backend == UPSCALE_BACKEND_REALESRGAN_NCNN:
+            lines.append(
+                "Warning: DDS-to-PNG conversion is enabled before Real-ESRGAN NCNN. "
+                "The NCNN stage will read source PNGs from the staging root and write its output into PNG root."
+            )
+        if normalized.upscale_backend == UPSCALE_BACKEND_ONNX_RUNTIME:
+            lines.append(
+                "Warning: DDS-to-PNG conversion is enabled before ONNX Runtime. "
+                "The ONNX stage will read source PNGs from the staging root and write its output into PNG root."
+            )
 
     lines.extend(
         [
@@ -591,6 +1339,38 @@ def build_preflight_report_lines(
             f"- Estimated source DDS data: {total_dds_bytes / (1024 * 1024):.1f} MiB",
         ]
     )
+    if texture_type_counts:
+        type_summary = ", ".join(
+            f"{texture_type}={count}"
+            for texture_type, count in sorted(texture_type_counts.items(), key=lambda item: (-item[1], item[0]))
+        )
+        lines.append(f"- Texture-type summary: {type_summary}")
+    if semantic_subtype_counts:
+        subtype_summary = ", ".join(
+            f"{subtype}={count}"
+            for subtype, count in sorted(semantic_subtype_counts.items(), key=lambda item: (-item[1], item[0]))
+        )
+        lines.append(f"- Semantic subtype summary: {subtype_summary}")
+    if action_counts:
+        action_summary = ", ".join(
+            f"{action}={count}"
+            for action, count in sorted(action_counts.items(), key=lambda item: (-item[1], item[0]))
+        )
+        lines.append(f"- Per-texture policy summary: {action_summary}")
+    if policy_examples:
+        lines.append("- Policy examples:")
+        for example in policy_examples[:6]:
+            lines.append(f"  {example}")
+    if high_risk_examples:
+        lines.append(
+            "- Warning: precision-sensitive technical maps were detected "
+            f"({'; '.join(high_risk_examples[:3])}). Safer presets keep these out of the upscale path."
+        )
+    if high_precision_examples:
+        lines.append(
+            "- Warning: float/snorm DDS formats were detected "
+            f"({'; '.join(high_precision_examples[:3])}). PNG intermediates can lose precision for these assets."
+        )
 
     try:
         usage = shutil.disk_usage(normalized.output_root if normalized.output_root.exists() else normalized.output_root.parent)
@@ -598,6 +1378,40 @@ def build_preflight_report_lines(
     except OSError:
         lines.append("- Free disk space near output root: unavailable")
 
+    if normalized.upscale_backend == UPSCALE_BACKEND_REALESRGAN_NCNN:
+        lines.append(f"- Real-ESRGAN NCNN executable: {normalized.ncnn_exe_path}")
+        lines.append(f"- Real-ESRGAN NCNN model folder: {normalized.ncnn_model_dir}")
+        lines.append(f"- Real-ESRGAN NCNN model: {normalized.ncnn_model_name}")
+        lines.append(
+            f"- Real-ESRGAN NCNN scale/tile/preset: {normalized.ncnn_scale}x / tile {normalized.ncnn_tile_size} / {normalized.upscale_texture_preset}"
+        )
+        lines.append(f"- Direct post-upscale correction: {normalized.upscale_post_correction_mode}")
+    elif normalized.upscale_backend == UPSCALE_BACKEND_ONNX_RUNTIME:
+        lines.append(f"- ONNX model folder: {normalized.onnx_model_dir}")
+        lines.append(f"- ONNX model: {normalized.onnx_model_name}")
+        lines.append(
+            f"- ONNX expected scale/tile/preset: {normalized.ncnn_scale}x / tile {normalized.ncnn_tile_size} / {normalized.upscale_texture_preset}"
+        )
+        lines.append(f"- Direct post-upscale correction: {normalized.upscale_post_correction_mode}")
+    lines.append(
+        f"- Automatic color/format rules: {'enabled' if normalized.enable_automatic_texture_rules else 'disabled'}"
+    )
+    lines.append(
+        f"- Retry with smaller tile: {'enabled' if normalized.retry_smaller_tile_on_failure else 'disabled'}"
+    )
+    if normalized.enable_automatic_texture_rules:
+        lines.append(
+            "- Automatic rules now keep color-like textures sRGB-aware, prefer BC5 for normals, apply alpha-aware mip hints for cutout data, distinguish grayscale/packed technical maps more explicitly, and preserve original float/vector or packed-data DDS files when the PNG intermediate would be unsafe."
+        )
+    if normalized.upscale_backend != UPSCALE_BACKEND_NONE:
+        lines.append(
+            "- Safe preset behavior: files excluded by the selected preset are copied through as original DDS files instead of being rebuilt from PNG."
+        )
+    lines.append(
+        f"- Mod-ready loose export: {'enabled' if normalized.enable_mod_ready_loose_export else 'disabled'}"
+    )
+    if normalized.enable_mod_ready_loose_export and normalized.mod_ready_export_root is not None:
+        lines.append(f"- Mod-ready export root: {normalized.mod_ready_export_root}")
     if chain_analysis and chain_analysis.warnings:
         lines.append("- chaiNNer preflight warnings:")
         for warning in chain_analysis.warnings[:5]:
@@ -687,7 +1501,7 @@ def stage_dds_to_pngs(
     if on_phase:
         on_phase("DDS Staging", "Extracting DDS files to PNG...", False)
     if on_log:
-        on_log(f"Phase 0/2: staging DDS files to PNG in {stage_root}")
+        on_log(f"Phase 0/2: staging policy-selected DDS files to PNG in {stage_root}")
     if on_phase_progress:
         on_phase_progress(0, total, f"0 / {total} DDS staging files")
 
@@ -757,13 +1571,28 @@ def build_compare_preview_pane_result(
         return ComparePreviewPaneResult(status="error", message=str(exc))
 
 
-def normalize_config(config: AppConfig) -> NormalizedConfig:
+def normalize_config(config: AppConfig, *, validate_backend_runtime: bool = True) -> NormalizedConfig:
+    upscale_backend = str(getattr(config, "upscale_backend", "") or "").strip().lower()
+    if upscale_backend not in {
+        UPSCALE_BACKEND_NONE,
+        UPSCALE_BACKEND_CHAINNER,
+        UPSCALE_BACKEND_REALESRGAN_NCNN,
+        UPSCALE_BACKEND_ONNX_RUNTIME,
+    }:
+        upscale_backend = UPSCALE_BACKEND_CHAINNER if config.enable_chainner else UPSCALE_BACKEND_NONE
+    use_chainner = upscale_backend == UPSCALE_BACKEND_CHAINNER
+    use_ncnn = upscale_backend == UPSCALE_BACKEND_REALESRGAN_NCNN
+    use_onnx = upscale_backend == UPSCALE_BACKEND_ONNX_RUNTIME
+
     original_dds_root = ensure_existing_dir(
         normalize_required_path(config.original_dds_root, "Original DDS root"),
         "Original DDS root",
     )
     png_root = normalize_required_path(config.png_root, "PNG root")
-    if not config.enable_chainner and not config.enable_dds_staging:
+    if not config.enable_dds_staging and (
+        upscale_backend == UPSCALE_BACKEND_NONE
+        or (validate_backend_runtime and upscale_backend in {UPSCALE_BACKEND_REALESRGAN_NCNN, UPSCALE_BACKEND_ONNX_RUNTIME})
+    ):
         ensure_existing_dir(png_root, "PNG root")
     output_root = normalize_required_path(config.output_root, "Output root")
     texconv_path = ensure_existing_file(
@@ -779,24 +1608,128 @@ def normalize_config(config: AppConfig) -> NormalizedConfig:
 
     chainner_exe_path: Optional[Path] = None
     chainner_chain_path: Optional[Path] = None
-    if config.enable_chainner:
-        chainner_exe_path = ensure_existing_file(
-            normalize_required_path(config.chainner_exe_path, "chaiNNer executable path"),
-            "chaiNNer executable path",
-        )
-        chainner_chain_path = ensure_existing_file(
-            normalize_required_path(config.chainner_chain_path, "chaiNNer chain path"),
-            "chaiNNer chain path",
-        )
+    if use_chainner:
+        if validate_backend_runtime:
+            chainner_exe_path = ensure_existing_file(
+                normalize_required_path(config.chainner_exe_path, "chaiNNer executable path"),
+                "chaiNNer executable path",
+            )
+            chainner_chain_path = ensure_existing_file(
+                normalize_required_path(config.chainner_chain_path, "chaiNNer chain path"),
+                "chaiNNer chain path",
+            )
+        else:
+            chainner_exe_path = normalize_optional_path(config.chainner_exe_path)
+            chainner_chain_path = normalize_optional_path(config.chainner_chain_path)
+
+    ncnn_exe_path: Optional[Path] = None
+    ncnn_model_dir: Optional[Path] = None
+    ncnn_model_name = ""
+    ncnn_scale = int(getattr(config, "ncnn_scale", REALESRGAN_NCNN_SCALE))
+    ncnn_tile_size = int(getattr(config, "ncnn_tile_size", REALESRGAN_NCNN_TILE_SIZE))
+    upscale_post_correction_mode = str(
+        getattr(config, "upscale_post_correction_mode", DEFAULT_UPSCALE_POST_CORRECTION) or ""
+    ).strip().lower() or DEFAULT_UPSCALE_POST_CORRECTION
+    upscale_texture_preset = str(getattr(config, "upscale_texture_preset", DEFAULT_UPSCALE_TEXTURE_PRESET) or "").strip().lower() or DEFAULT_UPSCALE_TEXTURE_PRESET
+    upscale_post_correction_mode = _validate_choice(
+        upscale_post_correction_mode,
+        (
+            UPSCALE_POST_CORRECTION_NONE,
+            UPSCALE_POST_CORRECTION_MATCH_MEAN_LUMA,
+            UPSCALE_POST_CORRECTION_MATCH_LEVELS,
+            UPSCALE_POST_CORRECTION_MATCH_HISTOGRAM,
+        ),
+        "post-upscale correction mode",
+    )
+    if use_ncnn:
+        explicit_model_dir = normalize_optional_path(config.ncnn_model_dir)
+        if validate_backend_runtime:
+            ncnn_exe_path = ensure_existing_file(
+                normalize_required_path(config.ncnn_exe_path, "Real-ESRGAN NCNN executable path"),
+                "Real-ESRGAN NCNN executable path",
+            )
+            resolved_model_dir = resolve_ncnn_model_dir(ncnn_exe_path, explicit_model_dir)
+            if resolved_model_dir is None:
+                raise ValueError(
+                    "Real-ESRGAN NCNN model folder is not set and no default 'models' folder was found beside the executable."
+                )
+            ncnn_model_dir = ensure_existing_dir(resolved_model_dir, "Real-ESRGAN NCNN model folder")
+            discovered_models = discover_realesrgan_ncnn_models(ncnn_exe_path, ncnn_model_dir)
+            if not discovered_models:
+                raise ValueError(f"No Real-ESRGAN NCNN models (.param + .bin) were found in {ncnn_model_dir}.")
+            available_model_names = {name for name, _ in discovered_models}
+            ncnn_model_name = config.ncnn_model_name.strip() or next(iter(sorted(available_model_names)))
+            if ncnn_model_name not in available_model_names:
+                raise ValueError(
+                    f"Real-ESRGAN NCNN model '{ncnn_model_name}' was not found in {ncnn_model_dir}."
+                )
+        else:
+            ncnn_exe_path = normalize_optional_path(config.ncnn_exe_path)
+            ncnn_model_dir = resolve_ncnn_model_dir(ncnn_exe_path, explicit_model_dir) or explicit_model_dir
+            ncnn_model_name = config.ncnn_model_name.strip()
+        if ncnn_scale not in {2, 3, 4}:
+            raise ValueError("Real-ESRGAN NCNN scale must be 2, 3, or 4.")
+        if ncnn_tile_size < 0:
+            raise ValueError("Real-ESRGAN NCNN tile size must be 0 or greater.")
+        if upscale_texture_preset not in {
+            UPSCALE_TEXTURE_PRESET_BALANCED,
+            UPSCALE_TEXTURE_PRESET_COLOR_UI,
+            UPSCALE_TEXTURE_PRESET_COLOR_UI_EMISSIVE,
+            UPSCALE_TEXTURE_PRESET_ALL,
+        }:
+            raise ValueError(f"Unknown upscale texture preset: {upscale_texture_preset}")
+
+    onnx_model_dir: Optional[Path] = None
+    onnx_model_name = ""
+    if use_onnx:
+        explicit_onnx_model_dir = normalize_optional_path(getattr(config, "onnx_model_dir", ""))
+        if validate_backend_runtime:
+            if not is_onnxruntime_available():
+                raise ValueError(onnxruntime_error_message() or "onnxruntime is not available.")
+            resolved_onnx_model_dir = resolve_onnx_model_dir(explicit_onnx_model_dir)
+            if resolved_onnx_model_dir is None:
+                raise ValueError("ONNX model folder is not set.")
+            onnx_model_dir = ensure_existing_dir(resolved_onnx_model_dir, "ONNX model folder")
+            discovered_onnx_models = discover_onnx_models(onnx_model_dir)
+            if not discovered_onnx_models:
+                raise ValueError(f"No ONNX models (.onnx) were found in {onnx_model_dir}.")
+            available_onnx_model_names = {path.stem for path in discovered_onnx_models}
+            onnx_model_name = str(getattr(config, "onnx_model_name", "") or "").strip() or next(iter(sorted(available_onnx_model_names)))
+            if onnx_model_name not in available_onnx_model_names:
+                raise ValueError(f"ONNX model '{onnx_model_name}' was not found in {onnx_model_dir}.")
+        else:
+            onnx_model_dir = resolve_onnx_model_dir(explicit_onnx_model_dir)
+            onnx_model_name = str(getattr(config, "onnx_model_name", "") or "").strip()
+        if ncnn_scale < 1:
+            raise ValueError("ONNX expected scale must be at least 1.")
+        if ncnn_tile_size < 0:
+            raise ValueError("ONNX tile size must be 0 or greater.")
+        if upscale_texture_preset not in {
+            UPSCALE_TEXTURE_PRESET_BALANCED,
+            UPSCALE_TEXTURE_PRESET_COLOR_UI,
+            UPSCALE_TEXTURE_PRESET_COLOR_UI_EMISSIVE,
+            UPSCALE_TEXTURE_PRESET_ALL,
+        }:
+            raise ValueError(f"Unknown upscale texture preset: {upscale_texture_preset}")
+
+    enable_automatic_texture_rules = bool(getattr(config, "enable_automatic_texture_rules", ENABLE_AUTOMATIC_TEXTURE_RULES))
+    retry_smaller_tile_on_failure = bool(getattr(config, "retry_smaller_tile_on_failure", RETRY_SMALLER_TILE_ON_FAILURE))
+    enable_mod_ready_loose_export = bool(getattr(config, "enable_mod_ready_loose_export", ENABLE_MOD_READY_LOOSE_EXPORT))
+    mod_ready_export_root: Optional[Path] = None
+    if enable_mod_ready_loose_export:
+        explicit_mod_ready_export_root = normalize_optional_path(getattr(config, "mod_ready_export_root", ""))
+        mod_ready_export_root = explicit_mod_ready_export_root or resolve_default_mod_ready_export_root(output_root)
+        if mod_ready_export_root.resolve() == output_root.resolve():
+            raise ValueError("Mod-ready export root must be different from the main output root.")
 
     dds_staging_root: Optional[Path] = None
     if config.enable_dds_staging:
         if config.dds_staging_root.strip():
             dds_staging_root = normalize_required_path(config.dds_staging_root, "DDS staging root")
         else:
-            dds_staging_root = resolve_default_staging_png_root(png_root, config.enable_chainner).resolve()
-        if config.enable_chainner and dds_staging_root.resolve() == png_root.resolve():
-            raise ValueError("DDS staging root must be different from the final PNG root when chaiNNer is enabled.")
+            dds_staging_root = resolve_default_staging_png_root(png_root, use_chainner or use_ncnn or use_onnx).resolve()
+        if validate_backend_runtime and (use_chainner or use_ncnn or use_onnx) and dds_staging_root.resolve() == png_root.resolve():
+            raise ValueError("DDS staging root must be different from the final PNG root when an upscaling backend is enabled.")
 
     dds_format_mode = _validate_choice(
         config.dds_format_mode,
@@ -850,12 +1783,82 @@ def normalize_config(config: AppConfig) -> NormalizedConfig:
         allow_unique_basename_fallback=config.allow_unique_basename_fallback,
         overwrite_existing_dds=config.overwrite_existing_dds,
         include_filter_patterns=parse_filter_patterns(config.include_filters),
-        enable_chainner=config.enable_chainner,
+        upscale_backend=upscale_backend,
+        enable_chainner=use_chainner,
         chainner_exe_path=chainner_exe_path,
         chainner_chain_path=chainner_chain_path,
         chainner_override_json=config.chainner_override_json,
+        ncnn_exe_path=ncnn_exe_path,
+        ncnn_model_dir=ncnn_model_dir,
+        ncnn_model_name=ncnn_model_name,
+        ncnn_scale=ncnn_scale,
+        ncnn_tile_size=ncnn_tile_size,
+        upscale_post_correction_mode=upscale_post_correction_mode,
+        onnx_model_dir=onnx_model_dir,
+        onnx_model_name=onnx_model_name,
+        upscale_texture_preset=upscale_texture_preset,
+        enable_automatic_texture_rules=enable_automatic_texture_rules,
+        retry_smaller_tile_on_failure=retry_smaller_tile_on_failure,
+        enable_mod_ready_loose_export=enable_mod_ready_loose_export,
+        mod_ready_export_root=mod_ready_export_root,
         texture_rules=parsed_texture_rules,  # type: ignore[call-arg]
     )
+
+
+def validate_backend_runtime_requirements(normalized: NormalizedConfig) -> NormalizedConfig:
+    backend = normalized.upscale_backend
+    if backend == UPSCALE_BACKEND_NONE:
+        return normalized
+
+    if normalized.enable_dds_staging and normalized.dds_staging_root is not None:
+        if normalized.dds_staging_root.resolve() == normalized.png_root.resolve():
+            raise ValueError("DDS staging root must be different from the final PNG root when an upscaling backend is enabled.")
+
+    if backend == UPSCALE_BACKEND_CHAINNER:
+        normalized.chainner_exe_path = require_existing_file(normalized.chainner_exe_path, "chaiNNer executable path")
+        normalized.chainner_chain_path = require_existing_file(normalized.chainner_chain_path, "chaiNNer chain path")
+        return normalized
+
+    if backend == UPSCALE_BACKEND_REALESRGAN_NCNN:
+        normalized.ncnn_exe_path = require_existing_file(normalized.ncnn_exe_path, "Real-ESRGAN NCNN executable path")
+        if not normalized.enable_dds_staging:
+            ensure_existing_dir(normalized.png_root, "PNG root")
+        resolved_model_dir = resolve_ncnn_model_dir(normalized.ncnn_exe_path, normalized.ncnn_model_dir)
+        if resolved_model_dir is None:
+            raise ValueError(
+                "Real-ESRGAN NCNN model folder is not set and no default 'models' folder was found beside the executable."
+            )
+        normalized.ncnn_model_dir = ensure_existing_dir(resolved_model_dir, "Real-ESRGAN NCNN model folder")
+        discovered_models = discover_realesrgan_ncnn_models(normalized.ncnn_exe_path, normalized.ncnn_model_dir)
+        if not discovered_models:
+            raise ValueError(f"No Real-ESRGAN NCNN models (.param + .bin) were found in {normalized.ncnn_model_dir}.")
+        available_model_names = {name for name, _ in discovered_models}
+        normalized.ncnn_model_name = normalized.ncnn_model_name.strip() or next(iter(sorted(available_model_names)))
+        if normalized.ncnn_model_name not in available_model_names:
+            raise ValueError(
+                f"Real-ESRGAN NCNN model '{normalized.ncnn_model_name}' was not found in {normalized.ncnn_model_dir}."
+            )
+        return normalized
+
+    if backend == UPSCALE_BACKEND_ONNX_RUNTIME:
+        if not is_onnxruntime_available():
+            raise ValueError(onnxruntime_error_message() or "onnxruntime is not available.")
+        if not normalized.enable_dds_staging:
+            ensure_existing_dir(normalized.png_root, "PNG root")
+        resolved_onnx_model_dir = resolve_onnx_model_dir(normalized.onnx_model_dir)
+        if resolved_onnx_model_dir is None:
+            raise ValueError("ONNX model folder is not set.")
+        normalized.onnx_model_dir = ensure_existing_dir(resolved_onnx_model_dir, "ONNX model folder")
+        discovered_onnx_models = discover_onnx_models(normalized.onnx_model_dir)
+        if not discovered_onnx_models:
+            raise ValueError(f"No ONNX models (.onnx) were found in {normalized.onnx_model_dir}.")
+        available_onnx_model_names = {path.stem for path in discovered_onnx_models}
+        normalized.onnx_model_name = normalized.onnx_model_name.strip() or next(iter(sorted(available_onnx_model_names)))
+        if normalized.onnx_model_name not in available_onnx_model_names:
+            raise ValueError(f"ONNX model '{normalized.onnx_model_name}' was not found in {normalized.onnx_model_dir}.")
+        return normalized
+
+    return normalized
 
 
 def scan_dds_files(config: AppConfig, stop_event: Optional[threading.Event] = None) -> ScanResult:
@@ -1101,7 +2104,7 @@ def rebuild_dds_files(
     on_phase_progress: Optional[Callable[[int, int, str], None]] = None,
     stop_event: Optional[threading.Event] = None,
 ) -> RunSummary:
-    normalized = normalize_config(config)
+    normalized = normalize_config(config, validate_backend_runtime=False)
     normalized.output_root.mkdir(parents=True, exist_ok=True)
     active_png_root = normalized.png_root
 
@@ -1123,7 +2126,7 @@ def rebuild_dds_files(
 
     emit_log(
         "Build configuration: "
-        f"chaiNNer={'enabled' if normalized.enable_chainner else 'disabled'}, "
+        f"upscale_backend={normalized.upscale_backend}, "
         f"dds_staging={'enabled' if normalized.enable_dds_staging else 'disabled'}, "
         f"incremental_resume={'enabled' if normalized.enable_incremental_resume else 'disabled'}, "
         f"dry_run={'on' if normalized.dry_run else 'off'}, "
@@ -1132,11 +2135,65 @@ def rebuild_dds_files(
         f"dds_mip_mode={normalized.dds_mip_mode}, "
         f"overwrite_existing_dds={'on' if normalized.overwrite_existing_dds else 'off'}."
     )
-    if normalized.enable_chainner:
+    if normalized.upscale_backend == UPSCALE_BACKEND_CHAINNER:
         emit_log(f"chaiNNer executable: {normalized.chainner_exe_path}")
         emit_log(f"chaiNNer chain: {normalized.chainner_chain_path}")
+    elif normalized.upscale_backend == UPSCALE_BACKEND_REALESRGAN_NCNN:
+        emit_log(f"Real-ESRGAN NCNN executable: {normalized.ncnn_exe_path}")
+        emit_log(f"Real-ESRGAN NCNN model folder: {normalized.ncnn_model_dir}")
+        emit_log(f"Real-ESRGAN NCNN model: {normalized.ncnn_model_name}")
+        emit_log(
+            f"Real-ESRGAN NCNN scale/tile/preset: {normalized.ncnn_scale}x / tile {normalized.ncnn_tile_size} / {normalized.upscale_texture_preset}"
+        )
+        emit_log(f"Direct post-upscale correction: {normalized.upscale_post_correction_mode}")
+    elif normalized.upscale_backend == UPSCALE_BACKEND_ONNX_RUNTIME:
+        emit_log(f"ONNX model folder: {normalized.onnx_model_dir}")
+        emit_log(f"ONNX model: {normalized.onnx_model_name}")
+        emit_log(
+            f"ONNX expected scale/tile/preset: {normalized.ncnn_scale}x / tile {normalized.ncnn_tile_size} / {normalized.upscale_texture_preset}"
+        )
+        emit_log(f"Direct post-upscale correction: {normalized.upscale_post_correction_mode}")
     else:
-        emit_log("chaiNNer stage is disabled, so the app will rebuild DDS from the existing PNG root.")
+        emit_log("Upscaling stage is disabled, so the app will rebuild DDS from the existing PNG root.")
+    emit_log(
+        f"Automatic texture rules={'enabled' if normalized.enable_automatic_texture_rules else 'disabled'}, "
+        f"retry_smaller_tile={'enabled' if normalized.retry_smaller_tile_on_failure else 'disabled'}, "
+        f"mod_ready_export={'enabled' if normalized.enable_mod_ready_loose_export else 'disabled'}."
+    )
+    if normalized.enable_dds_staging:
+        if normalized.upscale_backend == UPSCALE_BACKEND_CHAINNER:
+            emit_log(
+                f"File flow: Original DDS -> Staging PNG root ({normalized.dds_staging_root}) -> chaiNNer -> PNG root ({normalized.png_root}) -> DDS rebuild -> Output root ({normalized.output_root})"
+            )
+        elif normalized.upscale_backend == UPSCALE_BACKEND_REALESRGAN_NCNN:
+            emit_log(
+                f"File flow: Original DDS -> Staging PNG root ({normalized.dds_staging_root}) -> Real-ESRGAN NCNN -> PNG root ({normalized.png_root}) -> DDS rebuild -> Output root ({normalized.output_root})"
+            )
+        elif normalized.upscale_backend == UPSCALE_BACKEND_ONNX_RUNTIME:
+            emit_log(
+                f"File flow: Original DDS -> Staging PNG root ({normalized.dds_staging_root}) -> ONNX Runtime -> PNG root ({normalized.png_root}) -> DDS rebuild -> Output root ({normalized.output_root})"
+            )
+        else:
+            emit_log(
+                f"File flow: Original DDS -> PNG root ({normalized.png_root}). With no backend selected, processing stops after PNG conversion."
+            )
+    else:
+        if normalized.upscale_backend == UPSCALE_BACKEND_CHAINNER:
+            emit_log(
+                f"File flow: Existing PNG root ({normalized.png_root}) -> chaiNNer -> PNG root ({normalized.png_root}) -> DDS rebuild -> Output root ({normalized.output_root})"
+            )
+        elif normalized.upscale_backend == UPSCALE_BACKEND_REALESRGAN_NCNN:
+            emit_log(
+                f"File flow: Existing PNG root ({normalized.png_root}) -> Real-ESRGAN NCNN -> PNG root ({normalized.png_root}) -> DDS rebuild -> Output root ({normalized.output_root})"
+            )
+        elif normalized.upscale_backend == UPSCALE_BACKEND_ONNX_RUNTIME:
+            emit_log(
+                f"File flow: Existing PNG root ({normalized.png_root}) -> ONNX Runtime -> PNG root ({normalized.png_root}) -> DDS rebuild -> Output root ({normalized.output_root})"
+            )
+        else:
+            emit_log(
+                f"File flow: Existing PNG root ({normalized.png_root}) -> DDS rebuild -> Output root ({normalized.output_root})"
+            )
 
     emit_log("Scanning DDS files...")
     dds_files = collect_dds_files(
@@ -1153,59 +2210,116 @@ def rebuild_dds_files(
         on_total(total)
     emit_progress(0, total, 0, 0, 0)
 
-    chain_analysis = analyze_chainner_chain(normalized.chainner_chain_path, normalized) if normalized.enable_chainner and normalized.chainner_chain_path else None
+    processing_plan = build_texture_processing_plan(normalized, dds_files)
+    plan_by_rel = {entry.relative_path.as_posix(): entry for entry in processing_plan}
+    dds_files_requiring_png = [entry.dds_path for entry in processing_plan if entry.requires_png_processing]
+
+    if normalized.upscale_backend == UPSCALE_BACKEND_NONE or dds_files_requiring_png:
+        normalized = validate_backend_runtime_requirements(normalized)
+    elif normalized.upscale_backend != UPSCALE_BACKEND_NONE:
+        emit_log(
+            "Backend/runtime validation was skipped because the current preset and automatic rules kept every matched DDS out of the PNG/upscale path."
+        )
+
+    chain_analysis = (
+        analyze_chainner_chain(normalized.chainner_chain_path, normalized)
+        if normalized.enable_chainner and normalized.chainner_chain_path and dds_files_requiring_png
+        else None
+    )
     for line in build_preflight_report_lines(
         normalized,
         dds_files,
+        processing_plan=processing_plan,
         chain_analysis=chain_analysis,
         texture_rules=normalized.texture_rules,
     ):
         emit_log(line)
 
-    if normalized.enable_dds_staging:
+    if normalized.enable_dds_staging and dds_files_requiring_png:
         stage_dds_to_pngs(
             normalized,
-            dds_files,
+            dds_files_requiring_png,
             on_log=on_log,
             on_phase=on_phase,
             on_phase_progress=on_phase_progress,
             on_current_file=on_current_file,
             stop_event=stop_event,
         )
-        if not normalized.enable_chainner and normalized.dds_staging_root is not None:
+        if normalized.upscale_backend == UPSCALE_BACKEND_NONE and normalized.dds_staging_root is not None:
             active_png_root = normalized.dds_staging_root
+    elif normalized.enable_dds_staging:
+        emit_log("DDS staging skipped because no files require PNG/upscale processing under the current policy.")
 
-    if normalized.enable_chainner:
+    if normalized.upscale_backend == UPSCALE_BACKEND_CHAINNER and dds_files_requiring_png:
         run_chainner_stage(
             normalized,
-            expected_output_total=total,
+            expected_output_total=len(dds_files_requiring_png),
             on_log=on_log,
             on_phase=on_phase,
             on_phase_progress=on_phase_progress,
             on_current_file=on_current_file,
             stop_event=stop_event,
         )
-
-    emit_phase("DDS Rebuild", "Indexing PNG files...", False)
-    emit_phase_progress(0, 0, "Indexing PNG files...")
-    emit_log("Indexing PNG files...")
-    relative_png_index, basename_png_index, png_count = find_png_matches(
-        active_png_root,
-        stop_event=stop_event,
-    )
-    emit_log(f"Indexed {png_count} PNG files.")
-    if normalized.enable_chainner and png_count == 0:
-        chain_analysis = chain_analysis or ChainnerChainAnalysis()
-        detail = ""
-        if chain_analysis.warnings:
-            detail = " " + " | ".join(chain_analysis.warnings[:3])
-        raise ValueError(
-            "chaiNNer finished, but no PNG files were found in the configured PNG root. "
-            "The chain likely still points at old folders or writes somewhere else."
-            + detail
+    elif normalized.upscale_backend == UPSCALE_BACKEND_REALESRGAN_NCNN and dds_files_requiring_png:
+        run_realesrgan_ncnn_stage(
+            normalized,
+            on_log=on_log,
+            on_phase=on_phase,
+            on_phase_progress=on_phase_progress,
+            on_current_file=on_current_file,
+            stop_event=stop_event,
         )
+    elif normalized.upscale_backend == UPSCALE_BACKEND_ONNX_RUNTIME and dds_files_requiring_png:
+        run_onnx_stage(
+            normalized,
+            on_log=on_log,
+            on_phase=on_phase,
+            on_phase_progress=on_phase_progress,
+            on_current_file=on_current_file,
+            stop_event=stop_event,
+        )
+    elif normalized.upscale_backend != UPSCALE_BACKEND_NONE:
+        emit_log("No files require direct PNG/upscale processing under the current preset and automatic rules. The selected backend will be skipped.")
+
+    relative_png_index: Dict[str, Path] = {}
+    basename_png_index: Dict[str, List[Path]] = {}
+    png_count = 0
+    if dds_files_requiring_png:
+        emit_phase("DDS Rebuild", "Indexing PNG files...", False)
+        emit_phase_progress(0, 0, "Indexing PNG files...")
+        emit_log("Indexing PNG files...")
+        relative_png_index, basename_png_index, png_count = find_png_matches(
+            active_png_root,
+            stop_event=stop_event,
+        )
+        emit_log(f"Indexed {png_count} PNG files.")
+        if normalized.upscale_backend == UPSCALE_BACKEND_CHAINNER and png_count == 0 and dds_files_requiring_png:
+            chain_analysis = chain_analysis or ChainnerChainAnalysis()
+            detail = ""
+            if chain_analysis.warnings:
+                detail = " " + " | ".join(chain_analysis.warnings[:3])
+            raise ValueError(
+                "chaiNNer finished, but no PNG files were found in the configured PNG root. "
+                "The chain likely still points at old folders or writes somewhere else."
+                + detail
+            )
+        if normalized.upscale_backend == UPSCALE_BACKEND_REALESRGAN_NCNN and png_count == 0 and dds_files_requiring_png:
+            raise ValueError(
+                "Real-ESRGAN NCNN finished, but no PNG files were found in the configured PNG root. "
+                "Verify the NCNN executable, model folder, and selected model."
+            )
+        if normalized.upscale_backend == UPSCALE_BACKEND_ONNX_RUNTIME and png_count == 0 and dds_files_requiring_png:
+            raise ValueError(
+                "ONNX Runtime finished, but no PNG files were found in the configured PNG root. "
+                "Verify the ONNX model folder, selected model, and runtime installation."
+            )
+    else:
+        emit_log("No policy-selected files require PNG matching. DDS rebuild will use preserve-original copy-through actions only.")
     emit_phase_progress(0, total, f"0 / {total} DDS files")
-    emit_log(f"Found {total} DDS files to process.")
+    emit_log(
+        f"Found {total} DDS files to process. "
+        f"{len(dds_files_requiring_png)} file(s) require PNG/upscale processing under the current policy."
+    )
     emit_phase("DDS Rebuild", "Converting PNG files to DDS...", False)
 
     results: List[JobResult] = []
@@ -1233,6 +2347,83 @@ def rebuild_dds_files(
                 on_current_file(rel_display)
             emit_progress(index - 1, total, converted, skipped, failed)
             emit_phase_progress(index - 1, total, f"{index - 1} / {total} DDS files")
+
+            plan_entry = plan_by_rel.get(rel_display)
+            dds_info = plan_entry.dds_info if plan_entry is not None else parse_dds(dds_path)
+            decision = (
+                plan_entry.decision
+                if plan_entry is not None
+                else suggest_texture_upscale_decision(
+                    rel_display,
+                    preset=normalized.upscale_texture_preset,
+                    original_texconv_format=dds_info.texconv_format,
+                    has_alpha=dds_info.has_alpha,
+                    enable_automatic_rules=normalized.enable_automatic_texture_rules,
+                )
+            )
+            if normalized.upscale_backend != UPSCALE_BACKEND_NONE and (
+                not decision.should_upscale or decision.preserve_original_due_to_intermediate
+            ):
+                target_dir.mkdir(parents=True, exist_ok=True)
+                note_parts = [
+                    (
+                        f"automatic policy preserved source DDS [{decision.texture_type}/{decision.semantic_subtype}]"
+                        if decision.preserve_original_due_to_intermediate
+                        else f"preset kept source DDS unchanged [{decision.texture_type}/{decision.semantic_subtype}]"
+                    ),
+                    *decision.notes,
+                ]
+                if target_file.exists() and not normalized.overwrite_existing_dds:
+                    skipped += 1
+                    note = "; ".join(note_parts + ["existing DDS kept because overwrite is disabled"])
+                    results.append(
+                        JobResult(
+                            original_dds=str(dds_path),
+                            png="",
+                            output_dir=str(target_dir),
+                            width=dds_info.width,
+                            height=dds_info.height,
+                            original_mips=dds_info.mip_count,
+                            used_mips=dds_info.mip_count,
+                            texconv_format=dds_info.texconv_format,
+                            status="skipped",
+                            note=note,
+                        )
+                    )
+                    emit_log(f"[{index}/{total}] SKIP {rel_display} -> {note}")
+                    emit_progress(index, total, converted, skipped, failed)
+                    emit_phase_progress(index, total, f"{index} / {total} DDS files")
+                    continue
+
+                if normalized.dry_run:
+                    converted += 1
+                    status = "dry-run"
+                    note = "; ".join(note_parts + ["planned DDS passthrough"])
+                    emit_log(f"[{index}/{total}] DRYRUN COPY {rel_display} [{decision.texture_type}] -> original DDS passthrough")
+                else:
+                    shutil.copy2(dds_path, target_file)
+                    converted += 1
+                    status = "converted"
+                    note = "; ".join(note_parts)
+                    emit_log(f"[{index}/{total}] COPY {rel_display} [{decision.texture_type}] -> kept original DDS")
+
+                results.append(
+                    JobResult(
+                        original_dds=str(dds_path),
+                        png="",
+                        output_dir=str(target_dir),
+                        width=dds_info.width,
+                        height=dds_info.height,
+                        original_mips=dds_info.mip_count,
+                        used_mips=dds_info.mip_count,
+                        texconv_format=dds_info.texconv_format,
+                        status=status,
+                        note=note,
+                    )
+                )
+                emit_progress(index, total, converted, skipped, failed)
+                emit_phase_progress(index, total, f"{index} / {total} DDS files")
+                continue
 
             png_path, match_note = resolve_png(
                 rel_path,
@@ -1263,8 +2454,8 @@ def rebuild_dds_files(
                 continue
 
             try:
-                dds_info = parse_dds(dds_path)
                 png_width, png_height = read_png_dimensions(png_path)
+                png_has_alpha = png_has_alpha_channel(png_path)
                 notes = [match_note]
                 output_settings = resolve_dds_output_settings(normalized, dds_info, png_width, png_height)
                 rule = find_matching_texture_rule(rel_path, normalized.texture_rules)
@@ -1292,6 +2483,15 @@ def rebuild_dds_files(
                         emit_phase_progress(index, total, f"{index} / {total} DDS files")
                         continue
                     output_settings = updated_settings
+                if normalized.enable_automatic_texture_rules:
+                    output_settings = apply_automatic_texture_rule_adjustments(
+                        output_settings,
+                        rel_path,
+                        dds_info,
+                        has_alpha=png_has_alpha,
+                        preset=normalized.upscale_texture_preset,
+                        semantic_decision=decision,
+                    )
                 notes.extend(output_settings.notes)
 
                 if manifest_path is not None and manifest_entry_matches(
@@ -1354,6 +2554,8 @@ def rebuild_dds_files(
                     resize_width=output_settings.width if output_settings.resize_to_dimensions else None,
                     resize_height=output_settings.height if output_settings.resize_to_dimensions else None,
                     overwrite_existing_dds=normalized.overwrite_existing_dds,
+                    color_args=output_settings.texconv_color_args,
+                    extra_args=output_settings.texconv_extra_args,
                 )
 
                 action = "DRYRUN" if normalized.dry_run else "BUILD"
@@ -1431,6 +2633,26 @@ def rebuild_dds_files(
     if normalized.csv_log_path:
         write_csv_log(normalized.csv_log_path, results)
         emit_log(f"CSV log written to: {normalized.csv_log_path}")
+
+    if (
+        normalized.enable_mod_ready_loose_export
+        and normalized.mod_ready_export_root is not None
+        and not cancelled
+        and failed == 0
+    ):
+        emit_phase("Loose Export", "Copying final DDS output to mod-ready loose export...", False)
+        emit_log(f"Copying final DDS output to mod-ready loose export: {normalized.mod_ready_export_root}")
+        export_result = copy_mod_ready_loose_tree(
+            normalized.output_root,
+            normalized.mod_ready_export_root,
+            overwrite=True,
+            dry_run=normalized.dry_run,
+            on_log=None,
+        )
+        emit_log(
+            "Mod-ready loose export complete: "
+            f"copied={export_result.copied_files}, skipped={export_result.skipped_files}, failed={export_result.failed_files}"
+        )
 
     return RunSummary(
         total_files=total,

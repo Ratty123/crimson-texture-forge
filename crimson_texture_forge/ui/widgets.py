@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 from PySide6.QtCore import QRect, QSize, Qt, Signal
 from PySide6.QtGui import (
@@ -43,7 +43,9 @@ class PreviewLabel(QLabel):
         self._source_pixmap: Optional[QPixmap] = None
         self._zoom_factor = 1.0
         self._fit_to_view = True
+        self._fit_scale = 1.0
         self._scroll_area = None
+        self._wheel_zoom_handler: Optional[Callable[[int], None]] = None
         self._drag_active = False
         self._drag_start_global_pos = None
         self._drag_start_h = 0
@@ -63,6 +65,9 @@ class PreviewLabel(QLabel):
         self._scroll_area = scroll_area
         scroll_area.resized.connect(self._handle_viewport_resize)
 
+    def set_wheel_zoom_handler(self, handler: Optional[Callable[[int], None]]) -> None:
+        self._wheel_zoom_handler = handler
+
     def set_zoom_factor(self, zoom_factor: float) -> None:
         self._zoom_factor = max(0.1, zoom_factor)
         if self._source_pixmap is not None:
@@ -73,9 +78,19 @@ class PreviewLabel(QLabel):
         if self._source_pixmap is not None:
             self._apply_scaled_pixmap(self.text())
 
+    def set_fit_scale(self, fit_scale: float) -> None:
+        self._fit_scale = max(0.5, min(4.0, fit_scale))
+        if self._source_pixmap is not None and self._fit_to_view:
+            self._apply_scaled_pixmap(self.text())
+
     def set_preview_pixmap(self, pixmap: QPixmap, fallback_text: str) -> None:
         self._source_pixmap = pixmap
         self._apply_scaled_pixmap(fallback_text)
+
+    def current_display_scale(self) -> float:
+        if self._source_pixmap is None or self._source_pixmap.isNull() or self._source_pixmap.width() <= 0:
+            return 1.0
+        return max(0.1, self.width() / float(self._source_pixmap.width()))
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
@@ -119,10 +134,22 @@ class PreviewLabel(QLabel):
             return
         super().mouseReleaseEvent(event)
 
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        delta_y = event.angleDelta().y()
+        if (
+            self._wheel_zoom_handler is not None
+            and self._source_pixmap is not None
+            and not self._source_pixmap.isNull()
+            and delta_y != 0
+        ):
+            step = 1 if delta_y > 0 else -1
+            self._wheel_zoom_handler(step)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
     def _can_pan(self) -> bool:
         if self._source_pixmap is None or self._source_pixmap.isNull() or self._scroll_area is None:
-            return False
-        if self._fit_to_view:
             return False
         viewport = self._scroll_area.viewport().size()
         return self.width() > viewport.width() or self.height() > viewport.height()
@@ -144,8 +171,8 @@ class PreviewLabel(QLabel):
 
         if self._fit_to_view and self._scroll_area is not None:
             viewport = self._scroll_area.viewport().size()
-            width = max(1, viewport.width() - 6)
-            height = max(1, viewport.height() - 6)
+            width = max(1, int(round((viewport.width() - 6) * self._fit_scale)))
+            height = max(1, int(round((viewport.height() - 6) * self._fit_scale)))
         else:
             width = max(1, int(round(self._source_pixmap.width() * self._zoom_factor)))
             height = max(1, int(round(self._source_pixmap.height() * self._zoom_factor)))
@@ -490,11 +517,28 @@ class CodePreviewEditor(QPlainTextEdit):
 
 class LogHighlighter(QSyntaxHighlighter):
     _timestamp_re = re.compile(r"^\[\d{2}:\d{2}:\d{2}\]")
-    _error_re = re.compile(r"\b(ERROR|Traceback|Exception|FAILED)\b", re.IGNORECASE)
-    _warning_re = re.compile(r"\b(warning|preflight)\b", re.IGNORECASE)
-    _success_re = re.compile(r"\b(complete|completed|finished|ready|successfully)\b", re.IGNORECASE)
+    _error_re = re.compile(r"\b(ERROR|Traceback|Exception|FAILED|failure|fatal)\b", re.IGNORECASE)
+    _warning_re = re.compile(r"\b(warning|preflight|skip|skipped)\b", re.IGNORECASE)
+    _success_re = re.compile(r"\b(complete|completed|finished|ready|successfully|correct)\b", re.IGNORECASE)
     _phase_re = re.compile(r"\bPhase\s+\d+/\d+\b", re.IGNORECASE)
-    _path_re = re.compile(r"[A-Za-z]:\\[^\r\n<>|\"*?]+")
+    _windows_path_re = re.compile(r"[A-Za-z]:\\[^\r\n<>|\"*?]+")
+    _relative_path_re = re.compile(r"(?<![\w.-])(?:[\w.-]+[\\/]){2,}[\w.-]+")
+    _progress_re = re.compile(r"\[\d+/\d+\]|\b\d+(?:[.,]\d+)?%")
+    _action_re = re.compile(
+        r"\b(UPSCALE|BUILD|COPY|DRYRUN|SYNCING|INDEXING|SCANNING|STARTING|RUNNING|LOADING|REFRESHING|EXTRACTING|CONVERTING|VALIDATING|RETRYING|FOUND)\b",
+        re.IGNORECASE,
+    )
+    _backend_re = re.compile(r"\b(Real-ESRGAN NCNN|ONNX Runtime|chaiNNer|texconv(?:\.exe)?)\b", re.IGNORECASE)
+    _correction_mode_re = re.compile(r"\b(Match Mean Luma|Match Levels|Match Histogram)\b", re.IGNORECASE)
+    _texture_type_re = re.compile(r"\[(color|ui|emissive|impostor|normal|height|vector|roughness|mask|unknown)\]")
+    _key_value_re = re.compile(r"\b([a-z_]+)=([^\s,;()]+)", re.IGNORECASE)
+    _label_re = re.compile(
+        r"\b(scale|tile|preset|model|format|mips|output|png|backend|correction|mean|range|source|providers?|folder|executable|input|root)\b",
+        re.IGNORECASE,
+    )
+    _dimension_re = re.compile(r"\b\d+x\d+\b")
+    _number_re = re.compile(r"(?<![\w./\\-])\d+(?:[.,]\d+)?\b")
+    _arrow_re = re.compile(r"->")
 
     def __init__(self, document, theme_key: str):
         super().__init__(document)
@@ -504,36 +548,136 @@ class LogHighlighter(QSyntaxHighlighter):
         self.success_format = QTextCharFormat()
         self.phase_format = QTextCharFormat()
         self.path_format = QTextCharFormat()
+        self.progress_format = QTextCharFormat()
+        self.action_format = QTextCharFormat()
+        self.backend_format = QTextCharFormat()
+        self.key_format = QTextCharFormat()
+        self.value_format = QTextCharFormat()
+        self.number_format = QTextCharFormat()
+        self.separator_format = QTextCharFormat()
+        self.error_line_format = QTextCharFormat()
+        self.warning_line_format = QTextCharFormat()
+        self.success_line_format = QTextCharFormat()
+        self.texture_type_formats: dict[str, QTextCharFormat] = {}
         self.set_theme(theme_key)
 
     def set_theme(self, theme_key: str) -> None:
         theme = get_theme(theme_key)
+        light = _theme_is_light(theme_key)
 
-        def make_format(color: str, *, bold: bool = False) -> QTextCharFormat:
+        def make_format(
+            color: str,
+            *,
+            bold: bool = False,
+            italic: bool = False,
+            background: Optional[QColor] = None,
+        ) -> QTextCharFormat:
             fmt = QTextCharFormat()
             fmt.setForeground(QColor(color))
             if bold:
                 fmt.setFontWeight(QFont.Bold)
+            fmt.setFontItalic(italic)
+            if background is not None:
+                fmt.setBackground(background)
             return fmt
 
         self.timestamp_format = make_format(theme["text_muted"])
         self.error_format = make_format(theme["error"], bold=True)
         self.warning_format = make_format(theme["warning_text"], bold=True)
-        self.success_format = make_format(theme["accent"], bold=False)
+        self.success_format = make_format("#098658" if light else "#6a9955", bold=True)
         self.phase_format = make_format(theme["accent"], bold=True)
-        self.path_format = make_format(theme["text_strong"], bold=False)
+        self.path_format = make_format(theme["text_strong"], bold=True)
+        self.progress_format = make_format(theme["accent"], bold=True)
+        self.action_format = make_format("#0451a5" if light else "#569cd6", bold=True)
+        self.backend_format = make_format(theme["accent"], bold=True)
+        self.key_format = make_format("#795e26" if light else "#d7ba7d", bold=True)
+        self.value_format = make_format("#a31515" if light else "#ce9178")
+        self.number_format = make_format("#098658" if light else "#b5cea8")
+        self.separator_format = make_format(theme["text_muted"], bold=True)
+
+        warning_bg = QColor(theme["warning_bg"])
+        warning_bg.setAlpha(70 if light else 48)
+        error_bg = QColor(theme["error"])
+        error_bg.setAlpha(42 if light else 34)
+        success_bg = QColor(theme["accent_soft"])
+        success_bg.setAlpha(120 if light else 90)
+        self.error_line_format = make_format(theme["text_strong"], background=error_bg)
+        self.warning_line_format = make_format(theme["text"], background=warning_bg)
+        self.success_line_format = make_format(theme["text"], background=success_bg)
+
+        texture_palette = {
+            "color": "#a31515" if light else "#ce9178",
+            "ui": "#795e26" if light else "#d7ba7d",
+            "emissive": "#b58900" if light else "#ffd166",
+            "impostor": "#8a5a00" if light else "#f4a261",
+            "normal": "#0451a5" if light else "#569cd6",
+            "height": "#098658" if light else "#4ec9b0",
+            "vector": "#0b7a75" if light else "#4ec9b0",
+            "roughness": "#af00db" if light else "#c586c0",
+            "mask": "#7c3aed" if light else "#c586c0",
+            "unknown": theme["text_muted"],
+        }
+        self.texture_type_formats = {
+            texture_type: make_format(color, bold=True)
+            for texture_type, color in texture_palette.items()
+        }
         self.rehighlight()
 
     def highlightBlock(self, text: str) -> None:  # type: ignore[override]
+        lowered = text.lower()
+        if self._error_re.search(text):
+            self.setFormat(0, len(text), self.error_line_format)
+        elif self._warning_re.search(text):
+            self.setFormat(0, len(text), self.warning_line_format)
+        elif "completed successfully" in lowered:
+            self.setFormat(0, len(text), self.success_line_format)
+
         timestamp_match = self._timestamp_re.match(text)
         if timestamp_match:
             self.setFormat(timestamp_match.start(), timestamp_match.end() - timestamp_match.start(), self.timestamp_format)
 
-        for match in self._path_re.finditer(text):
+        for match in self._windows_path_re.finditer(text):
             self.setFormat(match.start(), match.end() - match.start(), self.path_format)
+        for match in self._relative_path_re.finditer(text):
+            self.setFormat(match.start(), match.end() - match.start(), self.path_format)
+
+        for match in self._progress_re.finditer(text):
+            self.setFormat(match.start(), match.end() - match.start(), self.progress_format)
 
         for match in self._phase_re.finditer(text):
             self.setFormat(match.start(), match.end() - match.start(), self.phase_format)
+
+        for match in self._backend_re.finditer(text):
+            self.setFormat(match.start(), match.end() - match.start(), self.backend_format)
+
+        for match in self._correction_mode_re.finditer(text):
+            self.setFormat(match.start(), match.end() - match.start(), self.success_format)
+
+        for match in self._key_value_re.finditer(text):
+            key_start, key_end = match.span(1)
+            value_start, value_end = match.span(2)
+            self.setFormat(key_start, key_end - key_start, self.key_format)
+            self.setFormat(value_start, value_end - value_start, self.value_format)
+
+        for match in self._label_re.finditer(text):
+            self.setFormat(match.start(), match.end() - match.start(), self.key_format)
+
+        for match in self._dimension_re.finditer(text):
+            self.setFormat(match.start(), match.end() - match.start(), self.number_format)
+
+        for match in self._number_re.finditer(text):
+            self.setFormat(match.start(), match.end() - match.start(), self.number_format)
+
+        for match in self._arrow_re.finditer(text):
+            self.setFormat(match.start(), match.end() - match.start(), self.separator_format)
+
+        for match in self._texture_type_re.finditer(text):
+            texture_type = match.group(1).lower()
+            fmt = self.texture_type_formats.get(texture_type, self.path_format)
+            self.setFormat(match.start(), match.end() - match.start(), fmt)
+
+        for match in self._action_re.finditer(text):
+            self.setFormat(match.start(), match.end() - match.start(), self.action_format)
 
         for match in self._warning_re.finditer(text):
             self.setFormat(match.start(), match.end() - match.start(), self.warning_format)
@@ -541,10 +685,8 @@ class LogHighlighter(QSyntaxHighlighter):
         for match in self._error_re.finditer(text):
             self.setFormat(match.start(), match.end() - match.start(), self.error_format)
 
-        if "completed successfully" in text.lower():
-            match = self._success_re.search(text)
-            if match:
-                self.setFormat(match.start(), match.end() - match.start(), self.success_format)
+        for match in self._success_re.finditer(text):
+            self.setFormat(match.start(), match.end() - match.start(), self.success_format)
 
 
 class CollapsibleSection(QWidget):
@@ -614,46 +756,61 @@ class QuickStartDialog(QDialog):
         self.browser.setHtml(
             """
             <h3>Overview</h3>
-            <p><b>Crimson Texture Forge</b> is a read-only archive and loose-file workflow tool for Crimson Desert. Its main jobs are archive extraction, DDS-to-PNG conversion, optional external upscaling, DDS rebuild, compare review, and text search.</p>
+            <p><b>Crimson Texture Forge</b> is a read-only archive and loose-file workflow tool for Crimson Desert. Its main jobs are archive extraction, DDS-to-PNG conversion, optional upscaling, DDS rebuild, compare review, texture research, and text search.</p>
             <ul>
               <li><b>Archive Browser</b>: scan <b>.pamt/.paz</b>, preview supported assets, filter, and extract to normal folders.</li>
-              <li><b>Workflow</b>: scan loose DDS files, optionally convert DDS to PNG with <b>texconv</b>, optionally run <b>chaiNNer</b>, rebuild DDS, and compare results.</li>
+              <li><b>Workflow</b>: scan loose DDS files, optionally convert DDS to PNG with <b>texconv</b>, optionally upscale with <b>chaiNNer</b>, <b>Real-ESRGAN NCNN</b>, or <b>ONNX Runtime</b>, rebuild DDS, and compare results.</li>
+              <li><b>Research</b>: inspect grouped texture sets, classification, references, DDS QA results, exported reports, and local notes.</li>
               <li><b>Text Search</b>: search archive or loose text-like files such as <b>.xml</b>, preview matches with syntax colors, and export results while preserving folder structure.</li>
               <li><b>Settings</b>: store persistent global preferences such as theme, startup cache behavior, remembered layouts, and cleanup confirmations.</li>
             </ul>
-            <h3>Recommended first setup</h3>
+            <h3>Recommended first run</h3>
             <ol>
               <li>Open <b>Setup</b> and click <b>Init Workspace</b>.</li>
               <li>Configure or download <b>texconv.exe</b>. DDS preview, DDS-to-PNG conversion, compare previews, and final DDS rebuild depend on it.</li>
               <li>Set <b>Original DDS root</b>, <b>PNG root</b>, and <b>Output root</b>.</li>
-              <li>If you want PNG files before rebuild, enable <b>Convert DDS to PNG before processing</b>.</li>
+              <li>Choose an upscaling mode in <b>Upscaling</b>: disabled, direct <b>Real-ESRGAN NCNN</b>, direct <b>ONNX Runtime</b>, or <b>chaiNNer</b>.</li>
+              <li>Keep a safer <b>Texture Policy</b> preset first and leave automatic rules enabled so risky technical DDS files are preserved instead of pushed through the PNG path.</li>
+              <li>Use <b>Preview Policy</b> before <b>Start</b> if you want to inspect the planned per-texture action.</li>
               <li>Click <b>Scan</b> in the Workflow tab.</li>
-              <li>Run a small subset first, then review the output in <b>Compare</b>.</li>
+              <li>Run a small subset first, then review the output in <b>Compare</b> before trying a larger batch.</li>
             </ol>
-            <h3>Optional chaiNNer stage</h3>
-            <p><b>chaiNNer</b> is optional and external. If enabled, this app runs <b>chaiNNer</b> first and only starts DDS rebuild after it finishes.</p>
+            <h3>Backend chooser</h3>
+            <p><b>Safe Upscale Wizard</b> gives you a guided way to pick a backend, choose a safer preset, set direct scale/tile values, enable retry behavior, and configure optional loose export.</p>
             <ul>
-              <li>Install and test <b>chaiNNer</b> separately first.</li>
-              <li>Install the backends your chain needs, such as <b>PyTorch</b>, <b>NCNN</b>, or <b>ONNX Runtime</b>.</li>
-              <li>Create and validate your own <b>.chn</b> chain in <b>chaiNNer</b>.</li>
-              <li>If your chain expects PNG input, enable DDS-to-PNG conversion and point the chain at <b>${staging_png_root}</b>, <b>${png_root}</b>, or another matching PNG folder.</li>
-              <li>If your chain reads DDS directly, verify that in <b>chaiNNer</b> itself first.</li>
+              <li><b>Disabled</b>: rebuild DDS from existing PNGs or test DDS output settings without upscaling.</li>
+              <li><b>Real-ESRGAN NCNN</b>: easiest direct in-app route if you want scale, tile, retry, and optional post correction controlled from the app.</li>
+              <li><b>ONNX Runtime</b>: direct in-app route for local <b>.onnx</b> models with the same direct controls.</li>
+              <li><b>chaiNNer</b>: use only if you already have a tested chain. The chain remains the source of truth; direct NCNN / ONNX controls do not override it.</li>
             </ul>
-            <h3>Archive Browser</h3>
-            <p>The archive browser is read-only. Use it to scan <b>.pamt/.paz</b>, filter files, preview supported assets, and extract DDS or other files into normal folders.</p>
+            <h3>Before you upscale</h3>
+            <p>Visible color textures are not the same as technical maps. Height, displacement, normals, masks, vectors, and other precision-sensitive DDS files are riskier to push through PNG intermediates.</p>
             <ul>
-              <li><b>Scan</b> uses a saved archive cache when it is valid.</li>
-              <li><b>Refresh</b> ignores the cache and rebuilds it from the current <b>.pamt</b> files.</li>
-              <li><b>DDS To Workflow</b> extracts archive DDS files into your loose workflow so you can scan and rebuild them like normal files.</li>
+              <li>Start with a safer preset.</li>
+              <li>Keep automatic rules enabled.</li>
+              <li>Remember that presets decide what enters the upscale path, but model choice can still shift brightness, contrast, and detail.</li>
+              <li>Optional post correction such as <b>match_levels</b> or <b>match_histogram</b> only applies to direct NCNN / ONNX runs and only to visible texture classes.</li>
             </ul>
-            <h3>Text Search</h3>
-            <p>The <b>Text Search</b> tab is a supporting utility for `.xml`, `.json`, `.cfg`, `.lua`, and similar files. It can search archive or loose files, decrypt supported encrypted XML, preview full text with syntax colors and line numbers, and export matched files.</p>
+            <h3>Compare and review</h3>
+            <p><b>Compare</b> is meant to be the review step before large runs. When the Compare tab is active, the layout gives more room to the previews.</p>
+            <ul>
+              <li>Use <b>Preview size</b> to scale both panes together.</li>
+              <li>Use the mouse wheel while hovering a preview to zoom.</li>
+              <li>Drag to pan when a preview is larger than the viewport.</li>
+              <li>Use <b>Sync Pan</b> to keep both previews aligned.</li>
+            </ul>
+            <h3>Research and Text Search</h3>
+            <ul>
+              <li>Use <b>Research</b> for grouped texture sets, classifier output, references, DDS analysis, reports, heatmaps, and local notes.</li>
+              <li>Use <b>Text Search</b> for archive or loose text-like files such as <b>.xml</b>, <b>.json</b>, <b>.cfg</b>, and <b>.lua</b>, including preview, regex search, and export.</li>
+            </ul>
             <h3>Common failure causes</h3>
             <ul>
-              <li><b>Missing texconv</b>: previews, DDS-to-PNG conversion, and DDS rebuild will fail until <b>texconv.exe</b> is configured.</li>
-              <li><b>Wrong chaiNNer chain paths</b>: hardcoded folders inside the chain can make chaiNNer read or save to the wrong place.</li>
-              <li><b>No matching PNG outputs</b>: if chaiNNer finishes but nothing lands in <b>PNG root</b>, the DDS rebuild step has nothing to convert.</li>
-              <li><b>Wrong chaiNNer input type</b>: if DDS-to-PNG conversion is enabled but the chain still reads DDS from the original folder, the workflow will not behave as expected.</li>
+              <li><b>Missing texconv</b>: previews, DDS-to-PNG conversion, compare previews, and DDS rebuild all depend on <b>texconv.exe</b>.</li>
+              <li><b>Missing NCNN models or ONNX runtime/models</b>: direct backends need working runtime setup plus compatible models.</li>
+              <li><b>No matching PNG outputs</b>: if a chain or backend produces no usable PNG output, DDS rebuild has nothing to convert.</li>
+              <li><b>Wrong chaiNNer paths</b>: hardcoded chain folders can make chaiNNer read from or write to the wrong place.</li>
+              <li><b>Brightness drift</b>: review in <b>Compare</b>, try a different model, or test direct post correction for visible textures.</li>
             </ul>
             <h3>Local state</h3>
             <p>The app auto-saves its settings beside the EXE and also stores archive scan cache beside it.</p>
