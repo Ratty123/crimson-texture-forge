@@ -15,7 +15,6 @@ archive_cache/
 tmp_*/
 
 *.zip
-LOCAL_MODDING_HELPER_IDEAS.md
 build_importtime.log
 pyinstaller_importtime.log
 
