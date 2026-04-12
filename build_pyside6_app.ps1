@@ -132,6 +132,7 @@ $pyInstallerArgs = @(
     "PyInstaller",
     "--noconfirm",
     "--clean",
+    "--noupx",
     "--windowed",
     "--distpath",
     $pyInstallerDistDir,

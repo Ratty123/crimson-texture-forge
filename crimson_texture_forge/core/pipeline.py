@@ -27,7 +27,6 @@ from crimson_texture_forge.models import *
 from crimson_texture_forge.core.common import *
 from crimson_texture_forge.core.chainner import *
 from crimson_texture_forge.core.realesrgan_ncnn import *
-from crimson_texture_forge.core.upscale_onnx import *
 from crimson_texture_forge.core.upscale_postprocess import (
     build_source_match_plan_for_decision,
     describe_post_upscale_correction_mode,
@@ -633,7 +632,6 @@ def suggested_workspace_paths(base_dir: Path) -> Dict[str, Path]:
     tools_root = base / "tools"
     chainner_dir = tools_root / "chaiNNer"
     ncnn_dir = tools_root / "realesrgan_ncnn"
-    onnx_models_dir = tools_root / "onnx_models"
     output_root = base / "dds_final"
     return {
         "original_dds_root": base / "input_dds",
@@ -648,7 +646,6 @@ def suggested_workspace_paths(base_dir: Path) -> Dict[str, Path]:
         "ncnn_dir": ncnn_dir,
         "ncnn_exe_path": ncnn_dir / "realesrgan-ncnn-vulkan.exe",
         "ncnn_model_dir": ncnn_dir / "models",
-        "onnx_model_dir": onnx_models_dir,
         "mod_ready_export_root": resolve_default_mod_ready_export_root(output_root),
         "csv_log_path": base / "build_log.csv",
     }
@@ -666,7 +663,6 @@ def create_workspace_structure(base_dir: Path) -> Dict[str, Path]:
         "chainner_dir",
         "ncnn_dir",
         "ncnn_model_dir",
-        "onnx_model_dir",
         "mod_ready_export_root",
     ):
         paths[key].mkdir(parents=True, exist_ok=True)
@@ -689,7 +685,6 @@ def create_missing_directories_for_config(config: AppConfig) -> List[Path]:
         config.archive_extract_root,
         config.mod_ready_export_root,
         config.ncnn_model_dir,
-        config.onnx_model_dir,
     ):
         text = str(raw).strip()
         if text:
@@ -888,13 +883,15 @@ def _plan_path_kind(
     dds_info: DdsInfo,
     alpha_policy: str,
 ) -> IntermediateKind | str:
-    if rule is not None and rule.intermediate_value:
-        return str(rule.intermediate_value).strip().lower()
-    if (
+    rule_intermediate = str(rule.intermediate_value).strip().lower() if rule is not None and rule.intermediate_value else ""
+    unsafe_override_applies = (
         normalized.enable_unsafe_technical_override
-        and decision.should_upscale
         and is_technical_texture_type(decision.texture_type)
-    ):
+        and not (rule is not None and (rule.action == "skip" or rule_intermediate in {"technical_preserve_path", "technical_high_precision_path"}))
+    )
+    if rule is not None and rule.intermediate_value:
+        return rule_intermediate
+    if unsafe_override_applies:
         return "visible_color_png_path"
     if _is_scalar_high_precision_candidate(decision, dds_info, alpha_policy, profile):
         return "technical_high_precision_path"
@@ -996,7 +993,7 @@ def _build_backend_capability_matrix(
             execution_mode="preserve_original",
             reason="chaiNNer is only trusted on the visible-color path in this tranche. Technical high-precision scalar paths stay preserve-first.",
         )
-    elif normalized_backend in {UPSCALE_BACKEND_REALESRGAN_NCNN, UPSCALE_BACKEND_ONNX_RUNTIME}:
+    elif normalized_backend == UPSCALE_BACKEND_REALESRGAN_NCNN:
         visible_decision = BackendCapabilityDecision(
             backend=normalized_backend,
             path_kind="visible_color_png_path",
@@ -1095,15 +1092,19 @@ def _build_texture_processing_plan_entry(
         dds_info,
         preset=normalized.upscale_texture_preset,
     )
+    rule_intermediate = str(rule.intermediate_value).strip().lower() if rule is not None and rule.intermediate_value else ""
+    unsafe_override_applies = (
+        normalized.enable_unsafe_technical_override
+        and is_technical_texture_type(decision.texture_type)
+        and not (rule is not None and (rule.action == "skip" or rule_intermediate in {"technical_preserve_path", "technical_high_precision_path"}))
+    )
     base_alpha_policy = _normalize_alpha_policy(decision.alpha_mode)
     profile = _profile_for_key(_infer_profile_key(decision, base_alpha_policy, dds_info, rule.profile_value if rule else None))
     alpha_policy = str(rule.alpha_policy_value).strip().lower() if rule and rule.alpha_policy_value else profile.alpha_policy or base_alpha_policy
     path_kind = _plan_path_kind(normalized, decision, profile, rule, dds_info, alpha_policy)
     if (
-        normalized.enable_unsafe_technical_override
-        and rule is None
+        unsafe_override_applies
         and path_kind == "visible_color_png_path"
-        and is_technical_texture_type(decision.texture_type)
     ):
         notes = list(decision.notes)
         notes.append(
@@ -1140,7 +1141,7 @@ def _build_texture_processing_plan_entry(
         action = backend_capability.execution_mode
         action_reason = backend_capability.reason
         requires_png_processing = action in {"rebuild_from_png", "rebuild_from_high_precision_png"}
-    elif not decision.should_upscale:
+    elif not decision.should_upscale and not unsafe_override_applies:
         action = "preserve_original"
         action_reason = f"preset excludes {decision.texture_type}/{decision.semantic_subtype}"
         preserve_reason = action_reason
@@ -1905,7 +1906,7 @@ def _summarize_policy_size(
         return f"{dds_info.width}x{dds_info.height} (match original)"
     if normalized.dds_size_mode == DDS_SIZE_MODE_CUSTOM:
         return f"{normalized.dds_custom_width}x{normalized.dds_custom_height} (custom)"
-    if normalized.upscale_backend in {UPSCALE_BACKEND_REALESRGAN_NCNN, UPSCALE_BACKEND_ONNX_RUNTIME} and entry.requires_png_processing:
+    if normalized.upscale_backend == UPSCALE_BACKEND_REALESRGAN_NCNN and entry.requires_png_processing:
         estimated_width = max(1, dds_info.width * max(1, normalized.ncnn_scale))
         estimated_height = max(1, dds_info.height * max(1, normalized.ncnn_scale))
         return f"{estimated_width}x{estimated_height} (estimated {normalized.ncnn_scale}x direct backend PNG)"
@@ -1952,7 +1953,6 @@ def build_texture_policy_preview_payload(
     semantic_counts: Dict[str, int] = defaultdict(int)
     direct_backend_supported = normalized.upscale_backend in {
         UPSCALE_BACKEND_REALESRGAN_NCNN,
-        UPSCALE_BACKEND_ONNX_RUNTIME,
     }
     for entry in plan:
         final_action = entry.action
@@ -2189,11 +2189,11 @@ def build_preflight_report_lines(
                 "Warning: DDS-to-PNG conversion is enabled before Real-ESRGAN NCNN. "
                 "The NCNN stage will read source PNGs from the staging root and write its output into PNG root."
             )
-        if normalized.upscale_backend == UPSCALE_BACKEND_ONNX_RUNTIME:
-            lines.append(
-                "Warning: DDS-to-PNG conversion is enabled before ONNX Runtime. "
-                "The ONNX stage will read source PNGs from the staging root and write its output into PNG root."
-            )
+    elif normalized.upscale_backend == UPSCALE_BACKEND_CHAINNER and "${staging_png_root}" in normalized.chainner_override_json:
+        lines.append(
+            "- Error: chaiNNer overrides reference ${staging_png_root}, but DDS staging is disabled. "
+            "Enable 'Create source PNGs from DDS before processing' or remove that token."
+        )
 
     lines.extend(
         [
@@ -2315,13 +2315,6 @@ def build_preflight_report_lines(
         if normalized.ncnn_extra_args:
             lines.append(f"- Real-ESRGAN NCNN extra args: {normalized.ncnn_extra_args}")
         lines.append(f"- Direct post-upscale correction: {normalized.upscale_post_correction_mode}")
-    elif normalized.upscale_backend == UPSCALE_BACKEND_ONNX_RUNTIME:
-        lines.append(f"- ONNX model folder: {normalized.onnx_model_dir}")
-        lines.append(f"- ONNX model: {normalized.onnx_model_name}")
-        lines.append(
-            f"- ONNX expected scale/tile/preset: {normalized.ncnn_scale}x / tile {normalized.ncnn_tile_size} / {normalized.upscale_texture_preset}"
-        )
-        lines.append(f"- Direct post-upscale correction: {normalized.upscale_post_correction_mode}")
     lines.append(
         f"- Automatic color/format rules: {'enabled' if normalized.enable_automatic_texture_rules else 'disabled'}"
     )
@@ -2356,21 +2349,29 @@ def build_preflight_report_lines(
     return lines
 
 
-def collect_relative_dds_paths(root: Path) -> List[Path]:
+def collect_relative_dds_paths(
+    root: Path,
+    stop_event: Optional[threading.Event] = None,
+) -> List[Path]:
     if not root.exists() or not root.is_dir():
         return []
-    files = [
-        path.relative_to(root)
-        for path in root.rglob("*")
-        if path.is_file() and path.suffix.lower() == ".dds"
-    ]
+    files: List[Path] = []
+    for path in root.rglob("*"):
+        raise_if_cancelled(stop_event, "DDS path scan cancelled by user.")
+        if not path.is_file() or path.suffix.lower() != ".dds":
+            continue
+        files.append(path.relative_to(root))
     files.sort()
     return files
 
 
-def collect_compare_relative_paths(original_root: Path, output_root: Path) -> List[Path]:
-    combined = set(collect_relative_dds_paths(original_root))
-    combined.update(collect_relative_dds_paths(output_root))
+def collect_compare_relative_paths(
+    original_root: Path,
+    output_root: Path,
+    stop_event: Optional[threading.Event] = None,
+) -> List[Path]:
+    combined = set(collect_relative_dds_paths(original_root, stop_event=stop_event))
+    combined.update(collect_relative_dds_paths(output_root, stop_event=stop_event))
     return sorted(combined)
 
 
@@ -2444,7 +2445,12 @@ def build_staging_png_command(
     ]
 
 
-def ensure_dds_preview_png(texconv_path: Path, dds_path: Path) -> Path:
+def ensure_dds_preview_png(
+    texconv_path: Path,
+    dds_path: Path,
+    *,
+    stop_event: Optional[threading.Event] = None,
+) -> Path:
     stat = dds_path.stat()
     texconv_stat = texconv_path.stat()
     cache_key = hashlib.sha256(
@@ -2518,6 +2524,7 @@ def ensure_dds_display_preview_png(
     *,
     dds_info: Optional[DdsInfo] = None,
     max_dimension: int = _COMPARE_DISPLAY_PREVIEW_MAX_DIMENSION,
+    stop_event: Optional[threading.Event] = None,
 ) -> Path:
     resolved_info = dds_info or parse_dds(dds_path)
     resize_dims = _preview_resize_dimensions(
@@ -2526,7 +2533,7 @@ def ensure_dds_display_preview_png(
         max_dimension=max_dimension,
     )
     if resize_dims is None:
-        return ensure_dds_preview_png(texconv_path, dds_path)
+        return ensure_dds_preview_png(texconv_path, dds_path, stop_event=stop_event)
 
     stat = dds_path.stat()
     texconv_stat = texconv_path.stat()
@@ -2543,6 +2550,7 @@ def ensure_dds_display_preview_png(
     preview_lock = _get_preview_cache_lock(cache_key)
 
     with preview_lock:
+        raise_if_cancelled(stop_event, f"Display preview generation cancelled for {dds_path.name}.")
         if preview_path.exists():
             try:
                 if preview_path.stat().st_size > 0:
@@ -2558,7 +2566,7 @@ def ensure_dds_display_preview_png(
             width=target_width,
             height=target_height,
         )
-        return_code, stdout, stderr = run_process_with_cancellation(cmd, stop_event=None)
+        return_code, stdout, stderr = run_process_with_cancellation(cmd, stop_event=stop_event)
         if return_code != 0:
             detail = stderr.strip() or stdout.strip() or f"texconv failed with exit code {return_code}"
             raise ValueError(f"Could not generate display preview for {dds_path.name}: {detail}")
@@ -2661,6 +2669,8 @@ def build_compare_preview_pane_result(
     dds_path: Optional[Path],
     missing_message: str,
     planner_summary: str = "",
+    *,
+    stop_event: Optional[threading.Event] = None,
 ) -> ComparePreviewPaneResult:
     if texconv_path is None:
         return ComparePreviewPaneResult(status="missing", message="Set texconv.exe to enable DDS previews.")
@@ -2682,6 +2692,7 @@ def build_compare_preview_pane_result(
             texconv_path.resolve(),
             dds_path.resolve(),
             dds_info=dds_info,
+            stop_event=stop_event,
         )
         return ComparePreviewPaneResult(
             status="ok",
@@ -2699,7 +2710,6 @@ def normalize_config_for_planning(config: AppConfig) -> NormalizedConfig:
         UPSCALE_BACKEND_NONE,
         UPSCALE_BACKEND_CHAINNER,
         UPSCALE_BACKEND_REALESRGAN_NCNN,
-        UPSCALE_BACKEND_ONNX_RUNTIME,
     }:
         upscale_backend = UPSCALE_BACKEND_CHAINNER if config.enable_chainner else UPSCALE_BACKEND_NONE
 
@@ -2717,7 +2727,6 @@ def normalize_config_for_planning(config: AppConfig) -> NormalizedConfig:
     ncnn_exe_path = normalize_optional_path(config.ncnn_exe_path)
     explicit_model_dir = normalize_optional_path(config.ncnn_model_dir)
     ncnn_model_dir = resolve_ncnn_model_dir(ncnn_exe_path, explicit_model_dir) or explicit_model_dir
-    onnx_model_dir = resolve_onnx_model_dir(normalize_optional_path(getattr(config, "onnx_model_dir", "")))
     mod_ready_export_root = normalize_optional_path(config.mod_ready_export_root)
 
     return NormalizedConfig(
@@ -2754,8 +2763,6 @@ def normalize_config_for_planning(config: AppConfig) -> NormalizedConfig:
         ncnn_tile_size=int(getattr(config, "ncnn_tile_size", REALESRGAN_NCNN_TILE_SIZE)),
         ncnn_extra_args=str(getattr(config, "ncnn_extra_args", REALESRGAN_NCNN_EXTRA_ARGS) or "").strip(),
         upscale_post_correction_mode=str(getattr(config, "upscale_post_correction_mode", DEFAULT_UPSCALE_POST_CORRECTION) or "").strip().lower() or DEFAULT_UPSCALE_POST_CORRECTION,
-        onnx_model_dir=onnx_model_dir,
-        onnx_model_name=str(getattr(config, "onnx_model_name", "") or "").strip(),
         upscale_texture_preset=str(getattr(config, "upscale_texture_preset", DEFAULT_UPSCALE_TEXTURE_PRESET) or "").strip().lower() or DEFAULT_UPSCALE_TEXTURE_PRESET,
         enable_automatic_texture_rules=bool(getattr(config, "enable_automatic_texture_rules", ENABLE_AUTOMATIC_TEXTURE_RULES)),
         enable_unsafe_technical_override=bool(getattr(config, "enable_unsafe_technical_override", ENABLE_UNSAFE_TECHNICAL_OVERRIDE)),
@@ -2771,12 +2778,10 @@ def normalize_config(config: AppConfig, *, validate_backend_runtime: bool = True
         UPSCALE_BACKEND_NONE,
         UPSCALE_BACKEND_CHAINNER,
         UPSCALE_BACKEND_REALESRGAN_NCNN,
-        UPSCALE_BACKEND_ONNX_RUNTIME,
     }:
         upscale_backend = UPSCALE_BACKEND_CHAINNER if config.enable_chainner else UPSCALE_BACKEND_NONE
     use_chainner = upscale_backend == UPSCALE_BACKEND_CHAINNER
     use_ncnn = upscale_backend == UPSCALE_BACKEND_REALESRGAN_NCNN
-    use_onnx = upscale_backend == UPSCALE_BACKEND_ONNX_RUNTIME
 
     original_dds_root = ensure_existing_dir(
         normalize_required_path(config.original_dds_root, "Original DDS root"),
@@ -2785,7 +2790,7 @@ def normalize_config(config: AppConfig, *, validate_backend_runtime: bool = True
     png_root = normalize_required_path(config.png_root, "PNG root")
     if not config.enable_dds_staging and (
         upscale_backend == UPSCALE_BACKEND_NONE
-        or (validate_backend_runtime and upscale_backend in {UPSCALE_BACKEND_REALESRGAN_NCNN, UPSCALE_BACKEND_ONNX_RUNTIME})
+        or (validate_backend_runtime and upscale_backend == UPSCALE_BACKEND_REALESRGAN_NCNN)
     ):
         ensure_existing_dir(png_root, "PNG root")
     output_root = normalize_required_path(config.output_root, "Output root")
@@ -2877,39 +2882,6 @@ def normalize_config(config: AppConfig, *, validate_backend_runtime: bool = True
         }:
             raise ValueError(f"Unknown upscale texture preset: {upscale_texture_preset}")
 
-    onnx_model_dir: Optional[Path] = None
-    onnx_model_name = ""
-    if use_onnx:
-        explicit_onnx_model_dir = normalize_optional_path(getattr(config, "onnx_model_dir", ""))
-        if validate_backend_runtime:
-            if not is_onnxruntime_available():
-                raise ValueError(onnxruntime_error_message() or "onnxruntime is not available.")
-            resolved_onnx_model_dir = resolve_onnx_model_dir(explicit_onnx_model_dir)
-            if resolved_onnx_model_dir is None:
-                raise ValueError("ONNX model folder is not set.")
-            onnx_model_dir = ensure_existing_dir(resolved_onnx_model_dir, "ONNX model folder")
-            discovered_onnx_models = discover_onnx_models(onnx_model_dir)
-            if not discovered_onnx_models:
-                raise ValueError(f"No ONNX models (.onnx) were found in {onnx_model_dir}.")
-            available_onnx_model_names = {path.stem for path in discovered_onnx_models}
-            onnx_model_name = str(getattr(config, "onnx_model_name", "") or "").strip() or next(iter(sorted(available_onnx_model_names)))
-            if onnx_model_name not in available_onnx_model_names:
-                raise ValueError(f"ONNX model '{onnx_model_name}' was not found in {onnx_model_dir}.")
-        else:
-            onnx_model_dir = resolve_onnx_model_dir(explicit_onnx_model_dir)
-            onnx_model_name = str(getattr(config, "onnx_model_name", "") or "").strip()
-        if ncnn_scale < 1:
-            raise ValueError("ONNX expected scale must be at least 1.")
-        if ncnn_tile_size < 0:
-            raise ValueError("ONNX tile size must be 0 or greater.")
-        if upscale_texture_preset not in {
-            UPSCALE_TEXTURE_PRESET_BALANCED,
-            UPSCALE_TEXTURE_PRESET_COLOR_UI,
-            UPSCALE_TEXTURE_PRESET_COLOR_UI_EMISSIVE,
-            UPSCALE_TEXTURE_PRESET_ALL,
-        }:
-            raise ValueError(f"Unknown upscale texture preset: {upscale_texture_preset}")
-
     enable_automatic_texture_rules = bool(getattr(config, "enable_automatic_texture_rules", ENABLE_AUTOMATIC_TEXTURE_RULES))
     enable_unsafe_technical_override = bool(getattr(config, "enable_unsafe_technical_override", ENABLE_UNSAFE_TECHNICAL_OVERRIDE))
     retry_smaller_tile_on_failure = bool(getattr(config, "retry_smaller_tile_on_failure", RETRY_SMALLER_TILE_ON_FAILURE))
@@ -2926,8 +2898,8 @@ def normalize_config(config: AppConfig, *, validate_backend_runtime: bool = True
         if config.dds_staging_root.strip():
             dds_staging_root = normalize_required_path(config.dds_staging_root, "DDS staging root")
         else:
-            dds_staging_root = resolve_default_staging_png_root(png_root, use_chainner or use_ncnn or use_onnx).resolve()
-        if validate_backend_runtime and (use_chainner or use_ncnn or use_onnx) and dds_staging_root.resolve() == png_root.resolve():
+            dds_staging_root = resolve_default_staging_png_root(png_root, use_chainner or use_ncnn).resolve()
+        if validate_backend_runtime and (use_chainner or use_ncnn) and dds_staging_root.resolve() == png_root.resolve():
             raise ValueError("DDS staging root must be different from the final PNG root when an upscaling backend is enabled.")
 
     dds_format_mode = _validate_choice(
@@ -2994,8 +2966,6 @@ def normalize_config(config: AppConfig, *, validate_backend_runtime: bool = True
         ncnn_tile_size=ncnn_tile_size,
         ncnn_extra_args=ncnn_extra_args,
         upscale_post_correction_mode=upscale_post_correction_mode,
-        onnx_model_dir=onnx_model_dir,
-        onnx_model_name=onnx_model_name,
         upscale_texture_preset=upscale_texture_preset,
         enable_automatic_texture_rules=enable_automatic_texture_rules,
         enable_unsafe_technical_override=enable_unsafe_technical_override,
@@ -3039,24 +3009,6 @@ def validate_backend_runtime_requirements(normalized: NormalizedConfig) -> Norma
             raise ValueError(
                 f"Real-ESRGAN NCNN model '{normalized.ncnn_model_name}' was not found in {normalized.ncnn_model_dir}."
             )
-        return normalized
-
-    if backend == UPSCALE_BACKEND_ONNX_RUNTIME:
-        if not is_onnxruntime_available():
-            raise ValueError(onnxruntime_error_message() or "onnxruntime is not available.")
-        if not normalized.enable_dds_staging:
-            ensure_existing_dir(normalized.png_root, "PNG root")
-        resolved_onnx_model_dir = resolve_onnx_model_dir(normalized.onnx_model_dir)
-        if resolved_onnx_model_dir is None:
-            raise ValueError("ONNX model folder is not set.")
-        normalized.onnx_model_dir = ensure_existing_dir(resolved_onnx_model_dir, "ONNX model folder")
-        discovered_onnx_models = discover_onnx_models(normalized.onnx_model_dir)
-        if not discovered_onnx_models:
-            raise ValueError(f"No ONNX models (.onnx) were found in {normalized.onnx_model_dir}.")
-        available_onnx_model_names = {path.stem for path in discovered_onnx_models}
-        normalized.onnx_model_name = normalized.onnx_model_name.strip() or next(iter(sorted(available_onnx_model_names)))
-        if normalized.onnx_model_name not in available_onnx_model_names:
-            raise ValueError(f"ONNX model '{normalized.onnx_model_name}' was not found in {normalized.onnx_model_dir}.")
         return normalized
 
     return normalized
@@ -3351,13 +3303,6 @@ def rebuild_dds_files(
             f"Real-ESRGAN NCNN scale/tile/preset: {normalized.ncnn_scale}x / tile {normalized.ncnn_tile_size} / {normalized.upscale_texture_preset}"
         )
         emit_log(f"Direct post-upscale correction: {normalized.upscale_post_correction_mode}")
-    elif normalized.upscale_backend == UPSCALE_BACKEND_ONNX_RUNTIME:
-        emit_log(f"ONNX model folder: {normalized.onnx_model_dir}")
-        emit_log(f"ONNX model: {normalized.onnx_model_name}")
-        emit_log(
-            f"ONNX expected scale/tile/preset: {normalized.ncnn_scale}x / tile {normalized.ncnn_tile_size} / {normalized.upscale_texture_preset}"
-        )
-        emit_log(f"Direct post-upscale correction: {normalized.upscale_post_correction_mode}")
     else:
         emit_log("Upscaling stage is disabled, so the app will rebuild DDS from the existing PNG root.")
     emit_log(
@@ -3374,10 +3319,6 @@ def rebuild_dds_files(
             emit_log(
                 f"File flow: Original DDS -> Staging PNG root ({normalized.dds_staging_root}) -> Real-ESRGAN NCNN -> PNG root ({normalized.png_root}) -> DDS rebuild -> Output root ({normalized.output_root})"
             )
-        elif normalized.upscale_backend == UPSCALE_BACKEND_ONNX_RUNTIME:
-            emit_log(
-                f"File flow: Original DDS -> Staging PNG root ({normalized.dds_staging_root}) -> ONNX Runtime -> PNG root ({normalized.png_root}) -> DDS rebuild -> Output root ({normalized.output_root})"
-            )
         else:
             emit_log(
                 f"File flow: Original DDS -> PNG root ({normalized.png_root}). With no backend selected, processing stops after PNG conversion."
@@ -3390,10 +3331,6 @@ def rebuild_dds_files(
         elif normalized.upscale_backend == UPSCALE_BACKEND_REALESRGAN_NCNN:
             emit_log(
                 f"File flow: Existing PNG root ({normalized.png_root}) -> Real-ESRGAN NCNN -> PNG root ({normalized.png_root}) -> DDS rebuild -> Output root ({normalized.output_root})"
-            )
-        elif normalized.upscale_backend == UPSCALE_BACKEND_ONNX_RUNTIME:
-            emit_log(
-                f"File flow: Existing PNG root ({normalized.png_root}) -> ONNX Runtime -> PNG root ({normalized.png_root}) -> DDS rebuild -> Output root ({normalized.output_root})"
             )
         else:
             emit_log(
@@ -3487,16 +3424,6 @@ def rebuild_dds_files(
             on_current_file=on_current_file,
             stop_event=stop_event,
         )
-    elif normalized.upscale_backend == UPSCALE_BACKEND_ONNX_RUNTIME and dds_files_requiring_png:
-        run_onnx_stage(
-            normalized,
-            processing_plan=processing_plan,
-            on_log=on_log,
-            on_phase=on_phase,
-            on_phase_progress=on_phase_progress,
-            on_current_file=on_current_file,
-            stop_event=stop_event,
-        )
     elif normalized.upscale_backend != UPSCALE_BACKEND_NONE:
         emit_log("No files require direct PNG/upscale processing under the current preset and automatic rules. The selected backend will be skipped.")
 
@@ -3526,11 +3453,6 @@ def rebuild_dds_files(
             raise ValueError(
                 "Real-ESRGAN NCNN finished, but no PNG files were found in the configured PNG root. "
                 "Verify the NCNN executable, model folder, and selected model."
-            )
-        if normalized.upscale_backend == UPSCALE_BACKEND_ONNX_RUNTIME and png_count == 0 and dds_files_requiring_png:
-            raise ValueError(
-                "ONNX Runtime finished, but no PNG files were found in the configured PNG root. "
-                "Verify the ONNX model folder, selected model, and runtime installation."
             )
     else:
         emit_log("No policy-selected files require PNG matching. DDS rebuild will use preserve-original copy-through actions only.")

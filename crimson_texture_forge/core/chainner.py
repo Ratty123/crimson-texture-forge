@@ -223,6 +223,11 @@ def build_chainner_override_payload(config: NormalizedConfig) -> Optional[Dict[s
     raw_json = config.chainner_override_json.strip()
     if not raw_json:
         return None
+    if "${staging_png_root}" in raw_json and config.dds_staging_root is None:
+        raise ValueError(
+            "chaiNNer override JSON references ${staging_png_root}, but DDS staging is disabled. "
+            "Enable 'Create source PNGs from DDS before processing' or remove that token from the overrides."
+        )
 
     try:
         parsed = json.loads(raw_json)
@@ -348,17 +353,6 @@ def validate_ncnn_model_import_sources(sources: Sequence[Path]) -> List[str]:
             "'realesr-animevideov3.bin'."
         )
     return pairs
-
-
-def validate_onnx_model_import_sources(sources: Sequence[Path]) -> List[str]:
-    member_paths = _iter_model_source_member_paths(sources)
-    models = sorted({path.name for path in member_paths if path.suffix.lower() == ".onnx"})
-    if not models:
-        raise ValueError(
-            "No .onnx files were found in the selected source. Choose a folder, zip, or file set "
-            "that contains one or more ONNX model files."
-        )
-    return models
 
 
 def resolve_python_package_install_interpreter() -> Optional[Path]:

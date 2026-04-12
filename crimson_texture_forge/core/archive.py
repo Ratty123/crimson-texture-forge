@@ -81,12 +81,15 @@ _COMMON_TECHNICAL_DDS_EXCLUDE_PATTERNS: Tuple[str, ...] = (
     "*_position.dds",
     "*_pivot.dds",
     "*_depth.dds",
+    "*_pivotpos.dds",
     "*_ma.dds",
     "*_mg.dds",
     "*_o.dds",
     "*_emi.dds",
     "*_emc.dds",
     "*_subsurface.dds",
+    "*_1bit.dds",
+    "*_mask_amg.dds",
     "*_d.dds",
 )
 _ARCHIVE_SCAN_CACHE_SUPPORTED_VERSIONS = {1, 2}
@@ -2120,6 +2123,8 @@ def build_archive_preview_result(
     texconv_path: Optional[Path],
     entry: Optional[ArchiveEntry],
     loose_search_roots: Optional[Sequence[Path]] = None,
+    *,
+    stop_event: Optional[threading.Event] = None,
 ) -> ArchivePreviewResult:
     if entry is None:
         return ArchivePreviewResult(
@@ -2207,7 +2212,11 @@ def build_archive_preview_result(
                     loose_preview_metadata_summary=loose_preview_metadata_summary,
                     loose_preview_detail_text=loose_preview_detail_text,
                 )
-            preview_png = ensure_dds_display_preview_png(texconv_path.resolve(), source_path.resolve())
+            preview_png = ensure_dds_display_preview_png(
+                texconv_path.resolve(),
+                source_path.resolve(),
+                stop_event=stop_event,
+            )
             return ArchivePreviewResult(
                 status="ok",
                 title=entry.basename,

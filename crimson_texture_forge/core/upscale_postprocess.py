@@ -148,7 +148,7 @@ def build_source_match_plan_for_decision(
             normalized_mode,
             "skip_backend",
             "skip",
-            "Only direct NCNN and ONNX backends currently support post-upscale correction.",
+            "Only the direct NCNN backend currently supports post-upscale correction.",
         )
 
     if normalized_mode in {
@@ -156,12 +156,12 @@ def build_source_match_plan_for_decision(
         UPSCALE_POST_CORRECTION_MATCH_LEVELS,
         UPSCALE_POST_CORRECTION_MATCH_HISTOGRAM,
     }:
-        if texture_type in _VISIBLE_TEXTURE_TYPES:
+        if texture_type in _VISIBLE_TEXTURE_TYPES or planner_visible_candidate:
             return SourceMatchPlan(
                 normalized_mode,
                 "visible_rgb_safe",
                 "apply_visible",
-                "Legacy correction mode is limited to visible color-like textures.",
+                "Legacy correction mode is limited to visible color-like textures or files the planner already routed through the visible-color path.",
                 scalar_only=False,
                 allow_alpha_correction=alpha_mode == "straight",
             )
@@ -275,6 +275,15 @@ def build_source_match_plan_for_decision(
             if alpha_mode == "straight":
                 return SourceMatchPlan(
                     normalized_mode,
+                    "visible_rgb_safe",
+                    "apply_visible",
+                    "Semantic hint stayed unknown, but the planner still routed this file through a visible-color profile, so visible-texture source matching is allowed with bounded alpha coverage correction.",
+                    scalar_only=False,
+                    allow_alpha_correction=True,
+                )
+            if alpha_mode in {"cutout", "premultiplied", "channel_data"}:
+                return SourceMatchPlan(
+                    normalized_mode,
                     "visible_rgb_alpha_limited",
                     "apply_visible_limited",
                     "Semantic hint stayed unknown, but the planner still routed this file through a visible-color profile, so bounded RGB source matching is allowed while keeping alpha untouched.",
@@ -283,9 +292,9 @@ def build_source_match_plan_for_decision(
                 )
             return SourceMatchPlan(
                 normalized_mode,
-                "visible_rgb_alpha_limited",
-                "apply_visible_limited",
-                "Semantic hint stayed unknown, but the planner still routed this file through a visible-color profile, so bounded RGB source matching is allowed while keeping alpha untouched.",
+                "visible_rgb_safe",
+                "apply_visible",
+                "Semantic hint stayed unknown, but the planner still routed this file through a visible-color profile, so visible-texture source matching is allowed.",
                 scalar_only=False,
                 allow_alpha_correction=False,
             )

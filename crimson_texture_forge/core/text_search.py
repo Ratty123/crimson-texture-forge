@@ -131,9 +131,16 @@ def _decode_text_bytes(data: bytes) -> str:
     return data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _iter_loose_text_files(root: Path, extension_filters: Sequence[str], path_filter: str) -> List[Path]:
+def _iter_loose_text_files(
+    root: Path,
+    extension_filters: Sequence[str],
+    path_filter: str,
+    *,
+    stop_event: Optional[threading.Event] = None,
+) -> List[Path]:
     files: List[Path] = []
     for path in root.rglob("*"):
+        raise_if_cancelled(stop_event, "Text search stopped by user.")
         if not path.is_file():
             continue
         if path.suffix.lower() not in extension_filters:
@@ -236,7 +243,12 @@ def search_loose_text_files(
     stop_event: Optional[threading.Event] = None,
 ) -> Tuple[List[TextSearchResult], TextSearchRunStats]:
     pattern = _compile_search_pattern(query, regex=regex, case_sensitive=case_sensitive)
-    candidates = _iter_loose_text_files(root, extension_filters, path_filter)
+    candidates = _iter_loose_text_files(
+        root,
+        extension_filters,
+        path_filter,
+        stop_event=stop_event,
+    )
     results: List[TextSearchResult] = []
     skipped_read_error_count = 0
     total = len(candidates)

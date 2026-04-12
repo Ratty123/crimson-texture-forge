@@ -9,10 +9,44 @@ The format is intentionally simple:
 - `Fixed` for bug fixes
 - `Docs` for README, guide, or release-note changes
 
+## [0.5.5] - 2026-04-12
+
+### Added
+- A persistent local texture-classification registry plus `Research -> Archive Insights -> Classification Review`, so you can review unresolved DDS files, approve a label once, and reuse that approval in future scans and texture-policy planning.
+- `Classification Review` now includes an inline archive-style preview, filters for `Name` / `Package`, bulk selection helpers, optional already-classified review, and a file-focused queue that works better on the real archive data than the original family/member split.
+- `Start` now performs a pre-run unclassified-DDS check for upscale builds, warns when matched files are still `unknown`, and can jump directly into `Research -> Classification Review` focused on the current run’s unknown DDS files before any build phases begin.
+- `Research -> References` now includes `Review In Text Search`, which opens the selected XML/material source file in `Text Search` and highlights the referenced DDS name so you can inspect the exact text-side usage quickly.
+
+### Changed
+- Removed the retired direct alternate Python-based upscale backend, its setup/import workflow, and related UI/runtime paths so the app now only exposes direct `Real-ESRGAN NCNN` or external `chaiNNer` for upscaling.
+- `Classification Review` now uses the selected file as the main review unit, while bulk actions still apply across the underlying family where that is actually useful.
+
+### Fixed
+- The pre-run unclassified-DDS prompt no longer fails before build start, because the GUI classification check now uses the public planner entry point instead of referencing a private backend-matrix helper that was not available in the UI module.
+- The pre-run unclassified-DDS prompt now correctly resumes into the build after you classify files and restart, instead of stopping after the “0 matched DDS file(s) are still unclassified” check while the utility worker was still cleaning up.
+- Text Search preview no longer gets stuck on `Preparing preview...`, because the preview-ready handler now uses the current result context correctly instead of referencing an undefined local when applying syntax highlighting.
+- Local classification approvals now apply correctly to both archive-style and extracted package-prefixed DDS paths, so classifying a file in `Research` is reused by later loose DDS workflow runs.
+- Archive-wide DDS classification now recognizes low-risk grayscale/scalar suffixes such as `_grayscale` and `_depth_grayscale` as technical mask data, recognizes `pivotpainter` DDS names as vector-style data, and groups `_ct` variants back into their base texture families instead of splitting them into separate review groups.
+- A few obvious suffixless archive misses now classify correctly too, so names such as `snownormal`, `snowmask`, and `nonetexturespecular` no longer stay `unknown` just because they omit the usual underscore-separated token.
+- Added a few more conservative archive suffix/classification fixes, including `_1bit`, `_mask_1bit`, `_pivotpos`, `_mask_amg`, and safer handling for bare `rough` names that were previously too easy to misread as roughness maps.
+- `Research` archive snapshot work now honors cancellation during the heavy archive-insight pass, and `Mip Analysis` detail views now reuse refresh-time family/path metadata instead of rescanning both DDS roots every time you click a row.
+- Loose Text Search file discovery now honors cancellation during the initial loose-file walk, and matched-file preview loading now runs through a debounced worker instead of blocking the UI thread on selection changes.
+- Archive Browser preview workers now preload decoded preview images in the worker thread, and preview jobs are now stoppable so stale or shutdown-time preview work can be cancelled instead of only waiting for threads to finish.
+- Preview widgets now cache scaled preview pixmaps by source and target size, and failed path-backed image loads are remembered so large previews no longer get repeatedly resampled or retried on every resize/fit update.
+- `Research -> Classification Review` now hides the redundant right-side `Archive Files` panel while you review labels, keeps the inline preview as the primary visual aid, and can optionally include already classified DDS families when you want to apply a custom override anyway.
+- The expert unsafe technical override now really overrides preset-based preserve behavior for technical textures unless an explicit texture rule still says `skip` or forces a preserve/high-precision path.
+- Legacy correction modes now honor planner-visible candidates, and planner-visible `unknown` textures with straight alpha now get the same bounded alpha-correction allowance as other visible textures.
+- `chaiNNer` override JSON now fails early and clearly when it references `${staging_png_root}` while DDS staging is disabled, instead of quietly substituting an empty string and failing later in the run.
+- `Retry with smaller tile` now keeps `tile size 0` as a true full-frame first attempt and only switches into the fixed tiled fallback ladder `512, 256, 128, 64, 32` after that full-frame attempt fails.
+- `Research` no longer fails on startup after the `Unknown Resolver` UI addition, because the missing `QComboBox` import is now included in the Research tab widgets.
+
+### Docs
+- Updated README/help/release wording to reflect the local classification registry, the refined `Classification Review` workflow, and the app now being `NCNN` / `chaiNNer` only for upscaling.
+
 ## [0.5.0] - 2026-04-12
 
 ### Added
-- Automatic `Source Match` reconstruction modes for direct `Real-ESRGAN NCNN` and `ONNX Runtime` workflows, including `Source Match Balanced`, `Source Match Extended`, and `Source Match Experimental`.
+- Automatic `Source Match` reconstruction modes for direct `Real-ESRGAN NCNN` workflows, including `Source Match Balanced`, `Source Match Extended`, and `Source Match Experimental`.
 - A planner-owned `technical_high_precision_path` for eligible non-packed scalar technical DDS files, with support for high-precision staged PNGs or validated direct `PNG root` inputs when the backend is disabled.
 - An optional `NCNN extra args` field for advanced Real-ESRGAN NCNN flags such as `-dn 0.2`, with settings/profile persistence and command-line validation.
 - An explicit expert override that can force technical maps such as normals, masks, roughness, height, and vectors through the generic visible-color PNG/upscale path when you intentionally want unsafe technical processing.
@@ -21,7 +55,7 @@ The format is intentionally simple:
 - Texture policy is now planner-authoritative across preview, preflight, direct backend execution, DDS rebuild, `Compare`, and `Research`, so path/profile/backend/alpha decisions come from one shared per-texture plan instead of being re-inferred later in the run.
 - Automatic texture policy now routes source-match correction per texture instead of expecting the user to know which post-correction mode belongs to which asset class.
 - Built-in output behavior is now formalized through planner-selected processing profiles, explicit path kinds, centralized backend capability gating, and semantic/profile/intermediate overrides in texture rules.
-- `chaiNNer`, direct `NCNN`, and direct `ONNX` capability handling now follows the same central planner matrix used by policy preview and preflight reporting.
+- `chaiNNer` and direct `NCNN` capability handling now follows the same central planner matrix used by policy preview and preflight reporting.
 - `Compare`, `Preview Policy`, and `Research` now surface richer planner metadata, including selected profile, processing path, backend compatibility, alpha policy, and preserve reasons.
 - `Safe Wizard` has been replaced by a read-only `Run Summary` dialog, so the editable backend and texture-policy controls live only in the main Workflow panel while the dialog is reserved for source and run-context review.
 
@@ -41,7 +75,7 @@ The format is intentionally simple:
 - DDS staging for direct backend runs now passes the source DDS path correctly to texconv again, fixing cases where staging appeared to run but the NCNN stage immediately failed with `Expected planner-selected PNG does not exist`.
 - Compare preview shutdown is now safer because queued preview work no longer respawns while the window is closing.
 - Settings persistence and `chaiNNer` chain inspection are now debounced in the UI, reducing stalls from keystroke-by-keystroke disk syncs and chain revalidation.
-- Preserve-only direct `NCNN` / `ONNX` runs now skip the backend stage cleanly instead of scanning unrelated stale PNGs in `PNG root`.
+- Preserve-only direct `NCNN` runs now skip the backend stage cleanly instead of scanning unrelated stale PNGs in `PNG root`.
 - `Retry with smaller tile` now steps down correctly from a `tile size 0` full-frame attempt into real smaller tiles.
 - `Research -> Mip Analysis` now only reports DDS files that exist in both Original and Output roots, instead of turning unmatched files into broken comparison rows.
 - DDS preview cache invalidation now includes the active `texconv.exe`, so Compare and Research previews are refreshed when the texconv binary changes.
@@ -70,7 +104,6 @@ The format is intentionally simple:
 - Normal maps that appear to use alpha are now rebuilt with an alpha-capable linear format instead of dropping alpha through the default BC5 path.
 - Closing the app during long-running scans or `Research` refresh work now signals those workers to stop before thread shutdown, which makes shutdown behavior less rough.
 - `Retry with smaller tile` now steps down through real fallback tile sizes even when the configured tile size is `0`.
-- Unsupported ONNX models, including unusual `2`-channel outputs, now fail earlier with a clearer compatibility error instead of a late generic conversion failure.
 - `Compare -> Mip Details` now clears its pending target when a `Research` refresh fails, avoiding stale focus jumps on the next refresh.
 - `_ct` texture variants are now classified as color maps before loose token matching, reducing false roughness/metalness classification when the base name contains those words.
 - The `Safe Upscale Wizard` now preserves caller-provided summary or notes text instead of overwriting it with its generated footer summary.
@@ -96,12 +129,9 @@ The format is intentionally simple:
 - `Safe Upscale Wizard` for guided backend, preset, retry, and export setup.
 - Direct in-app upscaling backend support for:
   - `Real-ESRGAN NCNN`
-  - `ONNX Runtime`
 - Setup actions for:
   - downloading and unpacking `Real-ESRGAN NCNN`
   - importing NCNN model files
-  - importing ONNX model files
-  - opening the official `ONNX Runtime` install guide
 - Grouped `NCNN Model Catalog` with:
   - short model descriptions
   - intended-use notes
@@ -124,7 +154,7 @@ The format is intentionally simple:
 
 ### Changed
 - Workflow upscaling now supports backend selection, texture-type-aware presets, automatic color/format safety rules, retry with smaller tile, and mod-ready loose export.
-- `Init Workspace` now seeds the newer NCNN / ONNX / mod-export path fields in addition to the original workspace folders.
+- `Init Workspace` now seeds the newer NCNN and mod-export path fields in addition to the original workspace folders.
 - Real-ESRGAN NCNN setup now handles the current upstream Windows package layout, which may ship without bundled models, by creating a model folder automatically and prompting model import instead of failing.
 - Safe Upscale Wizard and direct-backend help text now explain more clearly that presets only decide what gets sent to the upscaler, while the selected model can still shift brightness, contrast, and detail.
 - Workflow now includes a `Preview Policy` action that shows a per-texture plan before `Start`, including inferred semantic subtype, action, alpha/intermediate policy, and planned DDS rebuild format.
@@ -135,16 +165,16 @@ The format is intentionally simple:
 - Preflight reporting now summarizes detected texture types, semantic subtypes, and per-texture action counts, and warns when float/vector DDS files are present, so risky PNG-intermediate cases are visible before a run starts.
 - DDS Output help text now states more clearly where source PNGs, final PNGs, and rebuilt DDS files end up, and clarifies that `Use final PNG size for rebuilt DDS` only affects DDS dimensions.
 - The direct-backend controls area is now hidden when `chaiNNer` is the active backend.
-- Workflow now exposes `Texture Policy` as its own always-visible group, so preset/automatic-rule/export behavior is easier to find without opening `Safe Wizard`, while direct NCNN / ONNX scale and tile controls stay clearly separated.
+- Workflow now exposes `Texture Policy` as its own always-visible group, so preset/automatic-rule/export behavior is easier to find without opening `Safe Wizard`, while direct NCNN scale and tile controls stay clearly separated.
 - Top-level tab order now places `Research` ahead of `Text Search`, and the `Research` tab now includes its own `Archive Files` picker so reference and note workflows do not require jumping back to `Archive Browser`.
 - Archive related-set extraction prompts now state the destination path up front, explain that the extract root may be created automatically, and make overwrite-vs-keep-both behavior clearer before the extraction starts.
 - `Archive Browser -> DDS To Workflow` now respects explicit archive selection first. If files or folders are selected, only selected DDS files are extracted to the workflow root; the filtered DDS view is used only when nothing is selected.
 - `Research -> Texture Analysis` now explains where each result set comes from, what each panel requires, and shows the selected-row details in the right-side pane where `Archive Files` normally sits, so mip-analysis details have more room when that subtab is active.
 - `Research -> Texture Analysis` now exposes richer texture QA details for matching DDS pairs, including file-size drift, color-space changes, preview-based alpha/brightness/channel checks when texconv previews are available, and extra texture-specific warnings for normals, packed masks, and grayscale technical maps.
-- `Workflow -> Upscaling` now keeps the backend-specific area sized to the current backend page instead of inheriting the tallest backend page, reducing the wasted empty space when direct NCNN / ONNX pages are selected.
+- `Workflow -> Upscaling` now keeps the backend-specific area sized to the current backend page instead of inheriting the tallest backend page, reducing the wasted empty space when direct NCNN pages are selected.
 - Texture classification is now more tolerant of Crimson Desert-style texture sets by recognizing suffixes and explicit names such as `_cd`, `_sp`, `_m`, `_ma`, `_mg`, `_o`, `_disp`, `_dmap`, `_dr`, `_op`, `_wn`, `_emc`, `_emi`, `_subsurface`, `_color`, `_normal`, digit-letter variants like `63a`, family companions, and preview-based fallback hints when names are still ambiguous; `_d` is no longer treated as a strong diffuse/color signal and is instead handled as lower-confidence grayscale/support data.
 - `Research`, `Texture Analysis`, normal validation, mip-detail hints, and `Archive Browser` role/exclude filtering now use the same updated suffix semantics, so technical companions such as `_wn`, `_ma`, `_mg`, `_o`, `_dmap`, `_dr`, `_op`, `_emc`, `_emi`, and `_subsurface` are less likely to be mistaken for base/albedo textures.
-- Direct Real-ESRGAN NCNN / ONNX workflow controls now expose optional post-correction modes in both `Workflow` and `Safe Upscale Wizard`, and build/preflight logs now report the selected correction mode.
+- Direct Real-ESRGAN NCNN workflow controls now expose optional post-correction modes in both `Workflow` and `Safe Upscale Wizard`, and build/preflight logs now report the selected correction mode.
 - `Compare` now acts as a focused review mode: the progress area collapses while `Compare` is active, the top chrome is more compact, the default compare splitter favors preview space more strongly, and previews stay top-aligned instead of floating in the middle of the pane.
 - Compare review now supports shared preview-size presets, wheel zoom, drag pan, per-side zoom, and stronger space prioritization so side-by-side review is easier on smaller or scaled displays.
 - Workflow, Research, Text Search, archive preview, and global theme sizing were adjusted to behave better under UI scaling, including safer button/progress heights, tab/group title spacing, and toolbar wrapping in dense panes.
@@ -156,17 +186,16 @@ The format is intentionally simple:
 - Profile export and diagnostic bundle export now serialize config data correctly for slotted dataclasses, fixing `vars() argument must have __dict__ attribute` failures.
 - Harmless chaiNNer shutdown/deprecation noise such as `body not consumed` and `log.catchErrors is deprecated` is now filtered so successful runs do not look like hard failures.
 - Legacy float/vector DDS files that previously failed with unsupported FOURCC errors now parse and rebuild correctly, including real tested cases such as `pivotpos` and `xvector` effect textures.
-- Runs that select an upscale backend but end up preserving every matched DDS under the current preset/automatic rules no longer fail early on missing NCNN / ONNX / chaiNNer runtime setup; backend validation is now deferred until files actually require PNG/upscale processing.
+- Runs that select an upscale backend but end up preserving every matched DDS under the current preset/automatic rules no longer fail early on missing NCNN / chaiNNer runtime setup; backend validation is now deferred until files actually require PNG/upscale processing.
 - Backend/staging/PNG indexing work is now skipped when the current semantic policy keeps every matched DDS out of the PNG path, avoiding unnecessary empty-stage work and confusing stale-PNG scans.
 - `Research -> Archive Insights -> Groups` selection is now more robust: the first group is auto-selected after refresh, the extract button reflects whether a valid group is selected, and selecting either a group row or one of its member rows resolves correctly for `Extract Selected Set`.
 - `Research -> Archive Insights -> Groups` now warns explicitly when the research snapshot has not been built yet, so clicking `Extract Selected Set` before `Refresh Research` no longer feels like a silent failure.
 - `Research -> Texture Analysis` no longer repeats the same brightness-range warning in both `Preview comparison` and `Additional analysis warnings` for the same DDS pair.
-- `ONNX Runtime` direct upscale support now accepts 4-channel models more reliably, including RGBA input tensors that previously failed or mis-routed alpha-aware inputs.
 - Compare/preview sizing no longer wastes as much vertical space above the images, and stale saved splitter states from earlier layouts no longer force the progress block back into an oversized or clipped state.
 - Compare previews now use the actual displayed scale when zooming out of `Fit`, avoiding the earlier jumpy behavior where zoom started from an assumed `100%` baseline instead of the real fitted size.
 
 ### Docs
-- Rewrote `README.md` around the current app structure, including direct NCNN / ONNX support, `Safe Upscale Wizard`, `Texture Policy`, `Preview Policy`, `Research`, compare review workflow, and troubleshooting guidance.
+- Rewrote `README.md` around the current app structure, including direct NCNN support, `Safe Upscale Wizard`, `Texture Policy`, `Preview Policy`, `Research`, compare review workflow, and troubleshooting guidance.
 - Updated the in-app `Quick Start` guide so it now describes the current safe-first workflow, backend choices, texture-policy safety behavior, compare controls, and `Research` usage more clearly.
 - Expanded `Unreleased/In testing` notes to include the recent compare UX, preview interaction, live-log, and UI-scaling changes.
 

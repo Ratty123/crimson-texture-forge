@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 from PySide6.QtCore import QRect, QSize, Qt, Signal
 from PySide6.QtGui import (
@@ -46,6 +46,9 @@ class PreviewLabel(QLabel):
         self._source_image: Optional[QImage] = None
         self._source_image_path: str = ""
         self._source_image_size = QSize()
+        self._source_image_load_failed = False
+        self._source_revision = 0
+        self._scaled_pixmap_cache: Dict[Tuple[int, int, int], QPixmap] = {}
         self._zoom_factor = 1.0
         self._fit_to_view = True
         self._fit_scale = 1.0
@@ -61,6 +64,9 @@ class PreviewLabel(QLabel):
         self._source_image = None
         self._source_image_path = ""
         self._source_image_size = QSize()
+        self._source_image_load_failed = False
+        self._source_revision += 1
+        self._scaled_pixmap_cache.clear()
         self._drag_active = False
         self.setPixmap(QPixmap())
         self.setText(message)
@@ -96,6 +102,9 @@ class PreviewLabel(QLabel):
         self._source_image = None
         self._source_image_path = ""
         self._source_image_size = pixmap.size()
+        self._source_image_load_failed = False
+        self._source_revision += 1
+        self._scaled_pixmap_cache.clear()
         self._apply_scaled_pixmap(fallback_text)
 
     def set_preview_image(self, image: QImage, fallback_text: str) -> None:
@@ -103,15 +112,21 @@ class PreviewLabel(QLabel):
         self._source_image = image
         self._source_image_path = ""
         self._source_image_size = image.size() if not image.isNull() else QSize()
+        self._source_image_load_failed = False
+        self._source_revision += 1
+        self._scaled_pixmap_cache.clear()
         self._apply_scaled_pixmap(fallback_text)
 
     def set_preview_image_path(self, image_path: str, fallback_text: str) -> None:
         self._source_pixmap = None
         self._source_image = None
         self._source_image_path = image_path
+        self._source_image_load_failed = False
         reader = QImageReader(image_path)
         size = reader.size()
         self._source_image_size = size if size.isValid() else QSize()
+        self._source_revision += 1
+        self._scaled_pixmap_cache.clear()
         self._apply_scaled_pixmap(fallback_text)
 
     def current_display_scale(self) -> float:
@@ -188,7 +203,9 @@ class PreviewLabel(QLabel):
     def _has_source_image(self) -> bool:
         return (
             self._source_pixmap is not None and not self._source_pixmap.isNull()
-        ) or (self._source_image is not None and not self._source_image.isNull()) or bool(self._source_image_path)
+        ) or (self._source_image is not None and not self._source_image.isNull()) or (
+            bool(self._source_image_path) and not self._source_image_load_failed
+        )
 
     def _update_cursor(self) -> None:
         if self._drag_active:
@@ -201,7 +218,7 @@ class PreviewLabel(QLabel):
     def _apply_scaled_pixmap(self, fallback_text: str) -> None:
         has_source_pixmap = self._source_pixmap is not None and not self._source_pixmap.isNull()
         has_source_image = self._source_image is not None and not self._source_image.isNull()
-        has_source_path = bool(self._source_image_path)
+        has_source_path = bool(self._source_image_path) and not self._source_image_load_failed
         if not has_source_pixmap and not has_source_image and not has_source_path:
             self.setPixmap(QPixmap())
             self.setText(fallback_text)
@@ -222,18 +239,24 @@ class PreviewLabel(QLabel):
             width = max(1, int(round(source_size.width() * self._zoom_factor)))
             height = max(1, int(round(source_size.height() * self._zoom_factor)))
 
-        if has_source_pixmap:
+        cache_key = (self._source_revision, width, height)
+        cached = self._scaled_pixmap_cache.get(cache_key)
+        if cached is not None and not cached.isNull():
+            scaled = cached
+        elif has_source_pixmap:
             scaled = self._source_pixmap.scaled(
                 width,
                 height,
                 Qt.KeepAspectRatio,
                 Qt.SmoothTransformation,
             )
+            self._cache_scaled_pixmap(cache_key, scaled)
         else:
             if not has_source_image:
                 reader = QImageReader(self._source_image_path)
                 image = reader.read()
                 if image.isNull():
+                    self._source_image_load_failed = True
                     self.setPixmap(QPixmap())
                     self.setText(fallback_text)
                     self._update_cursor()
@@ -253,6 +276,8 @@ class PreviewLabel(QLabel):
                 Qt.SmoothTransformation,
             )
             scaled = QPixmap.fromImage(scaled_image)
+            self._cache_scaled_pixmap(cache_key, scaled)
+
         self.setText("")
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumSize(0, 0)
@@ -260,6 +285,14 @@ class PreviewLabel(QLabel):
         self.setFixedSize(scaled.size())
         self.setPixmap(scaled)
         self._update_cursor()
+
+    def _cache_scaled_pixmap(self, cache_key: Tuple[int, int, int], pixmap: QPixmap) -> None:
+        if pixmap.isNull():
+            return
+        self._scaled_pixmap_cache[cache_key] = pixmap
+        if len(self._scaled_pixmap_cache) > 12:
+            oldest_key = next(iter(self._scaled_pixmap_cache))
+            self._scaled_pixmap_cache.pop(oldest_key, None)
 
 
 class PreviewScrollArea(QScrollArea):
@@ -598,7 +631,7 @@ class LogHighlighter(QSyntaxHighlighter):
         r"\b(UPSCALE|BUILD|COPY|DRYRUN|SYNCING|INDEXING|SCANNING|STARTING|RUNNING|LOADING|REFRESHING|EXTRACTING|CONVERTING|VALIDATING|RETRYING|FOUND)\b",
         re.IGNORECASE,
     )
-    _backend_re = re.compile(r"\b(Real-ESRGAN NCNN|ONNX Runtime|chaiNNer|texconv(?:\.exe)?)\b", re.IGNORECASE)
+    _backend_re = re.compile(r"\b(Real-ESRGAN NCNN|chaiNNer|texconv(?:\.exe)?)\b", re.IGNORECASE)
     _correction_mode_re = re.compile(
         r"\b(Match Mean Luma|Match Levels|Match Histogram|Source Match Balanced|Source Match Extended|Source Match Experimental)\b",
         re.IGNORECASE,
@@ -832,8 +865,8 @@ class QuickStartDialog(QDialog):
             <p><b>Crimson Texture Forge</b> is a read-only archive and loose-file workflow tool for Crimson Desert. Its main jobs are archive extraction, DDS-to-PNG conversion, optional upscaling, DDS rebuild, compare review, texture research, and text search.</p>
             <ul>
               <li><b>Archive Browser</b>: scan <b>.pamt/.paz</b>, preview supported assets, filter, and extract to normal folders.</li>
-              <li><b>Workflow</b>: scan loose DDS files, optionally convert DDS to PNG with <b>texconv</b>, optionally upscale with <b>chaiNNer</b>, <b>Real-ESRGAN NCNN</b>, or <b>ONNX Runtime</b>, rebuild DDS, and compare results.</li>
-              <li><b>Research</b>: inspect grouped texture sets, classification, references, DDS QA results, exported reports, and local notes.</li>
+              <li><b>Workflow</b>: scan loose DDS files, optionally convert DDS to PNG with <b>texconv</b>, optionally upscale with <b>chaiNNer</b> or <b>Real-ESRGAN NCNN</b>, rebuild DDS, and compare results.</li>
+              <li><b>Research</b>: inspect grouped texture sets, classification, unknown-family review, references, DDS QA results, exported reports, and local notes.</li>
               <li><b>Text Search</b>: search archive or loose text-like files such as <b>.xml</b>, preview matches with syntax colors, and export results while preserving folder structure.</li>
               <li><b>Settings</b>: store persistent global preferences such as theme, startup cache behavior, remembered layouts, and cleanup confirmations.</li>
             </ul>
@@ -842,7 +875,7 @@ class QuickStartDialog(QDialog):
               <li>Open <b>Setup</b> and click <b>Init Workspace</b>.</li>
               <li>Configure <b>texconv.exe</b> or use the external download page link in <b>Setup</b>. DDS preview, DDS-to-PNG conversion, compare previews, and final DDS rebuild depend on it.</li>
               <li>Set <b>Original DDS root</b>, <b>PNG root</b>, and <b>Output root</b>.</li>
-              <li>Choose an upscaling mode in <b>Upscaling</b>: disabled, direct <b>Real-ESRGAN NCNN</b>, direct <b>ONNX Runtime</b>, or <b>chaiNNer</b>.</li>
+              <li>Choose an upscaling mode in <b>Upscaling</b>: disabled, direct <b>Real-ESRGAN NCNN</b>, or <b>chaiNNer</b>.</li>
               <li>Keep a safer <b>Texture Policy</b> preset first and leave automatic rules enabled so risky technical DDS files are preserved instead of pushed through the PNG path.</li>
               <li>Use <b>Preview Policy</b> before <b>Start</b> if you want to inspect the planned per-texture action.</li>
               <li>Click <b>Scan</b> in the Workflow tab.</li>
@@ -853,8 +886,7 @@ class QuickStartDialog(QDialog):
             <ul>
               <li><b>Disabled</b>: rebuild DDS from existing PNGs or test DDS output settings without upscaling.</li>
               <li><b>Real-ESRGAN NCNN</b>: easiest direct in-app route if you want scale, tile, retry, and optional post correction controlled from the app.</li>
-              <li><b>ONNX Runtime</b>: direct in-app route for local <b>.onnx</b> models with the same direct controls.</li>
-              <li><b>chaiNNer</b>: use only if you already have a tested chain. The chain remains the source of truth; direct NCNN / ONNX controls do not override it.</li>
+              <li><b>chaiNNer</b>: use only if you already have a tested chain. The chain remains the source of truth; direct NCNN controls do not override it.</li>
             </ul>
             <h3>Before you upscale</h3>
             <p>Visible color textures are not the same as technical maps. Height, displacement, normals, masks, vectors, and other precision-sensitive DDS files are riskier to push through PNG intermediates.</p>
@@ -862,7 +894,7 @@ class QuickStartDialog(QDialog):
               <li>Start with a safer preset.</li>
               <li>Keep automatic rules enabled.</li>
               <li>Remember that presets decide what enters the upscale path, but model choice can still shift brightness, contrast, and detail.</li>
-              <li>Source Match post correction only applies to direct NCNN / ONNX runs, and the app decides per texture whether to apply visible RGB correction, grayscale correction, limited RGB-only correction, or a full skip.</li>
+              <li>Source Match post correction only applies to direct NCNN runs, and the app decides per texture whether to apply visible RGB correction, grayscale correction, limited RGB-only correction, or a full skip.</li>
             </ul>
             <h3>Compare and review</h3>
             <p><b>Compare</b> is meant to be the review step before large runs. When the Compare tab is active, the layout gives more room to the previews.</p>
@@ -874,13 +906,13 @@ class QuickStartDialog(QDialog):
             </ul>
             <h3>Research and Text Search</h3>
             <ul>
-              <li>Use <b>Research</b> for grouped texture sets, classifier output, references, DDS analysis, reports, heatmaps, and local notes.</li>
+              <li>Use <b>Research</b> for grouped texture sets, classifier output, <b>Unknown Resolver</b> approval, references, DDS analysis, reports, heatmaps, and local notes.</li>
               <li>Use <b>Text Search</b> for archive or loose text-like files such as <b>.xml</b>, <b>.json</b>, <b>.cfg</b>, and <b>.lua</b>, including preview, regex search, and export.</li>
             </ul>
             <h3>Common failure causes</h3>
             <ul>
               <li><b>Missing texconv</b>: previews, DDS-to-PNG conversion, compare previews, and DDS rebuild all depend on <b>texconv.exe</b>.</li>
-              <li><b>Missing NCNN models or ONNX runtime/models</b>: direct backends need working runtime setup plus compatible models.</li>
+              <li><b>Missing NCNN models</b>: the direct NCNN backend needs a working executable plus compatible models.</li>
               <li><b>No matching PNG outputs</b>: if a chain or backend produces no usable PNG output, DDS rebuild has nothing to convert.</li>
               <li><b>Wrong chaiNNer paths</b>: hardcoded chain folders can make chaiNNer read from or write to the wrong place.</li>
               <li><b>Brightness drift</b>: review in <b>Compare</b>, try a different model, or test a Source Match correction mode.</li>

@@ -16,6 +16,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from crimson_texture_forge.constants import *
 from crimson_texture_forge.models import *
 from crimson_texture_forge.core.archive import *
+from crimson_texture_forge.core.classification_registry import configure_texture_classification_registry
 from crimson_texture_forge.core.chainner import *
 from crimson_texture_forge.core.pipeline import *
 from crimson_texture_forge.core.realesrgan_ncnn import discover_realesrgan_ncnn_models, resolve_ncnn_model_dir
@@ -25,13 +26,6 @@ from crimson_texture_forge.core.ncnn_model_catalog import (
     get_ncnn_catalog_entry,
 )
 from crimson_texture_forge.core.upscale_profiles import get_texture_preset_definition
-from crimson_texture_forge.core.upscale_onnx import (
-    available_providers as available_onnx_providers,
-    discover_onnx_models,
-    is_onnxruntime_available,
-    onnxruntime_error_message,
-    resolve_onnx_model_dir,
-)
 
 
 def run_gui() -> int:
@@ -107,6 +101,9 @@ def run_gui() -> int:
 
     def create_settings() -> QSettings:
         settings_file_path.parent.mkdir(parents=True, exist_ok=True)
+        configure_texture_classification_registry(
+            settings_file_path.parent / "texture_classification_registry.json"
+        )
         legacy_settings_path = settings_file_path.with_name("DDSRebuildApp.cfg")
         if not settings_file_path.exists() and legacy_settings_path.exists():
             try:
@@ -390,10 +387,16 @@ def run_gui() -> int:
             self.output_path = output_path
             self.original_planner_summary = original_planner_summary
             self.output_planner_summary = output_planner_summary
+            self.stop_event = threading.Event()
+
+        def stop(self) -> None:
+            self.stop_event.set()
 
         @Slot()
         def run(self) -> None:
             try:
+                if self.stop_event.is_set():
+                    return
                 payload = {
                     "original": self._build_result_with_loaded_image(
                         self.original_path,
@@ -406,9 +409,11 @@ def run_gui() -> int:
                         self.output_planner_summary,
                     ),
                 }
-                self.completed.emit(self.request_id, payload)
+                if not self.stop_event.is_set():
+                    self.completed.emit(self.request_id, payload)
             except Exception as exc:
-                self.error.emit(self.request_id, str(exc))
+                if not self.stop_event.is_set():
+                    self.error.emit(self.request_id, str(exc))
             finally:
                 self.finished.emit()
 
@@ -423,8 +428,9 @@ def run_gui() -> int:
                 dds_path,
                 missing_message,
                 planner_summary,
+                stop_event=self.stop_event,
             )
-            if result.status != "ok" or not result.preview_png_path:
+            if self.stop_event.is_set() or result.status != "ok" or not result.preview_png_path:
                 return result
             reader = QImageReader(result.preview_png_path)
             image = reader.read()
@@ -449,20 +455,52 @@ def run_gui() -> int:
             self.texconv_path = texconv_path
             self.entry = entry
             self.loose_search_roots = list(loose_search_roots)
+            self.stop_event = threading.Event()
+
+        def stop(self) -> None:
+            self.stop_event.set()
 
         @Slot()
         def run(self) -> None:
             try:
+                if self.stop_event.is_set():
+                    return
                 payload = build_archive_preview_result(
                     self.texconv_path,
                     self.entry,
                     self.loose_search_roots,
+                    stop_event=self.stop_event,
                 )
-                self.completed.emit(self.request_id, payload)
+                if self.stop_event.is_set():
+                    return
+                payload = self._attach_loaded_images(payload)
+                if not self.stop_event.is_set():
+                    self.completed.emit(self.request_id, payload)
             except Exception as exc:
-                self.error.emit(self.request_id, str(exc))
+                if not self.stop_event.is_set():
+                    self.error.emit(self.request_id, str(exc))
             finally:
                 self.finished.emit()
+
+        def _attach_loaded_images(self, result: ArchivePreviewResult) -> ArchivePreviewResult:
+            preview_image = self._load_image(result.preview_image_path)
+            loose_preview_image = self._load_image(result.loose_preview_image_path)
+            if preview_image is None and loose_preview_image is None:
+                return result
+            return dataclasses.replace(
+                result,
+                preview_image=preview_image,
+                loose_preview_image=loose_preview_image,
+            )
+
+        def _load_image(self, image_path: str) -> object:
+            if self.stop_event.is_set() or not image_path:
+                return None
+            reader = QImageReader(image_path)
+            image = reader.read()
+            if self.stop_event.is_set() or image.isNull():
+                return None
+            return image
 
     class MainWindow(QMainWindow):
         def __init__(self) -> None:
@@ -533,6 +571,7 @@ def run_gui() -> int:
             self.archive_preview_debounce_timer.setSingleShot(True)
             self.archive_preview_debounce_timer.setInterval(90)
             self.archive_preview_debounce_timer.timeout.connect(self._flush_scheduled_archive_preview_request)
+            self._last_build_unknown_review_result: Optional[Dict[str, object]] = None
 
             icon_path = resolve_app_icon_path()
             if icon_path is not None:
@@ -651,28 +690,21 @@ def run_gui() -> int:
             setup_buttons_row_3.setSpacing(8)
             self.download_ncnn_button = QPushButton("Open Real-ESRGAN NCNN Download Page")
             self.download_ncnn_button.setToolTip("Open the official Real-ESRGAN NCNN releases page in your default browser.")
-            self.install_onnx_runtime_button = QPushButton("ONNX Runtime Guide")
             setup_buttons_row_3.addWidget(self.download_ncnn_button)
-            setup_buttons_row_3.addWidget(self.install_onnx_runtime_button)
             setup_layout.addLayout(setup_buttons_row_3)
 
             setup_buttons_row_4 = QHBoxLayout()
             setup_buttons_row_4.setSpacing(8)
             self.import_ncnn_models_button = QPushButton("Import NCNN Models")
-            self.import_onnx_models_button = QPushButton("Import ONNX Models")
             self.import_ncnn_models_button.setToolTip(
                 "Import NCNN models from a folder, zip, or files that contain matching .param + .bin pairs."
             )
-            self.import_onnx_models_button.setToolTip(
-                "Import ONNX models from a folder, zip, or files that contain one or more .onnx files."
-            )
             setup_buttons_row_4.addWidget(self.import_ncnn_models_button)
-            setup_buttons_row_4.addWidget(self.import_onnx_models_button)
             setup_layout.addLayout(setup_buttons_row_4)
 
             setup_hint = QLabel(
                 "Direct backends can be prepared here. The setup buttons open official external download or install pages "
-                "in your browser instead of downloading files inside the app. NCNN and ONNX models can still be imported "
+                "in your browser instead of downloading files inside the app. NCNN models can still be imported "
                 "from files you already downloaded locally."
             )
             setup_hint.setObjectName("HintLabel")
@@ -866,7 +898,6 @@ def run_gui() -> int:
             self._add_combo_choice(self.upscale_backend_combo, "Disabled", UPSCALE_BACKEND_NONE)
             self._add_combo_choice(self.upscale_backend_combo, "chaiNNer", UPSCALE_BACKEND_CHAINNER)
             self._add_combo_choice(self.upscale_backend_combo, "Real-ESRGAN NCNN", UPSCALE_BACKEND_REALESRGAN_NCNN)
-            self._add_combo_choice(self.upscale_backend_combo, "ONNX Runtime", UPSCALE_BACKEND_ONNX_RUNTIME)
             self.safe_upscale_wizard_button = QPushButton("Run Summary")
             self.safe_upscale_wizard_button.setToolTip(
                 "Open a read-only summary of the current sources, backend, texture policy, and direct upscale settings before running."
@@ -877,7 +908,7 @@ def run_gui() -> int:
             upscale_layout.addLayout(upscale_backend_grid)
 
             upscale_hint = QLabel(
-                "Choose one optional upscaling backend. Texture Policy below still applies before DDS rebuild, while scale/tile controls only appear for direct NCNN / ONNX backends."
+                "Choose one optional upscaling backend. Texture Policy below still applies before DDS rebuild, while scale/tile controls only appear for the direct NCNN backend."
             )
             upscale_hint.setObjectName("HintLabel")
             upscale_hint.setWordWrap(True)
@@ -1021,49 +1052,6 @@ def run_gui() -> int:
 
             self.upscale_backend_stack.addWidget(ncnn_page)
 
-            onnx_page = QWidget()
-            onnx_page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-            onnx_layout = QVBoxLayout(onnx_page)
-            onnx_layout.setContentsMargins(0, 0, 0, 0)
-            onnx_layout.setSpacing(8)
-
-            onnx_paths_layout = QGridLayout()
-            onnx_paths_layout.setHorizontalSpacing(10)
-            onnx_paths_layout.setVerticalSpacing(10)
-            onnx_paths_layout.setColumnMinimumWidth(0, 136)
-            onnx_paths_layout.setColumnStretch(1, 1)
-            self.onnx_model_dir_edit = QLineEdit()
-            self.onnx_model_dir_browse_button = self._add_path_row(
-                onnx_paths_layout,
-                0,
-                "ONNX model folder",
-                self.onnx_model_dir_edit,
-                self._browse_onnx_model_dir,
-            )
-            onnx_layout.addLayout(onnx_paths_layout)
-
-            onnx_options_layout = QGridLayout()
-            onnx_options_layout.setHorizontalSpacing(10)
-            onnx_options_layout.setVerticalSpacing(8)
-            onnx_options_layout.setColumnMinimumWidth(0, 136)
-            onnx_options_layout.setColumnStretch(1, 1)
-            self.onnx_model_combo = QComboBox()
-            self.onnx_model_refresh_button = QPushButton("Refresh Models")
-            onnx_model_row = QHBoxLayout()
-            onnx_model_row.setContentsMargins(0, 0, 0, 0)
-            onnx_model_row.setSpacing(8)
-            onnx_model_row.addWidget(self.onnx_model_combo, stretch=1)
-            onnx_model_row.addWidget(self.onnx_model_refresh_button)
-            onnx_options_layout.addWidget(QLabel("Model"), 0, 0)
-            onnx_options_layout.addLayout(onnx_model_row, 0, 1)
-            onnx_layout.addLayout(onnx_options_layout)
-
-            self.onnx_runtime_status_label = QLabel()
-            self.onnx_runtime_status_label.setObjectName("HintLabel")
-            self.onnx_runtime_status_label.setWordWrap(True)
-            onnx_layout.addWidget(self.onnx_runtime_status_label)
-            self.upscale_backend_stack.addWidget(onnx_page)
-
             self.ncnn_scale_spin = QSpinBox()
             self.ncnn_scale_spin.setRange(1, 8)
             self.ncnn_tile_size_spin = QSpinBox()
@@ -1168,7 +1156,7 @@ def run_gui() -> int:
             policy_layout.addWidget(self.texture_policy_hint_label, 5, 0, 1, 2)
             upscale_layout.addWidget(self.texture_policy_group)
 
-            self.direct_backend_controls_group = QGroupBox("Direct Upscale Controls (NCNN / ONNX only)")
+            self.direct_backend_controls_group = QGroupBox("Direct Upscale Controls (NCNN only)")
             direct_layout = QGridLayout(self.direct_backend_controls_group)
             direct_layout.setHorizontalSpacing(10)
             direct_layout.setVerticalSpacing(8)
@@ -1548,7 +1536,7 @@ def run_gui() -> int:
             )
             self.archive_exclude_common_technical_checkbox = QCheckBox("Hide common companion DDS suffixes")
             self.archive_exclude_common_technical_checkbox.setToolTip(
-                "Also excludes common companion-map suffixes such as *_n.dds, *_wn.dds, *_sp.dds, *_m.dds, *_ma.dds, *_mg.dds, *_d.dds, *_dmap.dds, *_op.dds, and similar patterns."
+                "Also excludes common companion-map suffixes such as *_n.dds, *_wn.dds, *_sp.dds, *_m.dds, *_ma.dds, *_mg.dds, *_d.dds, *_dmap.dds, *_op.dds, *_pivotpos.dds, *_1bit.dds, *_mask_amg.dds, and similar patterns."
             )
             archive_exclude_filter_row.addWidget(archive_exclude_filter_label)
             archive_exclude_filter_row.addWidget(self.archive_exclude_filter_edit, stretch=1)
@@ -1800,6 +1788,9 @@ def run_gui() -> int:
                 lambda: self.main_tabs.setCurrentWidget(self.archive_browser_tab)
             )
             self.research_tab.extract_related_set_requested.connect(self.extract_related_archive_set_from_paths)
+            self.research_tab.review_reference_in_text_search_requested.connect(
+                self._review_reference_in_text_search
+            )
             self.main_tabs.addTab(self.research_tab, "Research")
             self.main_tabs.addTab(self.text_search_tab, "Text Search")
             self.settings_tab = SettingsTab(
@@ -1826,9 +1817,7 @@ def run_gui() -> int:
             self.download_chainner_button.clicked.connect(self.open_chainner_download_page)
             self.download_texconv_button.clicked.connect(self.open_texconv_download_page)
             self.download_ncnn_button.clicked.connect(self.open_realesrgan_ncnn_download_page)
-            self.install_onnx_runtime_button.clicked.connect(self.install_onnx_runtime)
             self.import_ncnn_models_button.clicked.connect(self.import_ncnn_models)
-            self.import_onnx_models_button.clicked.connect(self.import_onnx_models)
             self.validate_chainner_button.clicked.connect(self.validate_chainner_chain)
             self.clear_log_button.clicked.connect(self.clear_live_log)
             self.clear_archive_log_button.clicked.connect(self.clear_archive_scan_log)
@@ -1962,22 +1951,21 @@ def run_gui() -> int:
               <li>Read-only <code>.pamt/.paz</code> archive browsing and selective extraction</li>
               <li>Loose DDS workflow scanning, DDS-to-PNG conversion, DDS rebuild, and compare</li>
               <li>Text Search with encrypted XML support, syntax-colored preview, and export of matched files</li>
-              <li>Optional <b>chaiNNer</b>, <b>Real-ESRGAN NCNN</b>, or <b>ONNX Runtime</b> stage before DDS rebuild</li>
+              <li>Optional <b>chaiNNer</b> or <b>Real-ESRGAN NCNN</b> stage before DDS rebuild</li>
               <li>Persistent global settings, local config, and archive cache stored beside the EXE</li>
             </ul>
             <h3>External Requirements</h3>
             <ul>
               <li><b>texconv</b> is required for DDS preview, DDS-to-PNG conversion, compare previews, and final DDS rebuild.</li>
-              <li><b>chaiNNer</b>, <b>Real-ESRGAN NCNN</b>, and <b>ONNX Runtime</b> support are optional.</li>
+              <li><b>chaiNNer</b> and <b>Real-ESRGAN NCNN</b> support are optional.</li>
             </ul>
             <h3>Important Upscaling Notes</h3>
             <ul>
               <li>Install and maintain <b>chaiNNer</b> separately.</li>
-              <li>Install the backends your chain needs inside <b>chaiNNer</b>, such as <b>PyTorch</b>, <b>NCNN</b>, or <b>ONNX Runtime</b>.</li>
+              <li>Install the backends your chain needs inside <b>chaiNNer</b>, such as <b>PyTorch</b> or <b>NCNN</b>.</li>
               <li>Provide and test your own <code>.chn</code> chain.</li>
               <li>If DDS-to-PNG conversion is enabled, make sure the chain reads PNG input from the correct folder.</li>
               <li><b>Real-ESRGAN NCNN</b> runs directly from the app after you point it at a local executable and model folder. <b>Setup</b> now opens the official download page instead of downloading the package inside the app, and it can still import NCNN <code>.param</code> / <code>.bin</code> model pairs that you downloaded yourself.</li>
-              <li><b>ONNX Runtime</b> runs directly inside the app when <b>onnxruntime</b> is installed and a valid <code>.onnx</code> model folder is configured. The app currently opens the official setup guide rather than installing ONNX Runtime for you.</li>
               <li><b>Run Summary</b> shows the current sources, backend, and policy before you start, without duplicating the workflow controls.</li>
             </ul>
             <h3>Dependencies</h3>
@@ -1989,7 +1977,6 @@ def run_gui() -> int:
               <li><a href=\"https://github.com/microsoft/DirectXTex\">DirectXTex / texconv</a></li>
               <li><a href=\"https://chainner.app/download/\">chaiNNer</a></li>
               <li><a href=\"https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan\">Real-ESRGAN NCNN Vulkan</a></li>
-              <li><a href=\"https://onnxruntime.ai/\">ONNX Runtime</a></li>
             </ul>
             <h3>Credits and References</h3>
             <ul>
@@ -2009,7 +1996,6 @@ def run_gui() -> int:
               <li>Archive previews are best-effort for unusual or game-specific DDS cases.</li>
               <li><b>chaiNNer</b> remains an external dependency and chain behavior is only as reliable as the chain you provide.</li>
               <li><b>Real-ESRGAN NCNN</b> support assumes the standard command-line executable and supported model folder layout.</li>
-              <li><b>ONNX Runtime</b> support requires a separately installed runtime package and compatible ESRGAN-style <code>.onnx</code> models.</li>
               <li>Large archive sets still take noticeable time to prepare, even after the recent refresh/cache optimizations.</li>
             </ul>
             <h3>Notes</h3>
@@ -2112,7 +2098,6 @@ def run_gui() -> int:
                 self.ncnn_exe_path_edit.setText(getattr(config, "ncnn_exe_path", ""))
                 self.ncnn_model_dir_edit.setText(getattr(config, "ncnn_model_dir", ""))
                 self.ncnn_extra_args_edit.setText(getattr(config, "ncnn_extra_args", ""))
-                self.onnx_model_dir_edit.setText(getattr(config, "onnx_model_dir", ""))
                 self.ncnn_scale_spin.setValue(int(getattr(config, "ncnn_scale", REALESRGAN_NCNN_SCALE)))
                 self.ncnn_tile_size_spin.setValue(int(getattr(config, "ncnn_tile_size", REALESRGAN_NCNN_TILE_SIZE)))
                 self._set_combo_by_value(
@@ -2137,7 +2122,6 @@ def run_gui() -> int:
                 )
                 self.mod_ready_export_root_edit.setText(getattr(config, "mod_ready_export_root", ""))
                 self._refresh_ncnn_model_picker(preferred_name=getattr(config, "ncnn_model_name", ""))
-                self._refresh_onnx_model_picker(preferred_name=getattr(config, "onnx_model_name", ""))
                 self.archive_package_root_edit.setText(config.archive_package_root)
                 self.archive_extract_root_edit.setText(config.archive_extract_root)
                 self.archive_filter_edit.setText(config.archive_filter_text)
@@ -2515,7 +2499,6 @@ def run_gui() -> int:
                 self.ncnn_exe_path_edit,
                 self.ncnn_model_dir_edit,
                 self.ncnn_extra_args_edit,
-                self.onnx_model_dir_edit,
                 self.mod_ready_export_root_edit,
                 self.archive_package_root_edit,
                 self.archive_extract_root_edit,
@@ -2545,7 +2528,6 @@ def run_gui() -> int:
                 self.dds_mip_mode_combo,
                 self.upscale_backend_combo,
                 self.ncnn_model_combo,
-                self.onnx_model_combo,
                 self.upscale_post_correction_combo,
                 self.upscale_texture_preset_combo,
                 self.compare_preview_size_combo,
@@ -2579,8 +2561,6 @@ def run_gui() -> int:
             self.ncnn_model_catalog_button.clicked.connect(self.open_ncnn_model_catalog)
             self.ncnn_exe_path_edit.textChanged.connect(self._refresh_ncnn_model_picker)
             self.ncnn_model_dir_edit.textChanged.connect(self._refresh_ncnn_model_picker)
-            self.onnx_model_refresh_button.clicked.connect(self._refresh_onnx_model_picker)
-            self.onnx_model_dir_edit.textChanged.connect(self._refresh_onnx_model_picker)
             self.mod_ready_export_browse_button.clicked.connect(self._browse_mod_ready_export_root)
             self.enable_mod_ready_loose_export_checkbox.toggled.connect(self._apply_mod_ready_export_state)
             self.compare_sync_pan_checkbox.toggled.connect(self.schedule_settings_save)
@@ -2701,8 +2681,6 @@ def run_gui() -> int:
             self.settings.setValue("ncnn/extra_args", self.ncnn_extra_args_edit.text())
             self.settings.setValue("upscale/post_correction_mode", self._combo_value(self.upscale_post_correction_combo))
             self.settings.setValue("ncnn/texture_preset", self._combo_value(self.upscale_texture_preset_combo))
-            self.settings.setValue("onnx/model_dir", self.onnx_model_dir_edit.text())
-            self.settings.setValue("onnx/model_name", self._combo_value(self.onnx_model_combo))
             self.settings.setValue("upscale/automatic_texture_rules", self.enable_automatic_texture_rules_checkbox.isChecked())
             self.settings.setValue("upscale/unsafe_technical_override", self.enable_unsafe_technical_override_checkbox.isChecked())
             self.settings.setValue("upscale/retry_smaller_tile", self.retry_smaller_tile_checkbox.isChecked())
@@ -2852,7 +2830,6 @@ def run_gui() -> int:
                 UPSCALE_BACKEND_NONE,
                 UPSCALE_BACKEND_CHAINNER,
                 UPSCALE_BACKEND_REALESRGAN_NCNN,
-                UPSCALE_BACKEND_ONNX_RUNTIME,
             }:
                 saved_backend = UPSCALE_BACKEND_CHAINNER if self._read_bool("chainner/enabled", defaults.enable_chainner) else DEFAULT_UPSCALE_BACKEND
             self._set_combo_by_value(self.upscale_backend_combo, saved_backend)
@@ -2873,9 +2850,6 @@ def run_gui() -> int:
             )
             self.ncnn_extra_args_edit.setText(
                 str(self.settings.value("ncnn/extra_args", getattr(defaults, "ncnn_extra_args", REALESRGAN_NCNN_EXTRA_ARGS)))
-            )
-            self.onnx_model_dir_edit.setText(
-                self.settings.value("onnx/model_dir", getattr(defaults, "onnx_model_dir", ONNX_MODEL_DIR))
             )
             self.ncnn_scale_spin.setValue(
                 int(self.settings.value("ncnn/scale", getattr(defaults, "ncnn_scale", REALESRGAN_NCNN_SCALE)))
@@ -2906,14 +2880,6 @@ def run_gui() -> int:
                     self.settings.value(
                         "ncnn/model_name",
                         getattr(defaults, "ncnn_model_name", REALESRGAN_NCNN_MODEL_NAME),
-                    )
-                )
-            )
-            self._refresh_onnx_model_picker(
-                preferred_name=str(
-                    self.settings.value(
-                        "onnx/model_name",
-                        getattr(defaults, "onnx_model_name", ONNX_MODEL_NAME),
                     )
                 )
             )
@@ -2997,8 +2963,6 @@ def run_gui() -> int:
                 self.upscale_backend_stack.setCurrentIndex(1)
             elif backend == UPSCALE_BACKEND_REALESRGAN_NCNN:
                 self.upscale_backend_stack.setCurrentIndex(2)
-            elif backend == UPSCALE_BACKEND_ONNX_RUNTIME:
-                self.upscale_backend_stack.setCurrentIndex(3)
             else:
                 self.upscale_backend_stack.setCurrentIndex(0)
 
@@ -3018,7 +2982,7 @@ def run_gui() -> int:
             self.ncnn_model_combo.setEnabled(ncnn_enabled and self.ncnn_model_combo.count() > 0 and bool(self._combo_value(self.ncnn_model_combo)))
             self.ncnn_model_refresh_button.setEnabled(ncnn_enabled)
             self.ncnn_extra_args_edit.setEnabled(ncnn_enabled)
-            direct_backend_enabled = backend in {UPSCALE_BACKEND_REALESRGAN_NCNN, UPSCALE_BACKEND_ONNX_RUNTIME}
+            direct_backend_enabled = backend == UPSCALE_BACKEND_REALESRGAN_NCNN
             self.texture_policy_group.setVisible(True)
             self.direct_backend_controls_group.setVisible(direct_backend_enabled)
             self.ncnn_scale_spin.setEnabled(direct_backend_enabled)
@@ -3030,13 +2994,7 @@ def run_gui() -> int:
             self.enable_mod_ready_loose_export_checkbox.setEnabled(True)
             self.mod_ready_export_root_edit.setEnabled(self.enable_mod_ready_loose_export_checkbox.isChecked())
             self.mod_ready_export_browse_button.setEnabled(self.enable_mod_ready_loose_export_checkbox.isChecked())
-            onnx_enabled = backend == UPSCALE_BACKEND_ONNX_RUNTIME
-            self.onnx_model_dir_edit.setEnabled(onnx_enabled)
-            self.onnx_model_dir_browse_button.setEnabled(onnx_enabled)
-            self.onnx_model_combo.setEnabled(onnx_enabled and self.onnx_model_combo.count() > 0 and bool(self._combo_value(self.onnx_model_combo)))
-            self.onnx_model_refresh_button.setEnabled(onnx_enabled)
             self._update_ncnn_preset_hint()
-            self._update_onnx_runtime_status()
             self._refresh_dds_output_hints()
             self._sync_upscale_backend_stack_height()
 
@@ -3103,19 +3061,6 @@ def run_gui() -> int:
                             ]
                         )
                     )
-                elif backend == UPSCALE_BACKEND_ONNX_RUNTIME:
-                    self.dds_output_mode_hint.setText(
-                        "DDS files are converted to source PNGs first. ONNX Runtime reads the staged PNGs and writes the final upscaled PNGs into PNG root."
-                    )
-                    self.dds_output_flow_hint.setText(
-                        "\n".join(
-                            [
-                                f"Source PNG folder: {staging_root_text}",
-                                f"Final upscaled PNG folder: {png_root_text}",
-                                f"Rebuilt DDS folder: {output_root_text}",
-                            ]
-                        )
-                    )
                 else:
                     self.dds_output_mode_hint.setText(
                         "DDS files are converted to PNG first. With no backend selected, Start stops after PNG conversion and does not rebuild DDS."
@@ -3145,18 +3090,6 @@ def run_gui() -> int:
                 elif backend == UPSCALE_BACKEND_REALESRGAN_NCNN:
                     self.dds_output_mode_hint.setText(
                         "Real-ESRGAN NCNN is enabled without DDS staging, so it upscales the existing PNG root before DDS rebuild."
-                    )
-                    self.dds_output_flow_hint.setText(
-                        "\n".join(
-                            [
-                                f"Source and final PNG folder: {png_root_text}",
-                                f"Rebuilt DDS folder: {output_root_text}",
-                            ]
-                        )
-                    )
-                elif backend == UPSCALE_BACKEND_ONNX_RUNTIME:
-                    self.dds_output_mode_hint.setText(
-                        "ONNX Runtime is enabled without DDS staging, so it upscales the existing PNG root before DDS rebuild."
                     )
                     self.dds_output_flow_hint.setText(
                         "\n".join(
@@ -3222,15 +3155,9 @@ def run_gui() -> int:
                     "Scale should stay close to the selected model's intended native scale, smaller tile sizes trade speed for lower VRAM use, "
                     "and post correction can automatically decide per texture how aggressively to pull safe outputs back toward the source before DDS rebuild."
                 )
-            elif backend == UPSCALE_BACKEND_ONNX_RUNTIME:
-                direct_text = (
-                    "These controls only affect the direct ONNX PNG upscale pass. "
-                    "Scale and tile settings shape how the direct backend runs, optional post correction can automatically route safe textures toward source matching, "
-                    "and DDS Output below still controls final DDS format, size, and mip behavior."
-                )
             else:
                 direct_text = (
-                    "Direct upscale controls are only used when Real-ESRGAN NCNN or ONNX Runtime is selected. "
+                    "Direct upscale controls are only used when Real-ESRGAN NCNN is selected. "
                     "With no backend selected, the Texture Policy still affects how existing PNG or preserve-original paths are handled."
                 )
             self.direct_backend_hint_label.setText(direct_text)
@@ -3595,39 +3522,6 @@ def run_gui() -> int:
             self.ncnn_model_combo.blockSignals(False)
             self._apply_upscale_backend_state()
 
-        def _refresh_onnx_model_picker(self, *_args, preferred_name: str = "") -> None:
-            current_value = preferred_name or self._combo_value(self.onnx_model_combo)
-            model_dir_text = self.onnx_model_dir_edit.text().strip()
-            explicit_model_dir = Path(model_dir_text).expanduser() if model_dir_text else None
-            if explicit_model_dir is not None and not explicit_model_dir.exists():
-                explicit_model_dir = None
-            resolved_model_dir = resolve_onnx_model_dir(explicit_model_dir)
-
-            discovered_models = discover_onnx_models(resolved_model_dir) if resolved_model_dir is not None else []
-            self.onnx_model_combo.blockSignals(True)
-            self.onnx_model_combo.clear()
-            for model_path in discovered_models:
-                self._add_combo_choice(self.onnx_model_combo, model_path.stem, model_path.stem)
-            if not discovered_models:
-                self._add_combo_choice(self.onnx_model_combo, "No models detected", "")
-            target_name = current_value or (discovered_models[0].stem if discovered_models else "")
-            self._set_combo_by_value(self.onnx_model_combo, target_name)
-            self.onnx_model_combo.blockSignals(False)
-            self._update_onnx_runtime_status()
-            self._apply_upscale_backend_state()
-
-        def _update_onnx_runtime_status(self) -> None:
-            if not is_onnxruntime_available():
-                self.onnx_runtime_status_label.setText(
-                    onnxruntime_error_message() or "onnxruntime is not available."
-                )
-                return
-            providers = available_onnx_providers()
-            provider_text = ", ".join(providers) if providers else "CPUExecutionProvider"
-            self.onnx_runtime_status_label.setText(
-                f"onnxruntime is available. Providers: {provider_text}"
-            )
-
         def _apply_mod_ready_export_state(self) -> None:
             enabled = self.enable_mod_ready_loose_export_checkbox.isChecked()
             self.mod_ready_export_root_edit.setEnabled(enabled)
@@ -3713,9 +3607,6 @@ def run_gui() -> int:
 
         def _browse_ncnn_model_dir(self) -> None:
             self._browse_directory(self.ncnn_model_dir_edit, "Select Real-ESRGAN NCNN model folder")
-
-        def _browse_onnx_model_dir(self) -> None:
-            self._browse_directory(self.onnx_model_dir_edit, "Select ONNX model folder")
 
         def _browse_mod_ready_export_root(self) -> None:
             self._browse_directory(self.mod_ready_export_root_edit, "Select Mod-Ready Loose Export Root")
@@ -3932,12 +3823,9 @@ def run_gui() -> int:
                     self.ncnn_exe_path_edit.setText(str(result["ncnn_exe_path"]))
                 if not self.ncnn_model_dir_edit.text().strip():
                     self.ncnn_model_dir_edit.setText(str(result["ncnn_model_dir"]))
-                if not self.onnx_model_dir_edit.text().strip():
-                    self.onnx_model_dir_edit.setText(str(result["onnx_model_dir"]))
                 if not self.mod_ready_export_root_edit.text().strip():
                     self.mod_ready_export_root_edit.setText(str(result["mod_ready_export_root"]))
                 self._refresh_ncnn_model_picker()
-                self._refresh_onnx_model_picker()
                 self.set_status_message(f"Workspace initialized at {base_dir}")
                 self.append_log("Workspace initialization complete.")
 
@@ -3981,39 +3869,23 @@ def run_gui() -> int:
         def open_realesrgan_ncnn_download_page(self) -> None:
             self._open_external_urls([REALESRGAN_NCNN_RELEASES_PAGE_URL], label="Real-ESRGAN NCNN")
 
-        def install_onnx_runtime(self) -> None:
-            self._open_external_urls([ONNXRUNTIME_INSTALL_DOCS_URL], label="ONNX Runtime setup guide")
-
         def _confirm_model_import_expectations(self, model_kind: str) -> bool:
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Information)
-            if model_kind == "ncnn":
-                box.setWindowTitle("Import NCNN Models")
-                box.setText("Expected NCNN model contents")
-                box.setInformativeText(
-                    "Choose a folder, zip, or file set that contains at least one matching "
-                    ".param + .bin pair with the same base name."
-                )
-                box.setDetailedText(
-                    "Example:\n"
-                    "  realesr-animevideov3.param\n"
-                    "  realesr-animevideov3.bin\n\n"
-                    "Nested folders inside a zip are fine.\n"
-                    "Unsupported examples include a single .param without its .bin partner,\n"
-                    "random checkpoint formats, or the NCNN executable folder without model files."
-                )
-            else:
-                box.setWindowTitle("Import ONNX Models")
-                box.setText("Expected ONNX model contents")
-                box.setInformativeText(
-                    "Choose a folder, zip, or file set that contains one or more .onnx model files."
-                )
-                box.setDetailedText(
-                    "Example:\n"
-                    "  realesrgan-x4plus.onnx\n\n"
-                    "Nested folders inside a zip are fine.\n"
-                    "Unsupported examples include .pth, .ckpt, or folders that do not contain any .onnx files."
-                )
+            box.setWindowTitle("Import NCNN Models")
+            box.setText("Expected NCNN model contents")
+            box.setInformativeText(
+                "Choose a folder, zip, or file set that contains at least one matching "
+                ".param + .bin pair with the same base name."
+            )
+            box.setDetailedText(
+                "Example:\n"
+                "  realesr-animevideov3.param\n"
+                "  realesr-animevideov3.bin\n\n"
+                "Nested folders inside a zip are fine.\n"
+                "Unsupported examples include a single .param without its .bin partner,\n"
+                "random checkpoint formats, or the NCNN executable folder without model files."
+            )
             continue_button = box.addButton("Continue", QMessageBox.AcceptRole)
             box.addButton(QMessageBox.Cancel)
             box.exec()
@@ -4039,11 +3911,7 @@ def run_gui() -> int:
                 self,
                 title,
                 self._suggest_workspace_base_dir(),
-                (
-                    "NCNN model files (*.param *.bin *.zip);;All files (*.*)"
-                    if model_kind == "ncnn"
-                    else "ONNX model files (*.onnx *.zip);;All files (*.*)"
-                ),
+                "NCNN model files (*.param *.bin *.zip);;All files (*.*)",
             )
             return [Path(path) for path in selected_files]
 
@@ -4084,40 +3952,6 @@ def run_gui() -> int:
 
             self._run_utility_task(
                 status_message="Importing NCNN models...",
-                task=task,
-                on_complete=on_complete,
-            )
-
-        def import_onnx_models(self) -> None:
-            sources = self._choose_model_import_sources("Import ONNX Models", model_kind="onnx")
-            if not sources:
-                return
-            destination = self._choose_model_destination(
-                "Select ONNX Model Folder",
-                self.onnx_model_dir_edit.text().strip(),
-            )
-            if destination is None:
-                return
-
-            def task(on_log: Callable[[str], None]) -> List[str]:
-                model_names = validate_onnx_model_import_sources(sources)
-                on_log(f"Detected {len(model_names)} ONNX model file(s): {', '.join(model_names[:5])}")
-                imported = import_model_assets_to_directory(
-                    sources,
-                    destination,
-                    allowed_suffixes=(".onnx",),
-                    on_log=on_log,
-                )
-                return [str(path) for path in imported]
-
-            def on_complete(result: object) -> None:
-                imported = result if isinstance(result, list) else []
-                self.onnx_model_dir_edit.setText(str(destination))
-                self._refresh_onnx_model_picker()
-                self.set_status_message(f"Imported {len(imported)} ONNX model file(s).")
-
-            self._run_utility_task(
-                status_message="Importing ONNX models...",
                 task=task,
                 on_complete=on_complete,
             )
@@ -4763,6 +4597,8 @@ def run_gui() -> int:
 
             if self.archive_preview_thread is not None:
                 self.pending_archive_preview_request = (request_id, entry)
+                if self.archive_preview_worker is not None:
+                    self.archive_preview_worker.stop()
                 return
 
             self._start_archive_preview_worker(request_id, texconv_path, entry, loose_search_roots)
@@ -4791,13 +4627,13 @@ def run_gui() -> int:
             thread.start()
 
         def _handle_archive_preview_ready(self, request_id: int, payload: object) -> None:
-            if request_id != self.archive_preview_request_id:
+            if self._shutting_down or request_id != self.archive_preview_request_id:
                 return
             if isinstance(payload, ArchivePreviewResult):
                 self._apply_archive_preview_result(payload)
 
         def _handle_archive_preview_error(self, request_id: int, message: str) -> None:
-            if request_id != self.archive_preview_request_id:
+            if self._shutting_down or request_id != self.archive_preview_request_id:
                 return
             self._clear_archive_preview(f"Preview failed: {message}")
 
@@ -4853,7 +4689,8 @@ def run_gui() -> int:
                     else ""
                 )
                 preview_image_path = result.loose_preview_image_path
-                preferred_view = "image" if preview_image_path else "info"
+                preview_image = result.loose_preview_image
+                preferred_view = "image" if (preview_image is not None or preview_image_path) else "info"
             else:
                 title = result.title or "Archive Preview"
                 metadata_summary = result.metadata_summary or "Preview ready."
@@ -4861,6 +4698,7 @@ def run_gui() -> int:
                 warning_badge = result.warning_badge
                 warning_text = result.warning_text
                 preview_image_path = result.preview_image_path
+                preview_image = result.preview_image
                 preferred_view = result.preferred_view
 
             self.archive_preview_title_label.setText(title)
@@ -4872,8 +4710,11 @@ def run_gui() -> int:
                 can_toggle_loose=bool(result.loose_file_path),
             )
 
-            if preferred_view == "image" and preview_image_path:
-                self.archive_preview_label.set_preview_image_path(preview_image_path, title or "Preview image")
+            if preferred_view == "image" and (preview_image is not None or preview_image_path):
+                if preview_image is not None:
+                    self.archive_preview_label.set_preview_image(preview_image, title or "Preview image")
+                else:
+                    self.archive_preview_label.set_preview_image_path(preview_image_path, title or "Preview image")
                 self.archive_preview_stack.setCurrentWidget(self.archive_preview_scroll)
                 self.archive_preview_tabs.setCurrentIndex(0)
                 self._set_archive_preview_image_controls_enabled(True)
@@ -4910,6 +4751,10 @@ def run_gui() -> int:
         def _cleanup_archive_preview_refs(self) -> None:
             self.archive_preview_thread = None
             self.archive_preview_worker = None
+            if self._shutting_down:
+                self.pending_archive_preview_request = None
+                self.scheduled_archive_preview_request = None
+                return
             if self.pending_archive_preview_request is None:
                 return
             request_id, entry = self.pending_archive_preview_request
@@ -5245,8 +5090,6 @@ def run_gui() -> int:
                 ncnn_tile_size=self.ncnn_tile_size_spin.value(),
                 ncnn_extra_args=self.ncnn_extra_args_edit.text().strip(),
                 upscale_post_correction_mode=self._combo_value(self.upscale_post_correction_combo),
-                onnx_model_dir=self.onnx_model_dir_edit.text().strip(),
-                onnx_model_name=self._combo_value(self.onnx_model_combo),
                 upscale_texture_preset=self._combo_value(self.upscale_texture_preset_combo),
                 enable_automatic_texture_rules=self.enable_automatic_texture_rules_checkbox.isChecked(),
                 enable_unsafe_technical_override=self.enable_unsafe_technical_override_checkbox.isChecked(),
@@ -5507,6 +5350,15 @@ def run_gui() -> int:
                 return
             if not self._prepare_workflow_output_roots_for_start(config, include_output_root=True):
                 return
+            self._last_build_unknown_review_result = None
+            if config.upscale_backend != UPSCALE_BACKEND_NONE:
+                self._check_unclassified_files_before_build(config)
+                return
+            self._begin_build_with_config(config)
+
+        def _begin_build_with_config(self, config: AppConfig) -> None:
+            if self._background_task_active():
+                return
 
             self.set_status_message("Preparing build...")
             self.append_log("Starting build.")
@@ -5537,6 +5389,189 @@ def run_gui() -> int:
             self.worker_thread = thread
             self.set_busy(True, build_mode=True)
             thread.start()
+
+        def _begin_build_when_idle(self, config: AppConfig, *, attempt: int = 0) -> None:
+            if not self._background_task_active():
+                self._begin_build_with_config(config)
+                return
+            if self.utility_worker is not None and attempt < 100:
+                QTimer.singleShot(
+                    10,
+                    lambda config=config, attempt=attempt + 1: self._begin_build_when_idle(
+                        config,
+                        attempt=attempt,
+                    ),
+                )
+                return
+            self.set_status_message("Build could not start after the pre-run classification check.", error=True)
+            self.append_log(
+                "ERROR: Build start was blocked after the pre-run classification check did not fully release its worker state."
+            )
+
+        def _open_classification_review_for_paths(self, paths: Sequence[str]) -> None:
+            path_list = [str(path).strip() for path in paths if str(path).strip()]
+            self.main_tabs.setCurrentWidget(self.research_tab)
+            if not path_list:
+                self.set_status_message(
+                    "Build paused so you can review unclassified DDS files in Research -> Classification Review."
+                )
+                return
+            self.research_tab.focus_classification_review_for_paths(
+                path_list,
+                include_classified=False,
+                refresh_if_needed=not bool(getattr(self.research_tab, "research_payload", {})),
+            )
+            self.set_status_message(
+                f"Build paused so you can review {len(path_list):,} unclassified DDS file(s) in Research -> Classification Review."
+            )
+
+        def _review_reference_in_text_search(self, source_path: str, highlight_query: str) -> None:
+            normalized_path = source_path.strip().replace("\\", "/").strip("/")
+            query = highlight_query.strip()
+            if not normalized_path or not query:
+                self.set_status_message("The selected reference row is missing its source path or highlight query.", error=True)
+                return
+            entry: Optional[ArchiveEntry] = None
+            for candidate in self.archive_entries:
+                if not isinstance(candidate, ArchiveEntry):
+                    continue
+                candidate_path = candidate.path.replace("\\", "/").strip("/")
+                if candidate_path.casefold() == normalized_path.casefold():
+                    entry = candidate
+                    break
+            if entry is None:
+                self.set_status_message(
+                    f"Could not find the archive text entry for {normalized_path}. Refresh archives and try again.",
+                    error=True,
+                )
+                return
+            if not self.text_search_tab.review_archive_entry(entry, highlight_query=query):
+                return
+            self.main_tabs.setCurrentWidget(self.text_search_tab)
+
+        def _check_unclassified_files_before_build(self, config: AppConfig) -> None:
+            def task(on_log: Callable[[str], None]) -> Dict[str, object]:
+                normalized = normalize_config(config, validate_backend_runtime=False)
+                dds_files = collect_dds_files(
+                    normalized.original_dds_root,
+                    normalized.include_filter_patterns,
+                )
+                total = len(dds_files)
+                if total <= 0:
+                    raise ValueError("No DDS files were found under the original root with the current filter.")
+                processing_plan = build_texture_processing_plan(
+                    normalized,
+                    dds_files,
+                )
+                unknown_entries = [
+                    entry
+                    for entry in processing_plan
+                    if entry.decision.texture_type == "unknown"
+                ]
+                unknown_paths = [entry.relative_path.as_posix() for entry in unknown_entries]
+                processed_unknowns = sum(1 for entry in unknown_entries if entry.requires_png_processing)
+                preserved_unknowns = len(unknown_entries) - processed_unknowns
+                example_names: List[str] = []
+                seen_examples: set[str] = set()
+                for rel_path in unknown_paths:
+                    basename = PurePosixPath(rel_path).name
+                    if basename.casefold() in seen_examples:
+                        continue
+                    seen_examples.add(basename.casefold())
+                    example_names.append(basename)
+                    if len(example_names) >= 6:
+                        break
+                on_log(
+                    f"Pre-run classification check: {len(unknown_entries):,} matched DDS file(s) are still unclassified."
+                )
+                return {
+                    "total_files": total,
+                    "unknown_total": len(unknown_entries),
+                    "processed_unknowns": processed_unknowns,
+                    "preserved_unknowns": preserved_unknowns,
+                    "unknown_paths": unknown_paths,
+                    "example_names": example_names,
+                    "preset_label": get_texture_preset_definition(normalized.upscale_texture_preset).label,
+                }
+
+            def on_complete(result: object) -> None:
+                payload = result if isinstance(result, dict) else {}
+                unknown_total = int(payload.get("unknown_total", 0) or 0)
+                if unknown_total <= 0:
+                    QTimer.singleShot(0, lambda config=config: self._begin_build_when_idle(config))
+                    return
+
+                processed_unknowns = int(payload.get("processed_unknowns", 0) or 0)
+                preserved_unknowns = int(payload.get("preserved_unknowns", 0) or 0)
+                example_names = [
+                    str(item) for item in payload.get("example_names", [])
+                    if str(item).strip()
+                ]
+                preset_label = str(payload.get("preset_label", "") or "").strip()
+
+                box = QMessageBox(self)
+                box.setWindowTitle("Unclassified DDS Files")
+                box.setIcon(QMessageBox.Question)
+                box.setText(f"{unknown_total:,} matched DDS file(s) are still unclassified.")
+                detail_lines = []
+                if preset_label:
+                    detail_lines.append(f"Current texture preset: {preset_label}.")
+                if processed_unknowns <= 0:
+                    detail_lines.append(
+                        "Under the current preset and policy rules, these files will likely be left unchanged."
+                    )
+                elif preserved_unknowns <= 0:
+                    detail_lines.append(
+                        "Under the current preset and policy rules, these files will likely still be processed."
+                    )
+                else:
+                    detail_lines.append(
+                        f"Under the current preset and policy rules, about {processed_unknowns:,} would be processed and {preserved_unknowns:,} would likely be left unchanged."
+                    )
+                detail_lines.append(
+                    "Review them now if you want to approve classifications before the run starts."
+                )
+                if example_names:
+                    detail_lines.extend(
+                        [
+                            "",
+                            "Examples:",
+                            ", ".join(example_names[:5]),
+                        ]
+                    )
+                box.setInformativeText("\n".join(detail_lines))
+                review_button = box.addButton("Review Classifications", QMessageBox.ActionRole)
+                continue_button = box.addButton("Continue Anyway", QMessageBox.AcceptRole)
+                cancel_button = box.addButton(QMessageBox.Cancel)
+                box.setDefaultButton(review_button)
+                box.exec()
+
+                clicked = box.clickedButton()
+                if clicked == review_button:
+                    unknown_paths = [
+                        str(path) for path in payload.get("unknown_paths", [])
+                        if str(path).strip()
+                    ]
+                    self.append_log(
+                        f"Build paused so Research -> Classification Review can focus on {len(unknown_paths):,} unclassified DDS file(s)."
+                    )
+                    QTimer.singleShot(0, lambda paths=unknown_paths: self._open_classification_review_for_paths(paths))
+                    return
+                if clicked != continue_button:
+                    self.set_status_message("Build cancelled before start.")
+                    return
+
+                self._last_build_unknown_review_result = payload
+                self.append_log(
+                    f"Continuing build with {unknown_total:,} unclassified DDS file(s)."
+                )
+                QTimer.singleShot(0, lambda config=config: self._begin_build_when_idle(config))
+
+            self._run_utility_task(
+                status_message="Checking for unclassified DDS files before build...",
+                task=task,
+                on_complete=on_complete,
+            )
 
         def stop_build(self) -> None:
             active_worker = self.build_worker or self.dds_to_png_worker
@@ -5632,15 +5667,33 @@ def run_gui() -> int:
                     error=True,
                 )
             else:
-                self.set_status_message("Build completed successfully.")
+                unknown_total = int(self._last_build_unknown_review_result.get("unknown_total", 0) or 0) if isinstance(self._last_build_unknown_review_result, dict) else 0
+                if unknown_total > 0:
+                    self.set_status_message(
+                        f"Build completed. {unknown_total:,} matched DDS file(s) were still unclassified in this run."
+                    )
+                else:
+                    self.set_status_message("Build completed successfully.")
             self.append_log(
                 f"Finished. Converted/planned={summary.converted}, skipped={summary.skipped}, failed={summary.failed}."
             )
+            if isinstance(self._last_build_unknown_review_result, dict):
+                unknown_total = int(self._last_build_unknown_review_result.get("unknown_total", 0) or 0)
+                processed_unknowns = int(self._last_build_unknown_review_result.get("processed_unknowns", 0) or 0)
+                preserved_unknowns = int(self._last_build_unknown_review_result.get("preserved_unknowns", 0) or 0)
+                if unknown_total > 0:
+                    self.append_log(
+                        "Note: "
+                        f"{unknown_total:,} matched DDS file(s) were still unclassified in this run. "
+                        f"Current-policy estimate before start: {processed_unknowns:,} would be processed and {preserved_unknowns:,} would likely be left unchanged. "
+                        "Open Research -> Classification Review if you want to review them."
+                    )
             if summary.log_csv_path:
                 self.append_log(f"CSV log saved to {summary.log_csv_path}")
             self.refresh_compare_list(select_current=True)
             self.main_tabs.setCurrentWidget(self.workflow_tab)
             self.content_tabs.setCurrentIndex(1)
+            self._last_build_unknown_review_result = None
 
         def _handle_dds_to_png_complete(self, summary: RunSummary) -> None:
             self._handle_progress(
@@ -5670,6 +5723,7 @@ def run_gui() -> int:
             self.set_status_message(message, error=True)
             self.current_file_value.setText("Stopped")
             self.append_log(message)
+            self._last_build_unknown_review_result = None
 
         def _handle_utility_completed(self, result: object) -> None:
             if self._utility_completion_handler is not None:
@@ -5948,6 +6002,8 @@ def run_gui() -> int:
 
             if self.compare_preview_thread is not None:
                 self.pending_compare_preview_request = (request_id, relative_path)
+                if self.compare_preview_worker is not None:
+                    self.compare_preview_worker.stop()
                 return
 
             self._start_compare_preview_worker(
@@ -6088,9 +6144,13 @@ def run_gui() -> int:
             self._settings_save_timer.stop()
             self._chainner_analysis_timer.stop()
             self._compare_preview_timer.stop()
+            self.archive_preview_debounce_timer.stop()
             self.pending_compare_preview_selection = None
             self.pending_compare_preview_request = None
+            self.pending_archive_preview_request = None
+            self.scheduled_archive_preview_request = None
             self.compare_preview_request_id += 1
+            self.archive_preview_request_id += 1
             self.settings.setValue("window/geometry", self.saveGeometry())
             self.flush_settings_save()
             if self.scan_worker is not None:
@@ -6106,9 +6166,13 @@ def run_gui() -> int:
                     self.worker_thread.quit()
                     self.worker_thread.wait(2000)
             if self.compare_preview_thread is not None:
+                if self.compare_preview_worker is not None:
+                    self.compare_preview_worker.stop()
                 self.compare_preview_thread.quit()
                 self.compare_preview_thread.wait(3000)
             if self.archive_preview_thread is not None:
+                if self.archive_preview_worker is not None:
+                    self.archive_preview_worker.stop()
                 self.archive_preview_thread.quit()
                 self.archive_preview_thread.wait(3000)
             self.settings_tab.flush_settings_save()

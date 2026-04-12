@@ -12,11 +12,17 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from crimson_texture_forge.constants import ARCHIVE_IMAGE_EXTENSIONS
-from crimson_texture_forge.core.archive import ArchiveEntry, archive_entry_role, read_archive_entry_data
+from crimson_texture_forge.core.archive import (
+    ArchiveEntry,
+    archive_entry_role,
+    ensure_archive_preview_source,
+    read_archive_entry_data,
+)
 from crimson_texture_forge.core.common import raise_if_cancelled
 from crimson_texture_forge.core.pipeline import (
     _SCALAR_HIGH_PRECISION_MASK_SUBTYPES,
     build_texture_processing_plan,
+    collect_compare_relative_paths,
     collect_dds_files,
     describe_processing_path_kind,
     ensure_dds_preview_png,
@@ -160,6 +166,40 @@ class TextureSetGroup:
     package_labels: List[str]
     member_kinds: List[str]
     members: List[TextureSetMember] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class UnknownResolverSuggestion:
+    choice_key: str
+    texture_type: str
+    semantic_subtype: str
+    confidence: int
+    reason: str
+
+
+@dataclass(slots=True)
+class UnknownResolverMember:
+    path: str
+    package_label: str
+    current_kind: str
+    reason: str
+    role_hint: str = ""
+    extension: str = ""
+    is_unknown: bool = True
+
+
+@dataclass(slots=True)
+class UnknownResolverGroup:
+    group_key: str
+    display_name: str
+    unknown_count: int
+    total_members: int
+    package_labels: List[str]
+    known_kinds: List[str]
+    sidecar_paths: List[str]
+    suggestion_label: str = ""
+    members: List[UnknownResolverMember] = field(default_factory=list)
+    suggestions: List[UnknownResolverSuggestion] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -386,12 +426,14 @@ def build_archive_research_snapshot(
     classification_limit: int = 3000,
     group_limit: int = 2000,
     heatmap_limit_per_scope: int = 24,
+    stop_event: Optional[object] = None,
 ) -> Dict[str, object]:
     family_members_by_group: Dict[str, List[str]] = defaultdict(list)
     grouped_entries: Dict[str, List[ArchiveEntry]] = defaultdict(list)
     entry_metadata: List[Tuple[ArchiveEntry, str, bool, bool, str, str]] = []
 
     for entry in entries:
+        raise_if_cancelled(stop_event, "Research refresh cancelled.")
         normalized_path = entry.path.replace("\\", "/")
         lowered = normalized_path.lower()
         is_texture = entry.extension in TEXTURE_IMAGE_EXTENSIONS or "/texture/" in lowered
@@ -408,6 +450,7 @@ def build_archive_research_snapshot(
     heatmap_scopes: Dict[Tuple[str, str], Dict[str, object]] = {}
 
     for entry, normalized_path, is_texture, is_sidecar, lowered, group_key in entry_metadata:
+        raise_if_cancelled(stop_event, "Research refresh cancelled.")
         if not is_texture and not is_sidecar:
             continue
 
@@ -472,6 +515,7 @@ def build_archive_research_snapshot(
 
     texture_groups: List[TextureSetGroup] = []
     for group_key, entry_members in grouped_entries.items():
+        raise_if_cancelled(stop_event, "Research refresh cancelled.")
         if len(entry_members) < 2:
             continue
         members: List[TextureSetMember] = []
@@ -504,6 +548,7 @@ def build_archive_research_snapshot(
 
     heatmap_rows: List[TextureUsageHeatRow] = []
     for (scope_name, label), bucket in heatmap_scopes.items():
+        raise_if_cancelled(stop_event, "Research refresh cancelled.")
         set_count = len(bucket["set_keys"])
         heat_score = (
             int(bucket["texture_count"])
@@ -544,6 +589,12 @@ def build_archive_research_snapshot(
         "classification_rows": classification_rows[:classification_limit],
         "texture_groups": texture_groups[:group_limit],
         "heatmap_rows": flattened_heatmap_rows,
+        "unknown_resolver_groups": build_unknown_resolver_groups(entries, classification_rows),
+        "classification_review_groups": build_unknown_resolver_groups(
+            entries,
+            classification_rows,
+            include_classified=True,
+        ),
     }
 
 
@@ -564,6 +615,297 @@ def _build_family_members_by_relative_path(paths: Sequence[str]) -> Dict[str, Tu
         for member in ordered:
             family_members[member] = ordered
     return family_members
+
+
+_UNKNOWN_RESOLVER_LABELS: Tuple[Tuple[str, str, str], ...] = (
+    ("color_albedo", "color", "albedo"),
+    ("color_variant", "color", "albedo_variant"),
+    ("ui", "ui", "ui"),
+    ("emissive", "emissive", "emissive"),
+    ("normal", "normal", "normal"),
+    ("roughness", "roughness", "roughness"),
+    ("height", "height", "displacement"),
+    ("mask_generic", "mask", "mask"),
+    ("mask_specular", "mask", "specular"),
+    ("mask_opacity", "mask", "opacity_mask"),
+    ("vector", "vector", "vector"),
+    ("unknown", "unknown", "unknown"),
+)
+
+
+def default_unknown_resolver_label_choice() -> str:
+    return "color_albedo"
+
+
+def unknown_resolver_label_choices() -> List[Tuple[str, str, str]]:
+    return list(_UNKNOWN_RESOLVER_LABELS)
+
+
+def unknown_resolver_choice_for(texture_type: str, semantic_subtype: str) -> str:
+    normalized_type = str(texture_type or "").strip().lower()
+    normalized_subtype = str(semantic_subtype or "").strip().lower()
+    for choice_key, choice_type, choice_subtype in _UNKNOWN_RESOLVER_LABELS:
+        if normalized_type == choice_type and normalized_subtype == choice_subtype:
+            return choice_key
+    for choice_key, choice_type, _choice_subtype in _UNKNOWN_RESOLVER_LABELS:
+        if normalized_type == choice_type:
+            return choice_key
+    return default_unknown_resolver_label_choice()
+
+
+def unknown_resolver_choice_label(choice_key: str) -> str:
+    mapping = {
+        "color_albedo": "Color / Albedo",
+        "color_variant": "Color / Variant",
+        "ui": "UI",
+        "emissive": "Emissive",
+        "normal": "Normal",
+        "roughness": "Roughness",
+        "height": "Height / Displacement",
+        "mask_generic": "Mask / Generic",
+        "mask_specular": "Mask / Specular",
+        "mask_opacity": "Mask / Opacity",
+        "vector": "Vector",
+        "unknown": "Keep Unknown",
+    }
+    return mapping.get(choice_key, choice_key)
+
+
+def _default_semantic_subtype_for_type(texture_type: str) -> str:
+    return {
+        "color": "albedo",
+        "ui": "ui",
+        "emissive": "emissive",
+        "impostor": "impostor",
+        "normal": "normal",
+        "roughness": "roughness",
+        "height": "displacement",
+        "mask": "mask",
+        "vector": "vector",
+    }.get(str(texture_type or "").strip().lower(), "unknown")
+
+
+def _build_unknown_resolver_suggestions(
+    group_key: str,
+    *,
+    members: Sequence[UnknownResolverMember],
+    sidecar_paths: Sequence[str],
+) -> List[UnknownResolverSuggestion]:
+    suggestions: List[UnknownResolverSuggestion] = []
+    seen: set[str] = set()
+    known_counter = Counter(
+        member.current_kind
+        for member in members
+        if member.current_kind and member.current_kind != "unknown" and member.extension == ".dds"
+    )
+    normalized_group = group_key.replace("\\", "/").lower()
+    joined_member_paths = " ".join(member.path.lower() for member in members)
+
+    def add_suggestion(texture_type: str, semantic_subtype: str, confidence: int, reason: str) -> None:
+        choice_key = unknown_resolver_choice_for(texture_type, semantic_subtype)
+        if choice_key in seen:
+            return
+        seen.add(choice_key)
+        suggestions.append(
+            UnknownResolverSuggestion(
+                choice_key=choice_key,
+                texture_type=texture_type,
+                semantic_subtype=semantic_subtype,
+                confidence=int(confidence),
+                reason=reason,
+            )
+        )
+
+    if known_counter:
+        dominant_kind, dominant_count = known_counter.most_common(1)[0]
+        add_suggestion(
+            dominant_kind,
+            _default_semantic_subtype_for_type(dominant_kind),
+            92 if dominant_count > 1 else 82,
+            f"Family already contains {dominant_count} classified {dominant_kind} companion map(s).",
+        )
+
+    if "/ui/" in normalized_group or "/hud/" in normalized_group:
+        add_suggestion("ui", "ui", 80, "Group path looks UI-related.")
+    if any(token in joined_member_paths for token in ("emissive", "_emi", "_emc", "_glow", "_emit")):
+        add_suggestion("emissive", "emissive", 78, "Member names contain emissive/glow hints.")
+    if any(token in joined_member_paths for token in ("roughness", "smoothness", "gloss", "glossiness")):
+        add_suggestion("roughness", "roughness", 80, "Member names contain explicit roughness/gloss/smoothness hints.")
+    if any(token in joined_member_paths for token in ("displacement", "dmap", "height", "disp")):
+        add_suggestion("height", "displacement", 80, "Member names contain explicit height/displacement hints.")
+    if any(token in joined_member_paths for token in ("specular", "_spec", "_sp")):
+        add_suggestion("mask", "specular", 74, "Member names contain specular hints.")
+    if any(token in joined_member_paths for token in ("opacity", "alpha", "_mask")):
+        add_suggestion("mask", "opacity_mask", 72, "Member names contain alpha/opacity mask hints.")
+
+    if not suggestions:
+        variant_like_count = sum(1 for member in members if re.search(r"(?<=\d)[a-z]\.dds$", member.path, re.IGNORECASE))
+        if variant_like_count >= 1 or sidecar_paths:
+            add_suggestion(
+                "color",
+                "albedo",
+                66,
+                "Texture family has visible variant or sidecar evidence, which often indicates a color/albedo set.",
+            )
+        else:
+            add_suggestion(
+                "color",
+                "albedo",
+                58,
+                "Texture path has no strong technical hint; visible color/albedo is the safest first review guess.",
+            )
+        add_suggestion(
+            "mask",
+            "mask",
+            34,
+            "If the texture behaves like grayscale support data, review it as a generic mask instead.",
+        )
+
+    suggestions.sort(key=lambda suggestion: (-suggestion.confidence, suggestion.choice_key))
+    return suggestions[:3]
+
+
+def build_unknown_resolver_groups(
+    entries: Sequence[ArchiveEntry],
+    classification_rows: Sequence[TextureClassificationRow],
+    *,
+    include_classified: bool = False,
+) -> List[UnknownResolverGroup]:
+    rows_by_path = {row.path.replace("\\", "/"): row for row in classification_rows}
+    entries_by_group: Dict[str, List[ArchiveEntry]] = defaultdict(list)
+    for entry in entries:
+        normalized_path = entry.path.replace("\\", "/")
+        if entry.extension in TEXTURE_IMAGE_EXTENSIONS or entry.extension in TEXTURE_SIDECAR_EXTENSIONS:
+            entries_by_group[derive_texture_group_key(normalized_path)].append(entry)
+
+    groups: List[UnknownResolverGroup] = []
+    for group_key, group_entries in entries_by_group.items():
+        texture_rows = [
+            rows_by_path[entry.path.replace("\\", "/")]
+            for entry in group_entries
+            if entry.extension in TEXTURE_IMAGE_EXTENSIONS and entry.path.replace("\\", "/") in rows_by_path
+        ]
+        if not texture_rows:
+            continue
+        unknown_rows = [row for row in texture_rows if row.texture_type == "unknown"]
+        if not unknown_rows and not include_classified:
+            continue
+
+        members: List[UnknownResolverMember] = []
+        sidecar_paths: List[str] = []
+        for entry in sorted(group_entries, key=lambda member: member.path):
+            normalized_path = entry.path.replace("\\", "/")
+            row = rows_by_path.get(normalized_path)
+            if entry.extension in TEXTURE_SIDECAR_EXTENSIONS:
+                sidecar_paths.append(normalized_path)
+            if row is None and entry.extension not in TEXTURE_IMAGE_EXTENSIONS:
+                continue
+            current_kind = row.texture_type if row is not None else "sidecar"
+            reason = row.reason if row is not None else "Sidecar/support file in the same family."
+            members.append(
+                UnknownResolverMember(
+                    path=normalized_path,
+                    package_label=entry.package_label,
+                    current_kind=current_kind,
+                    reason=reason,
+                    role_hint=archive_entry_role(entry),
+                    extension=entry.extension,
+                    is_unknown=bool(row is not None and row.texture_type == "unknown"),
+                )
+            )
+
+        package_labels = sorted({member.package_label for member in members})
+        known_kinds = sorted({member.current_kind for member in members if member.current_kind not in {"unknown", "sidecar"}})
+        suggestions = _build_unknown_resolver_suggestions(group_key, members=members, sidecar_paths=sidecar_paths)
+        top_suggestion = suggestions[0] if suggestions else None
+        suggestion_label = (
+            f"{unknown_resolver_choice_label(top_suggestion.choice_key)} ({top_suggestion.confidence}%)"
+            if top_suggestion is not None
+            else "Manual review"
+        )
+        groups.append(
+            UnknownResolverGroup(
+                group_key=group_key,
+                display_name=PurePosixPath(group_key).name or group_key,
+                unknown_count=len(unknown_rows),
+                total_members=len([member for member in members if member.extension in TEXTURE_IMAGE_EXTENSIONS]),
+                package_labels=package_labels,
+                known_kinds=known_kinds,
+                sidecar_paths=sidecar_paths,
+                suggestion_label=suggestion_label,
+                members=members,
+                suggestions=suggestions,
+            )
+        )
+
+    groups.sort(key=lambda group: (-group.unknown_count, group.display_name.casefold()))
+    return groups
+
+
+def build_unknown_resolver_detail(
+    group: UnknownResolverGroup,
+    selected_member_path: str,
+    *,
+    entries_by_path: Dict[str, ArchiveEntry],
+    texconv_path: Optional[Path] = None,
+) -> str:
+    normalized_selected = selected_member_path.replace("\\", "/")
+    selected_entry = entries_by_path.get(normalized_selected)
+    detail_lines: List[str] = [
+        f"Group: {group.display_name}",
+        f"Group key: {group.group_key}",
+        f"Unknown members: {group.unknown_count}",
+        f"Texture members in family: {group.total_members}",
+        f"Known family kinds: {', '.join(group.known_kinds) if group.known_kinds else 'none'}",
+        f"Packages: {', '.join(group.package_labels[:4])}" + (" ..." if len(group.package_labels) > 4 else ""),
+        "",
+        "Suggested labels:",
+    ]
+    if group.suggestions:
+        for suggestion in group.suggestions:
+            detail_lines.append(
+                f"- {unknown_resolver_choice_label(suggestion.choice_key)} ({suggestion.confidence}%): {suggestion.reason}"
+            )
+    else:
+        detail_lines.append("- No strong automatic suggestion. Manual review is recommended.")
+
+    if group.sidecar_paths:
+        detail_lines.extend(["", "Family sidecar/reference files:"])
+        for sidecar_path in group.sidecar_paths[:6]:
+            detail_lines.append(f"- {sidecar_path}")
+        if len(group.sidecar_paths) > 6:
+            detail_lines.append(f"- ... and {len(group.sidecar_paths) - 6} more")
+
+    detail_lines.extend(["", f"Selected member: {normalized_selected}"])
+    if selected_entry is not None:
+        detail_lines.append(f"- Package: {selected_entry.package_label}")
+        detail_lines.append(f"- Role hint: {archive_entry_role(selected_entry) or 'none'}")
+        detail_lines.append(f"- Stored size: {selected_entry.orig_size:,} bytes")
+        if selected_entry.extension == ".dds":
+            try:
+                source_path, _note = ensure_archive_preview_source(selected_entry)
+                info = parse_dds(source_path)
+                detail_lines.append(
+                    f"- DDS header: {info.width}x{info.height} | {info.texconv_format} | mips={info.mip_count}"
+                )
+            except Exception as exc:
+                detail_lines.append(f"- DDS header: unavailable ({exc})")
+        if texconv_path is not None and texconv_path.exists() and selected_entry.extension == ".dds":
+            detail_lines.append("- Review the selected DDS in the center preview pane for visual confirmation.")
+    else:
+        detail_lines.append("- Entry metadata unavailable in the current archive view.")
+
+    detail_lines.extend(
+        [
+            "",
+            "Approval flow:",
+            "- Choose the label that best matches the selected DDS file or its family.",
+            "- Apply to the current family or to all currently selected families in the review queue.",
+            "- The member list is only shown for the rare families that contain multiple texture files.",
+            "- The approval is stored locally and reused by Research and texture policy in future runs.",
+        ]
+    )
+    return "\n".join(detail_lines)
 
 
 def bundle_texture_sets(entries: Sequence[ArchiveEntry], *, limit: int = 2000) -> List[TextureSetGroup]:
@@ -1335,16 +1677,38 @@ def _format_preview_pair_section(label: str, stats: Optional[TexturePreviewStats
     ]
 
 
-def _collect_matching_compare_relative_paths(original_root: Path, rebuilt_root: Path) -> List[str]:
+def _collect_matching_compare_relative_paths(
+    original_root: Path,
+    rebuilt_root: Path,
+    *,
+    stop_event: Optional[object] = None,
+) -> List[str]:
     original_paths = {
+        path.as_posix()
+        for path in collect_compare_relative_paths(original_root, rebuilt_root, stop_event=stop_event)
+    }
+    if not original_paths:
+        return []
+    original_only = {
         path.relative_to(original_root).as_posix()
-        for path in collect_dds_files(original_root, ())
+        for path in collect_dds_files(original_root, (), stop_event=stop_event)
     }
-    rebuilt_paths = {
+    rebuilt_only = {
         path.relative_to(rebuilt_root).as_posix()
-        for path in collect_dds_files(rebuilt_root, ())
+        for path in collect_dds_files(rebuilt_root, (), stop_event=stop_event)
     }
-    return sorted(original_paths.intersection(rebuilt_paths))
+    return sorted(original_paths.intersection(original_only).intersection(rebuilt_only))
+
+
+def build_mip_analysis_family_members_by_path(
+    original_root: Path,
+    rebuilt_root: Path,
+    *,
+    stop_event: Optional[object] = None,
+) -> Dict[str, Tuple[str, ...]]:
+    return _build_family_members_by_relative_path(
+        _collect_matching_compare_relative_paths(original_root, rebuilt_root, stop_event=stop_event)
+    )
 
 
 def build_mip_analysis_detail(
@@ -1353,14 +1717,15 @@ def build_mip_analysis_detail(
     row: MipAnalysisRow,
     *,
     texconv_path: Optional[Path] = None,
+    family_members_by_path: Optional[Dict[str, Tuple[str, ...]]] = None,
 ) -> str:
     relative = Path(row.relative_path)
     original_path = original_root / relative
     rebuilt_path = rebuilt_root / relative
-    family_members_by_path = _build_family_members_by_relative_path(
-        _collect_matching_compare_relative_paths(original_root, rebuilt_root)
-    )
-    family_members = family_members_by_path.get(row.relative_path, ())
+    resolved_family_members = family_members_by_path
+    if resolved_family_members is None:
+        resolved_family_members = build_mip_analysis_family_members_by_path(original_root, rebuilt_root)
+    family_members = resolved_family_members.get(row.relative_path, ())
     texture_type, confidence, reason = classify_texture_path(row.relative_path, family_members=family_members)
     detail_lines: List[str] = [
         f"Relative path: {row.relative_path}",
@@ -1537,16 +1902,23 @@ def analyze_mip_behavior(
     limit: int = 3000,
     processing_plan_lookup: Optional[Dict[str, TextureProcessingPlan]] = None,
     stop_event: Optional[object] = None,
+    family_members_by_path: Optional[Dict[str, Tuple[str, ...]]] = None,
 ) -> List[MipAnalysisRow]:
     rows: List[MipAnalysisRow] = []
-    compare_relative_paths = _collect_matching_compare_relative_paths(original_root, rebuilt_root)
-    family_members_by_path = _build_family_members_by_relative_path(compare_relative_paths)
+    resolved_family_members = family_members_by_path
+    if resolved_family_members is None:
+        resolved_family_members = build_mip_analysis_family_members_by_path(
+            original_root,
+            rebuilt_root,
+            stop_event=stop_event,
+        )
+    compare_relative_paths = sorted(resolved_family_members.keys())
     for relative_path_text in compare_relative_paths:
         raise_if_cancelled(stop_event)
         relative_path = Path(relative_path_text)
         original_path = original_root / relative_path
         rebuilt_path = rebuilt_root / relative_path
-        family_members = family_members_by_path.get(relative_path_text, ())
+        family_members = resolved_family_members.get(relative_path_text, ())
         plan_entry = (processing_plan_lookup or {}).get(relative_path_text)
         try:
             original_dds = parse_dds(original_path)
@@ -1616,11 +1988,11 @@ def analyze_mip_behavior(
             original_preview: Optional[TexturePreviewStats]
             rebuilt_preview: Optional[TexturePreviewStats]
             try:
-                original_preview = _collect_preview_stats(ensure_dds_preview_png(texconv_path, original_path))
+                original_preview = _collect_preview_stats(ensure_dds_preview_png(texconv_path, original_path, stop_event=stop_event))
             except Exception:
                 original_preview = None
             try:
-                rebuilt_preview = _collect_preview_stats(ensure_dds_preview_png(texconv_path, rebuilt_path))
+                rebuilt_preview = _collect_preview_stats(ensure_dds_preview_png(texconv_path, rebuilt_path, stop_event=stop_event))
             except Exception:
                 rebuilt_preview = None
             warnings.extend(
@@ -1709,7 +2081,7 @@ def validate_normal_maps(
     stop_event: Optional[object] = None,
 ) -> List[NormalValidationRow]:
     display_root_label = (root_label or root.name or str(root)).strip() or str(root)
-    dds_files = collect_dds_files(root, ())
+    dds_files = collect_dds_files(root, (), stop_event=stop_event)
     grouped_by_key: Dict[str, List[Path]] = defaultdict(list)
     for dds_path in dds_files:
         grouped_by_key[derive_texture_group_key(dds_path.relative_to(root).as_posix())].append(dds_path)

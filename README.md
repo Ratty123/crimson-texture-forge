@@ -9,7 +9,7 @@ Crimson Texture Forge is built for modders who want one place to:
 - browse and extract files from `.pamt` / `.paz` archives
 - scan loose DDS files and rebuild controlled DDS output with `texconv`
 - optionally convert DDS to PNG before processing
-- optionally upscale through `chaiNNer`, direct `Real-ESRGAN NCNN`, or direct `ONNX Runtime`
+- optionally upscale through `chaiNNer` or direct `Real-ESRGAN NCNN`
 - review results in a side-by-side compare view with zoom, pan, and preview-size controls
 - inspect texture sets, references, classification, DDS QA results, and notes in `Research`
 - search archive or loose text-like files such as `.xml`, `.json`, `.cfg`, and `.lua`
@@ -32,16 +32,16 @@ The app is intentionally focused on **read-only archive access** and **loose-fil
 - archive cache for faster repeated scans
 - DDS-to-PNG conversion with `texconv`
 - DDS rebuild with configurable format, size, and mip behavior
-- direct backend support for `Real-ESRGAN NCNN` and `ONNX Runtime`
+- direct backend support for `Real-ESRGAN NCNN`
 - external `chaiNNer` support for users who already have a working chain
 - `Run Summary` dialog for a read-only overview of sources, backend, and texture policy before you start
-- `Texture Policy` presets, family-aware suffix classification, planner-aware automatic safety rules, and safer preserve/high-precision handling for technical maps
+- `Texture Policy` presets, family-aware suffix classification, planner-aware automatic safety rules, a persistent local classification registry, and safer preserve/high-precision handling for technical maps
 - optional expert override to force technical maps through the generic PNG/upscale path when you explicitly want unsafe technical processing
-- automatic `Source Match` post-correction modes for direct `NCNN` / `ONNX` runs
+- automatic `Source Match` post-correction modes for direct `NCNN` runs
 - optional `NCNN extra args` for advanced direct `Real-ESRGAN NCNN` flags such as `-dn 0.2`
 - `Preview Policy` to inspect the planned per-texture action before `Start`
 - compare view with shared preview-size presets, per-side zoom, mouse-wheel zoom, drag pan, `Sync Pan`, and focused compare layout
-- `Research` tools for shared classifier output, grouped texture sets, sidecar/reference discovery, texture analysis, heatmap views, and local notes
+- `Research` tools for shared classifier output, grouped texture sets, sidecar/reference discovery, `Classification Review` preview/review/approval, texture analysis, heatmap views, and local notes
 - text search with archive/loose search, regex, local find, wrap toggle, line numbers, and export
 
 ## Recommended First Run
@@ -54,7 +54,7 @@ If you want the safest starting point, use this path first:
 4. Set `Original DDS root`, `PNG root`, and `Output root`.
 5. In `Workflow > Upscaling`, either:
    - keep the backend disabled if you only want DDS rebuild/testing
-   - pick direct `Real-ESRGAN NCNN` or `ONNX Runtime`
+   - pick direct `Real-ESRGAN NCNN`
    - use `chaiNNer` only if you already have a tested `.chn` chain
 6. Keep `Texture Policy` on a safer preset first and leave automatic texture rules enabled.
 7. Click `Preview Policy` to inspect what the app plans to do per texture.
@@ -87,19 +87,6 @@ Setup support in the app includes:
 - import NCNN `.param` / `.bin` model pairs
 - browse a grouped NCNN model catalog for visible color/albedo/UI texture use cases and open non-downloading model pages in your browser
 
-### ONNX Runtime
-
-Use this when you want:
-
-- direct in-app inference with local `.onnx` models
-- provider selection handled by ONNX Runtime
-- direct scale/tile/post-correction controls without an external chain
-
-Setup support in the app includes:
-
-- open the official ONNX Runtime install guide
-- import `.onnx` model files into the configured model folder
-
 ### chaiNNer
 
 Use this when you already have:
@@ -111,7 +98,7 @@ Use this when you already have:
 Important:
 
 - `chaiNNer` remains the source of truth for its own chain behavior
-- direct NCNN / ONNX controls in Crimson Texture Forge do **not** override the chain
+- direct NCNN controls in Crimson Texture Forge do **not** override the chain
 
 ## Texture Policy And Safety
 
@@ -125,6 +112,7 @@ What it does:
 - can route eligible non-packed scalar technical DDS files through a safer high-precision path instead of the normal visible-color PNG path
 - can optionally force technical maps through the generic visible-color PNG/upscale path with an explicit expert override, but this is intentionally marked unsafe
 - can use more than file names alone, including texture-family context and preview-derived hints
+- can store approved per-file classifications in a local registry so future scans, Research views, and policy planning reuse your confirmed label
 - recognizes common explicit names and suffix families such as `_color`, `_normal`, `_subsurface`, `_dmap`, `_n`, `_wn`, `_sp`, `_m`, `_ma`, `_mg`, `_o`, `_disp`, `_dr`, `_op`, `_emc`, and `_emi`
 - treats ambiguous names like `_d` more cautiously instead of assuming they are always safe color/diffuse textures
 
@@ -144,7 +132,7 @@ For a first run:
 
 ## Post Correction
 
-Direct `Real-ESRGAN NCNN` and direct `ONNX Runtime` support optional post-upscale correction modes:
+Direct `Real-ESRGAN NCNN` supports optional post-upscale correction modes:
 
 - `match_mean_luma`
 - `match_levels`
@@ -294,12 +282,11 @@ If `texconv.exe` is missing or wrong:
 - DDS rebuild fails
 - compare preview generation fails
 
-### Missing NCNN / ONNX setup
+### Missing NCNN setup
 
 For direct backends, make sure you have:
 
 - a working NCNN executable plus matching `.param` / `.bin` models
-- or a working ONNX Runtime installation plus compatible `.onnx` models
 
 ### chaiNNer produced no usable output
 
@@ -317,7 +304,7 @@ If rebuilt color textures look darker, flatter, or otherwise shifted:
 - compare it in `Compare`
 - try a safer preset
 - try a different model
-- try `Source Match Balanced` first on direct `NCNN` / `ONNX`
+- try `Source Match Balanced` first on direct `NCNN`
 - test `match_levels` or `match_histogram` if you want a simpler visible-texture-only correction path
 - remember that automatic texture safety rules are mainly about safer format/preserve policy, not about fixing tonal drift by themselves
 
@@ -355,7 +342,6 @@ It only opens external pages in your browser when you explicitly trigger actions
 - `Open chaiNNer Download Page`
 - `Open texconv Download Page`
 - `Open Real-ESRGAN NCNN Download Page`
-- `ONNX Runtime Guide`
 - `Open Model Pages` in the NCNN model catalog
 
 ## Screenshots
@@ -428,4 +414,3 @@ Build requirements are listed in `requirements-build.txt`.
 - `texconv.exe` from Microsoft DirectXTex
 - optional `chaiNNer`
 - optional `Real-ESRGAN NCNN`
-- optional ONNX Runtime packages / models

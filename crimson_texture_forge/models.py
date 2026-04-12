@@ -40,8 +40,6 @@ from crimson_texture_forge.constants import (
     INCLUDE_FILTERS,
     LOG_CSV,
     MOD_READY_EXPORT_ROOT,
-    ONNX_MODEL_DIR,
-    ONNX_MODEL_NAME,
     ORIGINAL_DDS_ROOT,
     OUTPUT_ROOT,
     OVERWRITE_EXISTING_DDS,
@@ -150,8 +148,6 @@ class AppConfig:
     ncnn_tile_size: int = REALESRGAN_NCNN_TILE_SIZE
     ncnn_extra_args: str = REALESRGAN_NCNN_EXTRA_ARGS
     upscale_post_correction_mode: str = DEFAULT_UPSCALE_POST_CORRECTION
-    onnx_model_dir: str = ONNX_MODEL_DIR
-    onnx_model_name: str = ONNX_MODEL_NAME
     upscale_texture_preset: str = DEFAULT_UPSCALE_TEXTURE_PRESET
     enable_automatic_texture_rules: bool = ENABLE_AUTOMATIC_TEXTURE_RULES
     enable_unsafe_technical_override: bool = ENABLE_UNSAFE_TECHNICAL_OVERRIDE
@@ -206,8 +202,6 @@ class NormalizedConfig:
     ncnn_tile_size: int
     ncnn_extra_args: str
     upscale_post_correction_mode: str
-    onnx_model_dir: Optional[Path]
-    onnx_model_name: str
     upscale_texture_preset: str
     enable_automatic_texture_rules: bool
     enable_unsafe_technical_override: bool
@@ -416,12 +410,14 @@ class ArchivePreviewResult:
     metadata_summary: str = ""
     detail_text: str = ""
     preview_image_path: str = ""
+    preview_image: object = None
     preview_text: str = ""
     preferred_view: str = "info"
     warning_badge: str = ""
     warning_text: str = ""
     loose_file_path: str = ""
     loose_preview_image_path: str = ""
+    loose_preview_image: object = None
     loose_preview_title: str = ""
     loose_preview_metadata_summary: str = ""
     loose_preview_detail_text: str = ""

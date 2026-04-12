@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import dataclasses
+import fnmatch
 import hashlib
 import threading
 from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, List, Optional, Sequence
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
+from PySide6.QtGui import QImageReader
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -27,7 +32,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from crimson_texture_forge.core.archive import build_archive_tree_index
+from crimson_texture_forge.core.archive import build_archive_preview_result, build_archive_tree_index
+from crimson_texture_forge.core.classification_registry import (
+    remove_registered_texture_classifications,
+    set_registered_texture_classifications,
+    texture_classification_registry_path,
+)
 from crimson_texture_forge.core.research import (
     MaterialTextureReferenceRow,
     MipAnalysisRow,
@@ -37,25 +47,34 @@ from crimson_texture_forge.core.research import (
     TextureClassificationRow,
     TextureSetGroup,
     TextureUsageHeatRow,
+    UnknownResolverGroup,
+    UnknownResolverMember,
     analyze_mip_behavior,
     build_processing_plan_lookup,
     build_archive_research_snapshot,
+    build_mip_analysis_family_members_by_path,
+    build_unknown_resolver_detail,
     build_texture_usage_heatmap,
     build_mip_analysis_detail,
     build_normal_validation_detail,
     bundle_texture_sets,
     classify_texture_entries,
+    default_unknown_resolver_label_choice,
     delete_research_note,
     discover_archive_sidecars,
     export_texture_analysis_report,
     load_research_notes,
     resolve_material_texture_references,
     save_research_notes,
+    unknown_resolver_choice_for,
+    unknown_resolver_choice_label,
+    unknown_resolver_label_choices,
     upsert_research_note,
     validate_normal_maps,
 )
 from crimson_texture_forge.core.pipeline import describe_processing_path_kind
-from crimson_texture_forge.models import AppConfig, ArchiveEntry
+from crimson_texture_forge.models import AppConfig, ArchiveEntry, ArchivePreviewResult
+from crimson_texture_forge.ui.widgets import PreviewLabel, PreviewScrollArea
 
 
 class ResearchRefreshWorker(QObject):
@@ -99,7 +118,7 @@ class ResearchRefreshWorker(QObject):
             if self.archive_snapshot_payload:
                 payload.update(self.archive_snapshot_payload)
             else:
-                payload.update(build_archive_research_snapshot(working_entries))
+                payload.update(build_archive_research_snapshot(working_entries, stop_event=self.stop_event))
 
             if self.stop_event.is_set():
                 raise RuntimeError("Research refresh cancelled.")
@@ -117,13 +136,20 @@ class ResearchRefreshWorker(QObject):
                     processing_plan_lookup = {}
             if self.original_root is not None and self.output_root is not None:
                 if self.original_root.exists() and self.output_root.exists():
+                    mip_family_members_by_path = build_mip_analysis_family_members_by_path(
+                        self.original_root,
+                        self.output_root,
+                        stop_event=self.stop_event,
+                    )
                     mip_rows = analyze_mip_behavior(
                         self.original_root,
                         self.output_root,
                         texconv_path=self.texconv_path,
                         processing_plan_lookup=processing_plan_lookup,
                         stop_event=self.stop_event,
+                        family_members_by_path=mip_family_members_by_path,
                     )
+                    payload["mip_detail_family_members_by_path"] = mip_family_members_by_path
             payload["mip_rows"] = mip_rows
 
             if self.stop_event.is_set():
@@ -222,10 +248,69 @@ class ReferenceResolveWorker(QObject):
             self.finished.emit()
 
 
+class UnknownResolverPreviewWorker(QObject):
+    completed = Signal(int, object)
+    error = Signal(int, str)
+    finished = Signal()
+
+    def __init__(
+        self,
+        request_id: int,
+        texconv_path: Optional[Path],
+        entry: Optional[ArchiveEntry],
+    ) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.texconv_path = texconv_path
+        self.entry = entry
+        self.stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            if self.stop_event.is_set():
+                return
+            payload = build_archive_preview_result(
+                self.texconv_path,
+                self.entry,
+                [],
+                stop_event=self.stop_event,
+            )
+            if self.stop_event.is_set():
+                return
+            payload = self._attach_loaded_images(payload)
+            if not self.stop_event.is_set():
+                self.completed.emit(self.request_id, payload)
+        except Exception as exc:
+            if not self.stop_event.is_set():
+                self.error.emit(self.request_id, str(exc))
+        finally:
+            self.finished.emit()
+
+    def _attach_loaded_images(self, result: ArchivePreviewResult) -> ArchivePreviewResult:
+        preview_image = self._load_image(result.preview_image_path)
+        if preview_image is None:
+            return result
+        return dataclasses.replace(result, preview_image=preview_image)
+
+    def _load_image(self, image_path: str) -> object:
+        if self.stop_event.is_set() or not image_path:
+            return None
+        reader = QImageReader(image_path)
+        image = reader.read()
+        if self.stop_event.is_set() or image.isNull():
+            return None
+        return image
+
+
 class ResearchTab(QWidget):
     status_message_requested = Signal(str, bool)
     extract_related_set_requested = Signal(object, str)
     focus_archive_browser_requested = Signal()
+    review_reference_in_text_search_requested = Signal(str, str)
 
     def __init__(
         self,
@@ -261,6 +346,12 @@ class ResearchTab(QWidget):
         self.refresh_worker: Optional[ResearchRefreshWorker] = None
         self.resolve_thread: Optional[QThread] = None
         self.resolve_worker: Optional[ReferenceResolveWorker] = None
+        self.unknown_preview_thread: Optional[QThread] = None
+        self.unknown_preview_worker: Optional[UnknownResolverPreviewWorker] = None
+        self.unknown_preview_request_id = 0
+        self.pending_unknown_preview_request: Optional[tuple[int, Optional[ArchiveEntry]]] = None
+        self.unknown_preview_fit_to_view = True
+        self.unknown_preview_zoom_factor = 1.0
         self.research_payload: Dict[str, object] = {}
         self.reference_payload: Dict[str, object] = {}
         self.pending_mip_focus_relative_path = ""
@@ -268,29 +359,35 @@ class ResearchTab(QWidget):
         self.pending_archive_snapshot_cache_key = ""
         self.archive_picker_entries: List[ArchiveEntry] = []
         self.archive_picker_entry_index_by_path: Dict[str, int] = {}
+        self.archive_picker_entry_by_path: Dict[str, ArchiveEntry] = {}
         self.archive_picker_child_folders: Dict[tuple[str, ...], List[tuple[str, tuple[str, ...]]]] = {}
         self.archive_picker_direct_files: Dict[tuple[str, ...], List[int]] = {}
         self.archive_picker_folder_entry_indexes: Dict[tuple[str, ...], List[int]] = {}
         self.archive_picker_items_by_folder_key: Dict[tuple[str, ...], QTreeWidgetItem] = {}
+        self.classification_registry_path = texture_classification_registry_path()
+        self.pending_classification_review_focus_keys: set[str] = set()
+        self._populating_unknown_resolver_controls = False
 
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(10, 10, 10, 10)
-        root_layout.setSpacing(10)
+        root_layout.setSpacing(8)
 
         top_row = QHBoxLayout()
-        top_row.setSpacing(8)
+        top_row.setSpacing(6)
         self.refresh_button = QPushButton("Refresh Research")
         self.refresh_status_label = QLabel("Ready. Use the current archive scan and compare roots.")
-        self.refresh_status_label.setWordWrap(True)
+        self.refresh_status_label.setWordWrap(False)
         self.refresh_status_label.setObjectName("HintLabel")
         self.refresh_progress = QProgressBar()
         self.refresh_progress.setRange(0, 1)
         self.refresh_progress.setValue(0)
         self.refresh_progress.setFormat("Idle")
+        self.refresh_progress.setMaximumWidth(220)
+        self.refresh_progress.setMaximumHeight(18)
         top_row.addWidget(self.refresh_button)
         top_row.addWidget(self.refresh_status_label, stretch=1)
+        top_row.addWidget(self.refresh_progress)
         root_layout.addLayout(top_row)
-        root_layout.addWidget(self.refresh_progress)
 
         self.main_splitter = QSplitter(Qt.Horizontal)
         self.main_splitter.setChildrenCollapsible(False)
@@ -319,13 +416,32 @@ class ResearchTab(QWidget):
         )
         self.reference_resolve_button.clicked.connect(self.resolve_references)
         self.reference_extract_button.clicked.connect(self.extract_resolved_related_set)
+        self.reference_review_text_button.clicked.connect(self.review_selected_reference_in_text_search)
         self.reference_tree.currentItemChanged.connect(self._handle_reference_selection_changed)
         self.sidecar_tree.currentItemChanged.connect(self._handle_sidecar_selection_changed)
         self.texture_group_extract_button.clicked.connect(self.extract_selected_group)
         self.texture_group_tree.currentItemChanged.connect(self._handle_texture_group_selection_changed)
+        self.unknown_group_tree.currentItemChanged.connect(self._handle_unknown_group_selection_changed)
+        self.unknown_group_tree.itemSelectionChanged.connect(self._handle_unknown_group_item_selection_changed)
+        self.unknown_member_tree.currentItemChanged.connect(self._handle_unknown_member_selection_changed)
+        self.unknown_show_classified_checkbox.toggled.connect(self._handle_unknown_show_classified_toggled)
+        self.unknown_name_filter_edit.textChanged.connect(self._handle_unknown_name_filter_changed)
+        self.unknown_package_filter_edit.textChanged.connect(self._handle_unknown_package_filter_changed)
+        self.unknown_select_all_button.clicked.connect(self._select_all_unknown_groups)
+        self.unknown_clear_family_selection_button.clicked.connect(self._clear_unknown_group_selection)
+        self.unknown_preview_button.clicked.connect(self._preview_selected_unknown_member)
+        self.unknown_apply_selected_button.clicked.connect(self._apply_unknown_selected_file_label)
+        self.unknown_apply_group_button.clicked.connect(self._apply_unknown_group_label)
+        self.unknown_clear_selected_button.clicked.connect(self._clear_unknown_selected_file_label)
+        self.unknown_clear_group_button.clicked.connect(self._clear_unknown_group_label)
+        self.unknown_preview_zoom_fit_button.clicked.connect(self._set_unknown_preview_fit_mode)
+        self.unknown_preview_zoom_100_button.clicked.connect(lambda: self._set_unknown_preview_zoom_factor(1.0))
+        self.unknown_preview_zoom_out_button.clicked.connect(lambda: self._adjust_unknown_preview_zoom(-1))
+        self.unknown_preview_zoom_in_button.clicked.connect(lambda: self._adjust_unknown_preview_zoom(1))
         self.export_report_csv_button.clicked.connect(lambda: self._export_analysis_report(".csv"))
         self.export_report_json_button.clicked.connect(lambda: self._export_analysis_report(".json"))
         self.tab_widget.currentChanged.connect(self._handle_research_subtab_changed)
+        self.archive_insights_tabs.currentChanged.connect(self._handle_archive_insights_subtab_changed)
         self.notes_use_archive_button.clicked.connect(
             self.use_selected_archive_picker_for_note
         )
@@ -341,6 +457,7 @@ class ResearchTab(QWidget):
         self._populate_notes_tree()
         self.refresh_archive_picker()
         self._handle_research_subtab_changed(self.tab_widget.currentIndex())
+        self._clear_unknown_preview("Select an unknown DDS file to preview it here.")
 
     def set_theme(self, _theme_key: str) -> None:
         return
@@ -350,7 +467,9 @@ class ResearchTab(QWidget):
             self.refresh_worker.stop()
         if self.resolve_worker is not None:
             self.resolve_worker.stop()
-        for thread in (self.refresh_thread, self.resolve_thread):
+        if self.unknown_preview_worker is not None:
+            self.unknown_preview_worker.stop()
+        for thread in (self.refresh_thread, self.resolve_thread, self.unknown_preview_thread):
             if thread is not None:
                 thread.quit()
                 thread.wait(3000)
@@ -361,6 +480,9 @@ class ResearchTab(QWidget):
         self.archive_picker_entry_index_by_path = {
             self._normalize_archive_path(entry.path).casefold(): index
             for index, entry in enumerate(self.archive_picker_entries)
+        }
+        self.archive_picker_entry_by_path = {
+            self._normalize_archive_path(entry.path): entry for entry in self.archive_picker_entries
         }
         self._rebuild_archive_picker_index()
         self.archive_picker_tree.blockSignals(True)
@@ -577,6 +699,7 @@ class ResearchTab(QWidget):
         layout.setSpacing(10)
 
         sub_tabs = QTabWidget()
+        self.archive_insights_tabs = sub_tabs
         layout.addWidget(sub_tabs, stretch=1)
 
         groups_tab = QWidget()
@@ -647,6 +770,195 @@ class ResearchTab(QWidget):
         groups_splitter.setSizes([620, 760])
         sub_tabs.addTab(groups_tab, "Groups")
 
+        unknown_tab = QWidget()
+        unknown_layout = QVBoxLayout(unknown_tab)
+        unknown_layout.setContentsMargins(0, 0, 0, 0)
+        unknown_layout.setSpacing(6)
+
+        unknown_hint = QLabel(
+            "Review DDS files here, preview them directly, and approve a label once so the app remembers it for future scans and policy planning."
+        )
+        unknown_hint.setWordWrap(True)
+        unknown_hint.setObjectName("HintLabel")
+        unknown_layout.addWidget(unknown_hint)
+
+        self.unknown_resolver_status_label = QLabel(
+            "Refresh Research to build the current classification review list."
+        )
+        self.unknown_resolver_status_label.setWordWrap(True)
+        self.unknown_resolver_status_label.setObjectName("HintLabel")
+        unknown_layout.addWidget(self.unknown_resolver_status_label)
+
+        unknown_filter_row = QHBoxLayout()
+        unknown_filter_row.setSpacing(8)
+        self.unknown_show_classified_checkbox = QCheckBox("Also show already classified DDS families")
+        self.unknown_show_classified_checkbox.setToolTip(
+            "Include already classified texture families too, so you can override them manually if you want."
+        )
+        self.unknown_name_filter_edit = QLineEdit()
+        self.unknown_name_filter_edit.setPlaceholderText("Name filter, supports * and ?")
+        self.unknown_package_filter_edit = QLineEdit()
+        self.unknown_package_filter_edit.setPlaceholderText("Package filter, for example 0000 or 0015*")
+        self.unknown_select_all_button = QPushButton("Select All Shown")
+        self.unknown_clear_family_selection_button = QPushButton("Clear Selection")
+        unknown_filter_row.addWidget(self.unknown_show_classified_checkbox)
+        unknown_filter_row.addWidget(QLabel("Name"))
+        unknown_filter_row.addWidget(self.unknown_name_filter_edit, stretch=1)
+        unknown_filter_row.addWidget(QLabel("Package"))
+        unknown_filter_row.addWidget(self.unknown_package_filter_edit)
+        unknown_filter_row.addWidget(self.unknown_select_all_button)
+        unknown_filter_row.addWidget(self.unknown_clear_family_selection_button)
+        unknown_layout.addLayout(unknown_filter_row)
+
+        unknown_splitter = QSplitter(Qt.Horizontal)
+        unknown_splitter.setChildrenCollapsible(False)
+        unknown_layout.addWidget(unknown_splitter, stretch=1)
+
+        unknown_left_panel = QWidget()
+        unknown_left_layout = QVBoxLayout(unknown_left_panel)
+        unknown_left_layout.setContentsMargins(0, 0, 0, 0)
+        unknown_left_layout.setSpacing(8)
+
+        self.unknown_group_tree = QTreeWidget()
+        self.unknown_group_tree.setRootIsDecorated(False)
+        self.unknown_group_tree.setAlternatingRowColors(True)
+        self.unknown_group_tree.setUniformRowHeights(True)
+        self.unknown_group_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.unknown_group_tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.unknown_group_tree.setHeaderLabels(["Name", "Classification", "Package"])
+        self.unknown_group_tree.header().setStretchLastSection(False)
+        self.unknown_group_tree.header().resizeSection(0, 340)
+        self.unknown_group_tree.header().resizeSection(1, 220)
+        self.unknown_group_tree.header().resizeSection(2, 120)
+        unknown_left_layout.addWidget(self.unknown_group_tree, stretch=1)
+
+        unknown_actions_widget = QWidget()
+        unknown_actions_layout = QVBoxLayout(unknown_actions_widget)
+        unknown_actions_layout.setContentsMargins(0, 0, 0, 0)
+        unknown_actions_layout.setSpacing(8)
+
+        approval_row = QHBoxLayout()
+        approval_row.setSpacing(8)
+        self.unknown_label_combo = QComboBox()
+        for choice_key, texture_type, semantic_subtype in unknown_resolver_label_choices():
+            self.unknown_label_combo.addItem(
+                unknown_resolver_choice_label(choice_key),
+                (choice_key, texture_type, semantic_subtype),
+            )
+        self.unknown_preview_button = QPushButton("Preview Current")
+        self.unknown_apply_selected_button = QPushButton("Apply To Current Family")
+        self.unknown_apply_group_button = QPushButton("Apply To Selected Families")
+        self.unknown_clear_selected_button = QPushButton("Clear Current Family")
+        self.unknown_clear_group_button = QPushButton("Clear Selected Families")
+        approval_row.addWidget(QLabel("Label"))
+        approval_row.addWidget(self.unknown_label_combo, stretch=1)
+        approval_row.addWidget(self.unknown_preview_button)
+        unknown_actions_layout.addLayout(approval_row)
+
+        approval_actions_row = QHBoxLayout()
+        approval_actions_row.setSpacing(8)
+        approval_actions_row.addWidget(self.unknown_apply_selected_button)
+        approval_actions_row.addWidget(self.unknown_apply_group_button)
+        approval_actions_row.addWidget(self.unknown_clear_selected_button)
+        approval_actions_row.addWidget(self.unknown_clear_group_button)
+        approval_actions_row.addStretch(1)
+        unknown_actions_layout.addLayout(approval_actions_row)
+        unknown_left_layout.addWidget(unknown_actions_widget)
+
+        unknown_members_group = QGroupBox("Family Members")
+        self.unknown_members_group = unknown_members_group
+        unknown_members_layout = QVBoxLayout(unknown_members_group)
+        unknown_members_layout.setContentsMargins(10, 12, 10, 10)
+        unknown_members_layout.setSpacing(8)
+        self.unknown_members_hint_label = QLabel(
+            "Shown only when the selected family has multiple texture files."
+        )
+        self.unknown_members_hint_label.setWordWrap(True)
+        self.unknown_members_hint_label.setObjectName("HintLabel")
+        unknown_members_layout.addWidget(self.unknown_members_hint_label)
+        self.unknown_member_tree = QTreeWidget()
+        self.unknown_member_tree.setRootIsDecorated(False)
+        self.unknown_member_tree.setAlternatingRowColors(True)
+        self.unknown_member_tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.unknown_member_tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.unknown_member_tree.setHeaderLabels(["File", "Current", "Role", "Package", "Reason"])
+        self.unknown_member_tree.header().resizeSection(0, 320)
+        self.unknown_member_tree.header().resizeSection(1, 90)
+        self.unknown_member_tree.header().resizeSection(2, 90)
+        self.unknown_member_tree.header().resizeSection(3, 120)
+        unknown_members_layout.addWidget(self.unknown_member_tree, stretch=1)
+        unknown_left_layout.addWidget(unknown_members_group)
+        unknown_splitter.addWidget(unknown_left_panel)
+
+        unknown_preview_group = QGroupBox("Selected Preview")
+        unknown_preview_layout = QVBoxLayout(unknown_preview_group)
+        unknown_preview_layout.setContentsMargins(10, 12, 10, 10)
+        unknown_preview_layout.setSpacing(8)
+        unknown_preview_title_row = QHBoxLayout()
+        unknown_preview_title_row.setSpacing(8)
+        self.unknown_preview_title_label = QLabel("Select a review item")
+        self.unknown_preview_title_label.setWordWrap(True)
+        self.unknown_preview_zoom_out_button = QPushButton("-")
+        self.unknown_preview_zoom_out_button.setToolTip("Zoom out.")
+        self.unknown_preview_zoom_fit_button = QPushButton("Fit")
+        self.unknown_preview_zoom_fit_button.setToolTip("Fit the preview to the available space.")
+        self.unknown_preview_zoom_100_button = QPushButton("100%")
+        self.unknown_preview_zoom_100_button.setToolTip("Show the preview at 100% zoom.")
+        self.unknown_preview_zoom_in_button = QPushButton("+")
+        self.unknown_preview_zoom_in_button.setToolTip("Zoom in.")
+        self.unknown_preview_zoom_value = QLabel("-")
+        self.unknown_preview_zoom_value.setObjectName("HintLabel")
+        unknown_preview_title_row.addWidget(self.unknown_preview_title_label, stretch=1)
+        unknown_preview_title_row.addWidget(self.unknown_preview_zoom_out_button)
+        unknown_preview_title_row.addWidget(self.unknown_preview_zoom_fit_button)
+        unknown_preview_title_row.addWidget(self.unknown_preview_zoom_100_button)
+        unknown_preview_title_row.addWidget(self.unknown_preview_zoom_in_button)
+        unknown_preview_title_row.addWidget(self.unknown_preview_zoom_value)
+        unknown_preview_layout.addLayout(unknown_preview_title_row)
+
+        self.unknown_preview_meta_label = QLabel("Select a DDS file to preview it here.")
+        self.unknown_preview_meta_label.setWordWrap(True)
+        self.unknown_preview_meta_label.setObjectName("HintLabel")
+        unknown_preview_layout.addWidget(self.unknown_preview_meta_label)
+        self.unknown_preview_warning_label = QLabel("")
+        self.unknown_preview_warning_label.setWordWrap(True)
+        self.unknown_preview_warning_label.setObjectName("WarningText")
+        self.unknown_preview_warning_label.setVisible(False)
+        unknown_preview_layout.addWidget(self.unknown_preview_warning_label)
+
+        self.unknown_preview_stack = QStackedWidget()
+        self.unknown_preview_label = PreviewLabel("Select a DDS file to preview it here.")
+        self.unknown_preview_scroll = PreviewScrollArea()
+        self.unknown_preview_scroll.setWidgetResizable(False)
+        self.unknown_preview_scroll.setAlignment(Qt.AlignCenter)
+        self.unknown_preview_scroll.setWidget(self.unknown_preview_label)
+        self.unknown_preview_label.attach_scroll_area(self.unknown_preview_scroll)
+        self.unknown_preview_label.set_wheel_zoom_handler(self._adjust_unknown_preview_zoom)
+        self.unknown_preview_info_edit = QPlainTextEdit()
+        self.unknown_preview_info_edit.setReadOnly(True)
+        self.unknown_preview_info_edit.setPlaceholderText("Select a DDS file to preview it here.")
+        self.unknown_preview_stack.addWidget(self.unknown_preview_scroll)
+        self.unknown_preview_stack.addWidget(self.unknown_preview_info_edit)
+        unknown_preview_layout.addWidget(self.unknown_preview_stack, stretch=1)
+        unknown_preview_group.setMinimumWidth(520)
+        unknown_splitter.addWidget(unknown_preview_group)
+
+        unknown_details_group = QGroupBox("Details")
+        unknown_details_layout = QVBoxLayout(unknown_details_group)
+        unknown_details_layout.setContentsMargins(10, 12, 10, 10)
+        unknown_details_layout.setSpacing(8)
+        self.unknown_detail_edit = QPlainTextEdit()
+        self.unknown_detail_edit.setReadOnly(True)
+        self.unknown_detail_edit.setPlaceholderText(
+            "Select a DDS review item to inspect suggestions, sidecars, DDS facts, and approval guidance."
+        )
+        unknown_details_layout.addWidget(self.unknown_detail_edit, stretch=1)
+        unknown_details_group.setMinimumWidth(360)
+        unknown_splitter.addWidget(unknown_details_group)
+        unknown_splitter.setSizes([620, 980, 540])
+        self.classification_review_tab = unknown_tab
+        sub_tabs.addTab(unknown_tab, "Classification Review")
+
         reference_tab = QWidget()
         reference_layout = QVBoxLayout(reference_tab)
         reference_layout.setContentsMargins(0, 0, 0, 0)
@@ -675,10 +987,13 @@ class ResearchTab(QWidget):
         self.reference_use_archive_button = QPushButton("Use Selected File")
         self.reference_resolve_button = QPushButton("Resolve")
         self.reference_extract_button = QPushButton("Extract Related Set")
+        self.reference_review_text_button = QPushButton("Review In Text Search")
+        self.reference_review_text_button.setEnabled(False)
         target_input_row.addWidget(self.reference_target_edit, stretch=1)
         target_actions_row.addWidget(self.reference_use_archive_button)
         target_actions_row.addWidget(self.reference_resolve_button)
         target_actions_row.addWidget(self.reference_extract_button)
+        target_actions_row.addWidget(self.reference_review_text_button)
         target_actions_row.addStretch(1)
         target_row.addLayout(target_input_row)
         target_row.addLayout(target_actions_row)
@@ -1094,9 +1409,12 @@ class ResearchTab(QWidget):
                 "classification_rows": self.research_payload.get("classification_rows", []),
                 "texture_groups": self.research_payload.get("texture_groups", []),
                 "heatmap_rows": self.research_payload.get("heatmap_rows", []),
+                "unknown_resolver_groups": self.research_payload.get("unknown_resolver_groups", []),
+                "classification_review_groups": self.research_payload.get("classification_review_groups", []),
             }
         self._populate_texture_groups(self.research_payload.get("texture_groups", []))
         self._populate_classifications(self.research_payload.get("classification_rows", []))
+        self._refresh_unknown_resolver_view()
         self._populate_heatmap_rows(self.research_payload.get("heatmap_rows", []))
         self._populate_mip_rows(self.research_payload.get("mip_rows", []))
         self._populate_normal_rows(self.research_payload.get("normal_rows", []))
@@ -1273,6 +1591,606 @@ class ResearchTab(QWidget):
             )
             item.setToolTip(0, row.path)
             self.classifier_tree.addTopLevelItem(item)
+
+    def _current_unknown_resolver_groups(self) -> object:
+        if self.unknown_show_classified_checkbox.isChecked():
+            return self.research_payload.get("classification_review_groups", [])
+        return self.research_payload.get("unknown_resolver_groups", [])
+
+    @staticmethod
+    def _normalize_classification_review_focus_key(path_value: str) -> str:
+        return str(path_value or "").strip().replace("\\", "/").strip("/").casefold()
+
+    @classmethod
+    def _classification_review_focus_candidates(cls, path_value: str) -> set[str]:
+        normalized = str(path_value or "").strip().replace("\\", "/").strip("/")
+        if not normalized:
+            return set()
+        candidates = {cls._normalize_classification_review_focus_key(normalized)}
+        parts = normalized.split("/")
+        if len(parts) > 1 and len(parts[0]) == 4 and parts[0].isdigit():
+            stripped = "/".join(parts[1:]).strip("/")
+            if stripped:
+                candidates.add(cls._normalize_classification_review_focus_key(stripped))
+        return candidates
+
+    def _clear_pending_classification_review_focus(self) -> None:
+        self.pending_classification_review_focus_keys.clear()
+
+    def focus_classification_review_for_paths(
+        self,
+        paths: Sequence[str],
+        *,
+        include_classified: bool = False,
+        refresh_if_needed: bool = False,
+    ) -> None:
+        focus_keys: set[str] = set()
+        for path_value in paths:
+            focus_keys.update(self._classification_review_focus_candidates(path_value))
+        self.pending_classification_review_focus_keys = focus_keys
+        self.unknown_name_filter_edit.blockSignals(True)
+        self.unknown_package_filter_edit.blockSignals(True)
+        try:
+            self.unknown_name_filter_edit.clear()
+            self.unknown_package_filter_edit.clear()
+        finally:
+            self.unknown_name_filter_edit.blockSignals(False)
+            self.unknown_package_filter_edit.blockSignals(False)
+        self.unknown_show_classified_checkbox.setChecked(include_classified)
+        self.tab_widget.setCurrentWidget(self.archive_tab)
+        self.archive_insights_tabs.setCurrentWidget(self.classification_review_tab)
+        if refresh_if_needed or not self.research_payload:
+            self.refresh_research()
+        else:
+            self._refresh_unknown_resolver_view()
+
+    @staticmethod
+    def _wildcard_filter_matches(value: str, pattern_text: str) -> bool:
+        normalized_value = value.casefold()
+        normalized_pattern = pattern_text.strip().casefold()
+        if not normalized_pattern:
+            return True
+        if "*" not in normalized_pattern and "?" not in normalized_pattern:
+            normalized_pattern = f"*{normalized_pattern}*"
+        return fnmatch.fnmatchcase(normalized_value, normalized_pattern)
+
+    def _unknown_group_display_name(self, group: UnknownResolverGroup) -> str:
+        member = self._primary_unknown_member(group)
+        if member is None:
+            return group.display_name
+        basename = PurePosixPath(member.path).name
+        extra_members = max(group.total_members - 1, 0)
+        return f"{basename} (+{extra_members})" if extra_members > 0 else basename
+
+    def _unknown_group_classification_text(self, group: UnknownResolverGroup) -> str:
+        if group.unknown_count > 0:
+            return group.suggestion_label or "Unknown"
+        return ", ".join(group.known_kinds) if group.known_kinds else "Classified"
+
+    def _unknown_group_package_text(self, group: UnknownResolverGroup) -> str:
+        return ", ".join(group.package_labels[:2]) + ("..." if len(group.package_labels) > 2 else "")
+
+    def _unknown_group_matches_filters(self, group: UnknownResolverGroup) -> bool:
+        if self.pending_classification_review_focus_keys:
+            if not any(
+                self._classification_review_focus_candidates(member.path) & self.pending_classification_review_focus_keys
+                for member in group.members
+                if member.extension == ".dds"
+            ):
+                return False
+        name_filter = self.unknown_name_filter_edit.text().strip()
+        package_filter = self.unknown_package_filter_edit.text().strip()
+        if name_filter:
+            name_candidates = [group.display_name, group.group_key, self._unknown_group_display_name(group)]
+            primary_member = self._primary_unknown_member(group)
+            if primary_member is not None:
+                name_candidates.append(primary_member.path)
+            if not any(self._wildcard_filter_matches(candidate, name_filter) for candidate in name_candidates if candidate):
+                return False
+        if package_filter:
+            if not any(self._wildcard_filter_matches(package_label, package_filter) for package_label in group.package_labels):
+                return False
+        return True
+
+    def _handle_unknown_show_classified_toggled(self, _checked: bool) -> None:
+        self._refresh_unknown_resolver_view()
+
+    def _handle_unknown_name_filter_changed(self, _text: str) -> None:
+        self._clear_pending_classification_review_focus()
+        self._refresh_unknown_resolver_view()
+
+    def _handle_unknown_package_filter_changed(self, _text: str) -> None:
+        self._clear_pending_classification_review_focus()
+        self._refresh_unknown_resolver_view()
+
+    def _refresh_unknown_resolver_view(self) -> None:
+        self._populate_unknown_resolver(self._current_unknown_resolver_groups())
+
+    def _populate_unknown_resolver(self, groups: object) -> None:
+        previous_group = self._current_unknown_group()
+        previous_group_key = previous_group.group_key if previous_group is not None else ""
+        self.unknown_group_tree.clear()
+        first_item: Optional[QTreeWidgetItem] = None
+        selected_item: Optional[QTreeWidgetItem] = None
+        valid_groups = [
+            group
+            for group in groups
+            if isinstance(group, UnknownResolverGroup) and self._unknown_group_matches_filters(group)
+        ]
+        showing_classified = self.unknown_show_classified_checkbox.isChecked()
+        for group in valid_groups:
+            item = QTreeWidgetItem(
+                [
+                    self._unknown_group_display_name(group),
+                    self._unknown_group_classification_text(group),
+                    self._unknown_group_package_text(group),
+                ]
+            )
+            item.setData(0, Qt.UserRole, group)
+            item.setToolTip(0, group.group_key)
+            item.setToolTip(1, self._unknown_group_classification_text(group))
+            item.setToolTip(2, ", ".join(group.package_labels))
+            self.unknown_group_tree.addTopLevelItem(item)
+            if first_item is None:
+                first_item = item
+            if previous_group_key and group.group_key == previous_group_key:
+                selected_item = item
+        if first_item is not None:
+            self.unknown_group_tree.setCurrentItem(selected_item or first_item)
+            registry_text = str(self.classification_registry_path) if self.classification_registry_path is not None else "local registry"
+            self.unknown_resolver_status_label.setText(
+                (
+                    f"{len(valid_groups):,} review item(s) are available. Approved labels are stored in {registry_text}."
+                    if showing_classified
+                    else f"{len(valid_groups):,} unresolved item(s) need review. Approved labels are stored in {registry_text}."
+                )
+            )
+            if self.pending_classification_review_focus_keys:
+                self.unknown_resolver_status_label.setText(
+                    self.unknown_resolver_status_label.text()
+                    + " Showing the current run's unclassified DDS files."
+                )
+        else:
+            self.unknown_member_tree.clear()
+            self.unknown_members_group.setVisible(False)
+            self.unknown_detail_edit.clear()
+            self._clear_unknown_preview("No matching DDS preview is available for the current review filter.")
+            self.unknown_resolver_status_label.setText(
+                (
+                    "No review items are available in the current Research snapshot."
+                    if showing_classified
+                    else "No unresolved review items match the current filters."
+                )
+                if not self.pending_classification_review_focus_keys
+                else "No current-run unclassified DDS files matched the current Research snapshot. Scan archives or broaden the current Archive Browser view if needed."
+            )
+        self._update_unknown_resolver_controls()
+
+    def _current_unknown_group(self) -> Optional[UnknownResolverGroup]:
+        item = self.unknown_group_tree.currentItem()
+        if item is None:
+            return None
+        value = item.data(0, Qt.UserRole)
+        return value if isinstance(value, UnknownResolverGroup) else None
+
+    def _selected_unknown_groups(self) -> List[UnknownResolverGroup]:
+        groups: List[UnknownResolverGroup] = []
+        seen_keys: set[str] = set()
+        for item in self.unknown_group_tree.selectedItems():
+            value = item.data(0, Qt.UserRole)
+            if not isinstance(value, UnknownResolverGroup):
+                continue
+            if value.group_key in seen_keys:
+                continue
+            seen_keys.add(value.group_key)
+            groups.append(value)
+        return groups
+
+    def _primary_unknown_member(self, group: Optional[UnknownResolverGroup]) -> Optional[UnknownResolverMember]:
+        if group is None:
+            return None
+        for member in group.members:
+            if member.is_unknown and member.extension == ".dds":
+                return member
+        for member in group.members:
+            if member.extension == ".dds":
+                return member
+        return group.members[0] if group.members else None
+
+    def _current_unknown_member(self) -> Optional[UnknownResolverMember]:
+        item = self.unknown_member_tree.currentItem()
+        if item is not None:
+            value = item.data(0, Qt.UserRole)
+            if isinstance(value, UnknownResolverMember):
+                return value
+        return self._primary_unknown_member(self._current_unknown_group())
+
+    def _update_unknown_member_group_visibility(self, group: Optional[UnknownResolverGroup]) -> None:
+        self.unknown_members_group.setVisible(bool(group is not None and group.total_members > 1))
+
+    def _unknown_group_target_paths(
+        self,
+        groups: Sequence[UnknownResolverGroup],
+        *,
+        unknown_only: bool,
+    ) -> List[str]:
+        target_paths: List[str] = []
+        seen_paths: set[str] = set()
+        for group in groups:
+            for member in group.members:
+                if member.extension != ".dds":
+                    continue
+                if unknown_only and not member.is_unknown:
+                    continue
+                if member.path in seen_paths:
+                    continue
+                seen_paths.add(member.path)
+                target_paths.append(member.path)
+        return target_paths
+
+    def _handle_unknown_group_selection_changed(
+        self,
+        current: Optional[QTreeWidgetItem],
+        _previous: Optional[QTreeWidgetItem],
+    ) -> None:
+        group = current.data(0, Qt.UserRole) if current is not None else None
+        if not isinstance(group, UnknownResolverGroup):
+            self.unknown_member_tree.clear()
+            self._update_unknown_member_group_visibility(None)
+            self.unknown_detail_edit.clear()
+            self._clear_unknown_preview("Select a DDS review item to preview it here.")
+            self._update_unknown_resolver_controls()
+            return
+        self._populating_unknown_resolver_controls = True
+        try:
+            self.unknown_member_tree.clear()
+            self._update_unknown_member_group_visibility(group)
+            for member in group.members:
+                item = QTreeWidgetItem(
+                    [
+                        PurePosixPath(member.path).name,
+                        member.current_kind,
+                        member.role_hint or "-",
+                        member.package_label,
+                        member.reason,
+                    ]
+                )
+                item.setData(0, Qt.UserRole, member)
+                item.setToolTip(0, member.path)
+                self.unknown_member_tree.addTopLevelItem(item)
+            suggested_choice = (
+                group.suggestions[0].choice_key if group.suggestions else default_unknown_resolver_label_choice()
+            )
+            combo_index = self.unknown_label_combo.findData(next(
+                (
+                    data
+                    for data in [
+                        self.unknown_label_combo.itemData(index)
+                        for index in range(self.unknown_label_combo.count())
+                    ]
+                    if isinstance(data, tuple) and data and data[0] == suggested_choice
+                ),
+                None,
+            ))
+            if combo_index >= 0:
+                self.unknown_label_combo.setCurrentIndex(combo_index)
+        finally:
+            self._populating_unknown_resolver_controls = False
+        if self.unknown_member_tree.topLevelItemCount() > 0:
+            first_member = self.unknown_member_tree.topLevelItem(0)
+            if first_member is not None:
+                self.unknown_member_tree.setCurrentItem(first_member)
+        else:
+            self.unknown_detail_edit.setPlainText("No reviewable members found in this unknown family.")
+        self._update_unknown_resolver_controls()
+
+    def _handle_unknown_group_item_selection_changed(self) -> None:
+        self._update_unknown_resolver_controls()
+
+    def _handle_unknown_member_selection_changed(
+        self,
+        current: Optional[QTreeWidgetItem],
+        _previous: Optional[QTreeWidgetItem],
+    ) -> None:
+        member = current.data(0, Qt.UserRole) if current is not None else None
+        group = self._current_unknown_group()
+        if not isinstance(member, UnknownResolverMember) or group is None:
+            self.unknown_detail_edit.clear()
+            self._clear_unknown_preview("Select a DDS review item to preview it here.")
+            self._update_unknown_resolver_controls()
+            return
+        texconv_path = Path(self.get_texconv_path()).expanduser() if self.get_texconv_path().strip() else None
+        detail_text = build_unknown_resolver_detail(
+            group,
+            member.path,
+            entries_by_path=self.archive_picker_entry_by_path,
+            texconv_path=texconv_path,
+        )
+        self.unknown_detail_edit.setPlainText(detail_text)
+        self._render_unknown_preview_for_member(member)
+        self._focus_archive_picker_path(member.path)
+        self._update_unknown_resolver_controls()
+
+    def _preview_selected_unknown_member(self) -> None:
+        member = self._current_unknown_member()
+        if member is None:
+            return
+        self._render_unknown_preview_for_member(member)
+        self._focus_archive_picker_path(member.path)
+
+    def _select_all_unknown_groups(self) -> None:
+        if self.unknown_group_tree.topLevelItemCount() <= 0:
+            return
+        current = self.unknown_group_tree.currentItem()
+        if current is None:
+            current = self.unknown_group_tree.topLevelItem(0)
+        self.unknown_group_tree.blockSignals(True)
+        try:
+            self.unknown_group_tree.selectAll()
+            if current is not None:
+                self.unknown_group_tree.setCurrentItem(current)
+        finally:
+            self.unknown_group_tree.blockSignals(False)
+        if current is not None:
+            self._handle_unknown_group_selection_changed(current, None)
+        self._update_unknown_resolver_controls()
+
+    def _clear_unknown_group_selection(self) -> None:
+        self.unknown_group_tree.blockSignals(True)
+        try:
+            self.unknown_group_tree.clearSelection()
+        finally:
+            self.unknown_group_tree.blockSignals(False)
+        self._update_unknown_resolver_controls()
+
+    def _selected_unknown_label(self) -> tuple[str, str, str]:
+        raw = self.unknown_label_combo.currentData()
+        if isinstance(raw, tuple) and len(raw) == 3:
+            return (str(raw[0]), str(raw[1]), str(raw[2]))
+        return ("color_albedo", "color", "albedo")
+
+    def _apply_unknown_selected_file_label(self) -> None:
+        group = self._current_unknown_group()
+        if group is None:
+            self.status_message_requested.emit("Select a texture family first.", True)
+            return
+        target_paths = self._unknown_group_target_paths([group], unknown_only=True)
+        if not target_paths:
+            self.status_message_requested.emit("No unknown DDS files remain in the current family.", True)
+            return
+        _choice_key, texture_type, semantic_subtype = self._selected_unknown_label()
+        updated = set_registered_texture_classifications(
+            target_paths,
+            texture_type,
+            semantic_subtype,
+            source="unknown_resolver",
+            note=f"Approved from Research -> Classification Review for family {group.group_key}",
+        )
+        if updated:
+            self.archive_snapshot_cache.clear()
+            self.status_message_requested.emit(
+                f"Saved classification {texture_type}/{semantic_subtype} for {updated} file(s) in the current family. Refreshing Research...",
+                False,
+            )
+            self.refresh_research()
+
+    def _apply_unknown_group_label(self) -> None:
+        groups = self._selected_unknown_groups()
+        if not groups:
+            self.status_message_requested.emit("Select one or more texture families first.", True)
+            return
+        target_paths = self._unknown_group_target_paths(groups, unknown_only=True)
+        if not target_paths:
+            self.status_message_requested.emit("No unknown DDS files remain in the selected families.", True)
+            return
+        _choice_key, texture_type, semantic_subtype = self._selected_unknown_label()
+        updated = set_registered_texture_classifications(
+            target_paths,
+            texture_type,
+            semantic_subtype,
+            source="unknown_resolver",
+            note="Approved from Research -> Classification Review for selected families",
+        )
+        if updated:
+            self.archive_snapshot_cache.clear()
+            self.status_message_requested.emit(
+                f"Saved classification {texture_type}/{semantic_subtype} for {updated} file(s) across {len(groups)} selected family/families. Refreshing Research...",
+                False,
+            )
+            self.refresh_research()
+
+    def _clear_unknown_selected_file_label(self) -> None:
+        group = self._current_unknown_group()
+        if group is None:
+            self.status_message_requested.emit("Select a texture family first.", True)
+            return
+        removed = remove_registered_texture_classifications(
+            self._unknown_group_target_paths([group], unknown_only=False)
+        )
+        if removed:
+            self.archive_snapshot_cache.clear()
+            self.status_message_requested.emit(
+                f"Removed {removed} saved classification override(s) from the current family. Refreshing Research...",
+                False,
+            )
+            self.refresh_research()
+
+    def _clear_unknown_group_label(self) -> None:
+        groups = self._selected_unknown_groups()
+        if not groups:
+            self.status_message_requested.emit("Select one or more texture families first.", True)
+            return
+        target_paths = self._unknown_group_target_paths(groups, unknown_only=False)
+        removed = remove_registered_texture_classifications(target_paths)
+        if removed:
+            self.archive_snapshot_cache.clear()
+            self.status_message_requested.emit(
+                f"Removed {removed} saved classification override(s) across {len(groups)} selected family/families. Refreshing Research...",
+                False,
+            )
+            self.refresh_research()
+
+    def _update_unknown_resolver_controls(self) -> None:
+        has_group = self._current_unknown_group() is not None
+        has_selected_groups = bool(self._selected_unknown_groups())
+        has_member = self._current_unknown_member() is not None
+        self.unknown_label_combo.setEnabled(has_group)
+        self.unknown_preview_button.setEnabled(has_member)
+        self.unknown_apply_selected_button.setEnabled(has_group)
+        self.unknown_apply_group_button.setEnabled(has_selected_groups)
+        self.unknown_clear_selected_button.setEnabled(has_group)
+        self.unknown_clear_group_button.setEnabled(has_selected_groups)
+        has_rows = self.unknown_group_tree.topLevelItemCount() > 0
+        self.unknown_select_all_button.setEnabled(has_rows)
+        self.unknown_clear_family_selection_button.setEnabled(has_rows and has_selected_groups)
+
+    def _set_unknown_preview_image_controls_enabled(self, enabled: bool) -> None:
+        self.unknown_preview_zoom_out_button.setEnabled(enabled)
+        self.unknown_preview_zoom_fit_button.setEnabled(enabled)
+        self.unknown_preview_zoom_100_button.setEnabled(enabled)
+        self.unknown_preview_zoom_in_button.setEnabled(enabled)
+        if not enabled:
+            self.unknown_preview_zoom_value.setText("-")
+        else:
+            self._update_unknown_preview_zoom_label()
+
+    def _update_unknown_preview_zoom_label(self) -> None:
+        if self.unknown_preview_fit_to_view:
+            self.unknown_preview_zoom_value.setText("Fit")
+        else:
+            self.unknown_preview_zoom_value.setText(f"{int(round(self.unknown_preview_zoom_factor * 100))}%")
+
+    def _apply_unknown_preview_zoom(self) -> None:
+        self.unknown_preview_label.set_fit_to_view(self.unknown_preview_fit_to_view)
+        self.unknown_preview_label.set_zoom_factor(self.unknown_preview_zoom_factor)
+        self._update_unknown_preview_zoom_label()
+
+    def _set_unknown_preview_fit_mode(self) -> None:
+        self.unknown_preview_fit_to_view = True
+        self._apply_unknown_preview_zoom()
+
+    def _set_unknown_preview_zoom_factor(self, zoom_factor: float) -> None:
+        self.unknown_preview_fit_to_view = False
+        self.unknown_preview_zoom_factor = min(max(zoom_factor, 0.1), 16.0)
+        self._apply_unknown_preview_zoom()
+
+    def _adjust_unknown_preview_zoom(self, step: int) -> None:
+        current_zoom = (
+            self.unknown_preview_label.current_display_scale()
+            if self.unknown_preview_fit_to_view
+            else self.unknown_preview_zoom_factor
+        )
+        zoom_steps = [0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0]
+        closest_index = min(range(len(zoom_steps)), key=lambda idx: abs(zoom_steps[idx] - current_zoom))
+        next_index = min(max(closest_index + step, 0), len(zoom_steps) - 1)
+        self._set_unknown_preview_zoom_factor(zoom_steps[next_index])
+
+    def _clear_unknown_preview(self, message: str) -> None:
+        self.unknown_preview_title_label.setText("Select an unknown family member")
+        self.unknown_preview_meta_label.setText(message)
+        self.unknown_preview_warning_label.clear()
+        self.unknown_preview_warning_label.setVisible(False)
+        self.unknown_preview_info_edit.setPlainText(message)
+        self.unknown_preview_label.clear_preview(message)
+        self.unknown_preview_stack.setCurrentWidget(self.unknown_preview_info_edit)
+        self._set_unknown_preview_image_controls_enabled(False)
+
+    def _render_unknown_preview_for_member(self, member: Optional[UnknownResolverMember]) -> None:
+        entry = (
+            self.archive_picker_entry_by_path.get(self._normalize_archive_path(member.path))
+            if member is not None
+            else None
+        )
+        request_id = self.unknown_preview_request_id + 1
+        self.unknown_preview_request_id = request_id
+        if entry is None:
+            self.pending_unknown_preview_request = None
+            self._clear_unknown_preview("No archive preview is available for the selected item in the current archive view.")
+            return
+
+        self.unknown_preview_title_label.setText(entry.basename)
+        self.unknown_preview_meta_label.setText("Loading preview...")
+        self.unknown_preview_warning_label.setVisible(False)
+        self.unknown_preview_warning_label.clear()
+        self.unknown_preview_info_edit.setPlainText("Preparing preview...")
+        self.unknown_preview_stack.setCurrentWidget(self.unknown_preview_info_edit)
+        self.pending_unknown_preview_request = None
+
+        texconv_text = self.get_texconv_path().strip()
+        texconv_path = Path(texconv_text).expanduser() if texconv_text else None
+        if self.unknown_preview_thread is not None:
+            self.pending_unknown_preview_request = (request_id, entry)
+            if self.unknown_preview_worker is not None:
+                self.unknown_preview_worker.stop()
+            return
+        self._start_unknown_preview_worker(request_id, texconv_path, entry)
+
+    def _start_unknown_preview_worker(
+        self,
+        request_id: int,
+        texconv_path: Optional[Path],
+        entry: Optional[ArchiveEntry],
+    ) -> None:
+        worker = UnknownResolverPreviewWorker(request_id, texconv_path, entry)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._handle_unknown_preview_ready)
+        worker.error.connect(self._handle_unknown_preview_error)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._cleanup_unknown_preview_refs)
+        self.unknown_preview_worker = worker
+        self.unknown_preview_thread = thread
+        thread.start()
+
+    def _handle_unknown_preview_ready(self, request_id: int, payload: object) -> None:
+        if request_id != self.unknown_preview_request_id:
+            return
+        if isinstance(payload, ArchivePreviewResult):
+            self._apply_unknown_preview_result(payload)
+
+    def _handle_unknown_preview_error(self, request_id: int, message: str) -> None:
+        if request_id != self.unknown_preview_request_id:
+            return
+        self._clear_unknown_preview(f"Preview failed: {message}")
+
+    def _cleanup_unknown_preview_refs(self) -> None:
+        self.unknown_preview_worker = None
+        self.unknown_preview_thread = None
+        if self.pending_unknown_preview_request is None:
+            return
+        request_id, entry = self.pending_unknown_preview_request
+        self.pending_unknown_preview_request = None
+        texconv_text = self.get_texconv_path().strip()
+        texconv_path = Path(texconv_text).expanduser() if texconv_text else None
+        self.unknown_preview_request_id = request_id
+        self._start_unknown_preview_worker(request_id, texconv_path, entry)
+
+    def _apply_unknown_preview_result(self, result: ArchivePreviewResult) -> None:
+        title = result.title or "Selected Preview"
+        metadata_summary = result.metadata_summary or "Preview ready."
+        detail_text = result.detail_text or metadata_summary
+        self.unknown_preview_title_label.setText(title)
+        self.unknown_preview_meta_label.setText(metadata_summary)
+        self.unknown_preview_warning_label.setText(result.warning_text)
+        self.unknown_preview_warning_label.setVisible(bool(result.warning_text))
+        self.unknown_preview_info_edit.setPlainText(detail_text)
+        if result.preferred_view == "image" and (result.preview_image is not None or result.preview_image_path):
+            if result.preview_image is not None:
+                self.unknown_preview_label.set_preview_image(result.preview_image, title or "Preview image")
+            else:
+                self.unknown_preview_label.set_preview_image_path(result.preview_image_path, title or "Preview image")
+            self.unknown_preview_stack.setCurrentWidget(self.unknown_preview_scroll)
+            self._set_unknown_preview_image_controls_enabled(True)
+            self._apply_unknown_preview_zoom()
+            return
+        if result.preferred_view == "text" and result.preview_text:
+            self.unknown_preview_info_edit.setPlainText(result.preview_text)
+        self.unknown_preview_label.clear_preview("No image preview available.")
+        self.unknown_preview_stack.setCurrentWidget(self.unknown_preview_info_edit)
+        self._set_unknown_preview_image_controls_enabled(False)
 
     def _populate_heatmap_rows(self, rows: object) -> None:
         self.heatmap_tree.clear()
@@ -1469,11 +2387,24 @@ class ResearchTab(QWidget):
         )
 
     def _handle_research_subtab_changed(self, index: int) -> None:
-        widget = self.tab_widget.widget(index)
+        del index
+        self._update_research_side_panel()
+
+    def _handle_archive_insights_subtab_changed(self, _index: int) -> None:
+        self._update_research_side_panel()
+
+    def _update_research_side_panel(self) -> None:
+        widget = self.tab_widget.currentWidget()
         if widget is self.texture_tab:
+            self.right_panel_stack.setVisible(True)
             self.right_panel_stack.setCurrentWidget(self.analysis_detail_group)
-        else:
-            self.right_panel_stack.setCurrentWidget(self.archive_picker_group)
+            return
+        current_archive_tab = self.archive_insights_tabs.currentWidget()
+        if current_archive_tab is getattr(self, "classification_review_tab", None):
+            self.right_panel_stack.setVisible(False)
+            return
+        self.right_panel_stack.setVisible(True)
+        self.right_panel_stack.setCurrentWidget(self.archive_picker_group)
 
     def _handle_mip_selection_changed(
         self,
@@ -1509,6 +2440,9 @@ class ResearchTab(QWidget):
             Path(output_root_text).expanduser() if output_root_text else Path("."),
             row,
             texconv_path=texconv_path,
+            family_members_by_path=self.research_payload.get("mip_detail_family_members_by_path")
+            if isinstance(self.research_payload.get("mip_detail_family_members_by_path"), dict)
+            else None,
         )
         self.analysis_detail_edit.setPlainText(detail_text)
 
@@ -1521,6 +2455,7 @@ class ResearchTab(QWidget):
 
     def _populate_reference_rows(self, rows: object) -> None:
         self.reference_tree.clear()
+        self.reference_review_text_button.setEnabled(False)
         for row in rows if isinstance(rows, list) else []:
             if not isinstance(row, MaterialTextureReferenceRow):
                 continue
@@ -1569,14 +2504,35 @@ class ResearchTab(QWidget):
         current: Optional[QTreeWidgetItem],
         _previous: Optional[QTreeWidgetItem],
     ) -> None:
+        self.reference_review_text_button.setEnabled(False)
         if current is None:
             return
         row = current.data(0, Qt.UserRole)
         if not isinstance(row, MaterialTextureReferenceRow):
             return
+        self.reference_review_text_button.setEnabled(bool(row.source_path and row.related_path))
         if self._focus_archive_picker_path(row.related_path):
             return
         self._focus_archive_picker_path(row.source_path)
+
+    def review_selected_reference_in_text_search(self) -> None:
+        item = self.reference_tree.currentItem()
+        if item is None:
+            self.status_message_requested.emit("Select a reference result first.", True)
+            return
+        row = item.data(0, Qt.UserRole)
+        if not isinstance(row, MaterialTextureReferenceRow):
+            self.status_message_requested.emit("Select a reference result first.", True)
+            return
+        source_path = row.source_path.strip().replace("\\", "/")
+        highlight_query = PurePosixPath(row.related_path.strip().replace("\\", "/")).name
+        if not source_path or not highlight_query:
+            self.status_message_requested.emit(
+                "The selected reference row does not include enough information for Text Search review.",
+                True,
+            )
+            return
+        self.review_reference_in_text_search_requested.emit(source_path, highlight_query)
 
     def _handle_sidecar_selection_changed(
         self,

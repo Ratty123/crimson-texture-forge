@@ -28,7 +28,6 @@ from crimson_texture_forge.constants import (
     DEFAULT_UI_THEME,
     UPSCALE_BACKEND_CHAINNER,
     UPSCALE_BACKEND_NONE,
-    UPSCALE_BACKEND_ONNX_RUNTIME,
     DEFAULT_UPSCALE_POST_CORRECTION,
     UPSCALE_POST_CORRECTION_MATCH_HISTOGRAM,
     UPSCALE_POST_CORRECTION_MATCH_LEVELS,
@@ -47,7 +46,6 @@ from crimson_texture_forge.ui.themes import build_app_stylesheet, get_theme
 
 DIRECT_BACKEND_VALUES = {
     UPSCALE_BACKEND_REALESRGAN_NCNN,
-    UPSCALE_BACKEND_ONNX_RUNTIME,
 }
 
 
@@ -154,7 +152,6 @@ class SafeUpscaleWizard(QDialog):
         self.backend_combo.addItem("Disabled", UPSCALE_BACKEND_NONE)
         self.backend_combo.addItem("chaiNNer", UPSCALE_BACKEND_CHAINNER)
         self.backend_combo.addItem("Real-ESRGAN NCNN (direct)", UPSCALE_BACKEND_REALESRGAN_NCNN)
-        self.backend_combo.addItem("ONNX Runtime (direct)", UPSCALE_BACKEND_ONNX_RUNTIME)
         backend_row.addWidget(QLabel("Backend"))
         backend_row.addWidget(self.backend_combo, 1)
         backend_layout.addLayout(backend_row)
@@ -191,7 +188,7 @@ class SafeUpscaleWizard(QDialog):
         preset_layout.addWidget(self.preset_warning_label)
         content_layout.addWidget(self.preset_group)
 
-        self.backend_controls_group = QGroupBox("4. Direct Backend Summary (NCNN / ONNX only)")
+        self.backend_controls_group = QGroupBox("4. Direct Backend Summary (NCNN only)")
         backend_controls_layout = QFormLayout(self.backend_controls_group)
         backend_controls_layout.setContentsMargins(12, 14, 12, 12)
         backend_controls_layout.setHorizontalSpacing(12)
@@ -235,7 +232,7 @@ class SafeUpscaleWizard(QDialog):
         backend_controls_layout.addRow("NCNN extra args", self.ncnn_extra_args_edit)
         backend_controls_layout.addRow("Post correction", self.post_correction_combo)
         self.backend_controls_note = QLabel(
-            "These controls only affect direct backends like Real-ESRGAN NCNN and ONNX Runtime. "
+            "These controls only affect the direct Real-ESRGAN NCNN backend. "
             "chaiNNer keeps using its own chain settings. Direct models can still shift brightness, contrast, or sharpness, "
             "so use Compare before bulk runs."
         )
@@ -532,8 +529,6 @@ class SafeUpscaleWizard(QDialog):
                 )
             else:
                 backend_text = "Real-ESRGAN NCNN is selected. The direct backend settings below decide the PNG upscale pass before DDS rebuild happens."
-        else:
-            backend_text = "ONNX Runtime is selected. The direct backend settings below decide the PNG upscale pass before DDS rebuild happens."
         self.backend_summary_label.setText(backend_text)
 
         preset_definition = get_texture_preset_definition(preset)
@@ -560,7 +555,7 @@ class SafeUpscaleWizard(QDialog):
             )
         else:
             self.backend_controls_detail.setText(
-                "No direct NCNN or ONNX backend is active, so this section is informational only."
+                "No direct NCNN backend is active, so this section is informational only."
             )
 
         safety_lines = []
@@ -621,7 +616,6 @@ class SafeUpscaleWizard(QDialog):
             UPSCALE_BACKEND_NONE,
             UPSCALE_BACKEND_CHAINNER,
             UPSCALE_BACKEND_REALESRGAN_NCNN,
-            UPSCALE_BACKEND_ONNX_RUNTIME,
         }:
             return text
         if text in {"none", "off", "false", "0"}:
@@ -630,8 +624,6 @@ class SafeUpscaleWizard(QDialog):
             return UPSCALE_BACKEND_CHAINNER
         if text in {"realesrgan", "realesrgan_ncnn", "real-esrgan", "real_esrgan_ncnn"}:
             return UPSCALE_BACKEND_REALESRGAN_NCNN
-        if text in {"onnx", "onnx_runtime", "onnxruntime"}:
-            return UPSCALE_BACKEND_ONNX_RUNTIME
         return None
 
     def _coerce_preset(self, value: Any) -> str:

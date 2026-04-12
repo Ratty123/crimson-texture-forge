@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import threading
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, List, Optional, Sequence
 
 from PySide6.QtCore import QObject, QThread, Qt, QTimer, Signal, Slot
@@ -126,6 +126,52 @@ class TextSearchWorker(QObject):
             self.finished.emit()
 
 
+class TextSearchPreviewWorker(QObject):
+    completed = Signal(int, object)
+    error = Signal(int, str)
+    finished = Signal()
+
+    def __init__(
+        self,
+        *,
+        request_id: int,
+        result: TextSearchResult,
+        query: str,
+        regex_enabled: bool,
+        case_sensitive: bool,
+    ) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.result = result
+        self.query = query
+        self.regex_enabled = regex_enabled
+        self.case_sensitive = case_sensitive
+        self.stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            if self.stop_event.is_set():
+                return
+            preview = load_text_search_preview(
+                self.result,
+                self.query,
+                regex=self.regex_enabled,
+                case_sensitive=self.case_sensitive,
+            )
+            if self.stop_event.is_set():
+                return
+            self.completed.emit(self.request_id, preview)
+        except Exception as exc:
+            if not self.stop_event.is_set():
+                self.error.emit(self.request_id, str(exc))
+        finally:
+            self.finished.emit()
+
+
 class TextSearchTab(QWidget):
     status_message_requested = Signal(str, bool)
     SYNTAX_HIGHLIGHT_CHAR_LIMIT = 2_000_000
@@ -149,6 +195,11 @@ class TextSearchTab(QWidget):
         self.current_theme_key = theme_key
         self.search_thread: Optional[QThread] = None
         self.search_worker: Optional[TextSearchWorker] = None
+        self.preview_thread: Optional[QThread] = None
+        self.preview_worker: Optional[TextSearchPreviewWorker] = None
+        self.preview_request_id = 0
+        self.pending_preview_result: Optional[TextSearchResult] = None
+        self.scheduled_preview_result: Optional[TextSearchResult] = None
         self.search_results: List[TextSearchResult] = []
         self.current_preview_result: Optional[TextSearchResult] = None
         self.last_search_query = ""
@@ -163,6 +214,10 @@ class TextSearchTab(QWidget):
         self._settings_save_timer.setSingleShot(True)
         self._settings_save_timer.setInterval(250)
         self._settings_save_timer.timeout.connect(self._save_settings)
+        self._preview_debounce_timer = QTimer(self)
+        self._preview_debounce_timer.setSingleShot(True)
+        self._preview_debounce_timer.setInterval(90)
+        self._preview_debounce_timer.timeout.connect(self._flush_scheduled_preview_request)
 
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(10, 10, 10, 10)
@@ -439,6 +494,67 @@ class TextSearchTab(QWidget):
                 f"Archive source ready: {len(self.archive_entries):,} scanned entry(s) available for text search."
             )
 
+    def review_archive_entry(
+        self,
+        entry: ArchiveEntry,
+        *,
+        highlight_query: str,
+    ) -> bool:
+        query = highlight_query.strip()
+        if not query:
+            self.status_message_requested.emit("No highlight query was provided for the selected reference.", True)
+            return False
+        if self.search_thread is not None:
+            self.status_message_requested.emit("Text Search is busy. Wait for the current search to finish first.", True)
+            return False
+
+        self._preview_debounce_timer.stop()
+        self.pending_preview_result = None
+        self.scheduled_preview_result = None
+        self.preview_request_id += 1
+        if self.preview_worker is not None:
+            self.preview_worker.stop()
+
+        archive_index = self.source_combo.findData("archive")
+        if archive_index >= 0:
+            self.source_combo.setCurrentIndex(archive_index)
+        self.query_edit.setText(query)
+
+        result = TextSearchResult(
+            source_kind="archive",
+            relative_path=entry.path.replace("\\", "/"),
+            extension=entry.extension,
+            match_count=1,
+            snippet="Opened from Research -> References for targeted XML/material review.",
+            package_label=entry.package_label,
+            archive_entry=entry,
+        )
+        self.search_results = [result]
+        self.current_preview_result = result
+        self.last_search_query = query
+        self.last_search_case_sensitive = False
+        self.last_search_regex_enabled = False
+        self.last_search_stats = TextSearchRunStats(source_kind="archive", candidate_count=1, searched_count=1)
+
+        self.results_tree.blockSignals(True)
+        self.results_tree.clear()
+        item = self._build_result_item(0, result)
+        self.results_tree.addTopLevelItem(item)
+        self.results_tree.blockSignals(False)
+        self.results_tree.setCurrentItem(item)
+
+        file_name = PurePosixPath(result.relative_path).name or result.relative_path
+        self.results_summary_label.setText("Opened 1 archive text file from Research for focused review.")
+        self.search_progress_label.setText("Reference review ready.")
+        self.search_progress_bar.setRange(0, 1)
+        self.search_progress_bar.setValue(1)
+        self.search_progress_bar.setFormat("Ready")
+        self.append_log(f"Opened {result.relative_path} in Text Search for reference review (highlight: {query}).")
+        self.status_message_requested.emit(f"Opened {file_name} in Text Search and highlighted '{query}'.", False)
+        self._update_controls()
+        self._schedule_preview(result)
+        return True
+
     def diagnostic_entries(self) -> Dict[str, str]:
         return {
             "text_search_log.txt": self.log_view.toPlainText(),
@@ -446,11 +562,17 @@ class TextSearchTab(QWidget):
 
     def shutdown(self) -> None:
         self.flush_settings_save()
+        self._preview_debounce_timer.stop()
         if self.search_worker is not None:
             self.search_worker.stop()
         if self.search_thread is not None:
             self.search_thread.quit()
             self.search_thread.wait(3000)
+        if self.preview_worker is not None:
+            self.preview_worker.stop()
+        if self.preview_thread is not None:
+            self.preview_thread.quit()
+            self.preview_thread.wait(3000)
 
     def clear_log(self) -> None:
         self.log_view.clear()
@@ -607,6 +729,12 @@ class TextSearchTab(QWidget):
     def start_search(self) -> None:
         if self.external_busy or self.search_thread is not None:
             return
+        self._preview_debounce_timer.stop()
+        self.pending_preview_result = None
+        self.scheduled_preview_result = None
+        self.preview_request_id += 1
+        if self.preview_worker is not None:
+            self.preview_worker.stop()
 
         query = self.query_edit.text().strip()
         source_kind = str(self.source_combo.currentData())
@@ -713,22 +841,7 @@ class TextSearchTab(QWidget):
         self.results_tree.clear()
         new_items: List[QTreeWidgetItem] = []
         for index, result in enumerate(self.search_results):
-            file_name = Path(result.relative_path).name or result.relative_path
-            item = QTreeWidgetItem(
-                [
-                    file_name,
-                    f"{result.match_count:,}",
-                    result.package_label if result.source_kind == "archive" else "Loose file",
-                    result.relative_path,
-                    result.extension,
-                ]
-            )
-            item.setToolTip(0, file_name)
-            item.setToolTip(2, item.text(2))
-            item.setToolTip(3, result.relative_path)
-            item.setToolTip(4, result.extension)
-            item.setData(0, Qt.UserRole, index)
-            new_items.append(item)
+            new_items.append(self._build_result_item(index, result))
         if new_items:
             self.results_tree.addTopLevelItems(new_items)
         self.results_tree.setUpdatesEnabled(True)
@@ -771,6 +884,24 @@ class TextSearchTab(QWidget):
         self.append_log(summary)
         self.status_message_requested.emit(summary, False)
 
+    def _build_result_item(self, index: int, result: TextSearchResult) -> QTreeWidgetItem:
+        file_name = PurePosixPath(result.relative_path).name or result.relative_path
+        item = QTreeWidgetItem(
+            [
+                file_name,
+                f"{result.match_count:,}",
+                result.package_label if result.source_kind == "archive" else "Loose file",
+                result.relative_path,
+                result.extension,
+            ]
+        )
+        item.setToolTip(0, file_name)
+        item.setToolTip(2, item.text(2))
+        item.setToolTip(3, result.relative_path)
+        item.setToolTip(4, result.extension)
+        item.setData(0, Qt.UserRole, index)
+        return item
+
     def _handle_search_cancelled(self, message: str) -> None:
         self.search_progress_label.setText(message)
         self.search_progress_bar.setRange(0, 1)
@@ -800,33 +931,66 @@ class TextSearchTab(QWidget):
             return
         result = self.search_results[raw]
         self.current_preview_result = result
-        self._render_preview(result)
+        self._schedule_preview(result)
 
-    def _render_preview(self, result: TextSearchResult) -> None:
-        try:
-            preview = load_text_search_preview(
-                result,
-                self.last_search_query,
-                regex=self.last_search_regex_enabled,
-                case_sensitive=self.last_search_case_sensitive,
-            )
-        except Exception as exc:
-            self.preview_title_label.setText(result.relative_path)
-            self.preview_meta_label.setText("Preview failed.")
-            self.preview_detail_label.setText(str(exc))
-            self.preview_text_edit.setPlainText("")
-            self.preview_text_edit.set_match_selections([])
-            self.preview_search_spans = []
-            self.preview_find_spans = []
-            self.preview_find_active_index = -1
-            self.preview_text_cache = ""
-            self.preview_find_status_label.setText("Preview failed.")
+    def _schedule_preview(self, result: TextSearchResult) -> None:
+        self.preview_title_label.setText(result.relative_path)
+        self.preview_meta_label.setText("Loading preview...")
+        self.preview_detail_label.setText("Preparing preview...")
+        self.preview_text_edit.setPlainText("")
+        self.preview_text_edit.set_match_selections([])
+        self.preview_search_spans = []
+        self.preview_find_spans = []
+        self.preview_find_active_index = -1
+        self.preview_text_cache = ""
+        self.preview_find_status_label.setText("Loading preview...")
+        self.scheduled_preview_result = result
+        self._preview_debounce_timer.start()
+
+    def _flush_scheduled_preview_request(self) -> None:
+        if self.scheduled_preview_result is None:
             return
+        result = self.scheduled_preview_result
+        self.scheduled_preview_result = None
+        if self.preview_thread is not None:
+            self.pending_preview_result = result
+            if self.preview_worker is not None:
+                self.preview_worker.stop()
+            return
+        request_id = self.preview_request_id + 1
+        self.preview_request_id = request_id
+        self._start_preview_worker(request_id, result)
 
+    def _start_preview_worker(self, request_id: int, result: TextSearchResult) -> None:
+        worker = TextSearchPreviewWorker(
+            request_id=request_id,
+            result=result,
+            query=self.last_search_query,
+            regex_enabled=self.last_search_regex_enabled,
+            case_sensitive=self.last_search_case_sensitive,
+        )
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._handle_preview_ready)
+        worker.error.connect(self._handle_preview_error)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._cleanup_preview_refs)
+        self.preview_worker = worker
+        self.preview_thread = thread
+        thread.start()
+
+    def _handle_preview_ready(self, request_id: int, payload: object) -> None:
+        if request_id != self.preview_request_id or not isinstance(payload, TextSearchPreview):
+            return
+        preview = payload
+        result = self.current_preview_result
         self.preview_title_label.setText(preview.title)
         self.preview_meta_label.setText(preview.metadata)
         preview_detail_text = preview.detail_text
-        syntax_extension = result.extension
+        syntax_extension = result.extension if result is not None else Path(preview.title).suffix
         if len(preview.preview_text) > self.SYNTAX_HIGHLIGHT_CHAR_LIMIT:
             syntax_extension = ""
             preview_detail_text = "\n".join(
@@ -840,6 +1004,32 @@ class TextSearchTab(QWidget):
         self.preview_detail_label.setText(preview_detail_text)
         self.preview_text_edit.set_language_for_extension(syntax_extension)
         self._apply_preview_content(preview)
+
+    def _handle_preview_error(self, request_id: int, message: str) -> None:
+        if request_id != self.preview_request_id:
+            return
+        result = self.current_preview_result
+        self.preview_title_label.setText(result.relative_path if result is not None else "Preview failed.")
+        self.preview_meta_label.setText("Preview failed.")
+        self.preview_detail_label.setText(message)
+        self.preview_text_edit.setPlainText("")
+        self.preview_text_edit.set_match_selections([])
+        self.preview_search_spans = []
+        self.preview_find_spans = []
+        self.preview_find_active_index = -1
+        self.preview_text_cache = ""
+        self.preview_find_status_label.setText("Preview failed.")
+
+    def _cleanup_preview_refs(self) -> None:
+        self.preview_thread = None
+        self.preview_worker = None
+        if self.pending_preview_result is None:
+            return
+        result = self.pending_preview_result
+        self.pending_preview_result = None
+        request_id = self.preview_request_id + 1
+        self.preview_request_id = request_id
+        self._start_preview_worker(request_id, result)
 
     def _apply_preview_content(self, preview: TextSearchPreview) -> None:
         self.preview_text_edit.setPlainText(preview.preview_text)

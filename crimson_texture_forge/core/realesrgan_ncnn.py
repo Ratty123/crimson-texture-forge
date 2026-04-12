@@ -251,6 +251,11 @@ def run_realesrgan_ncnn_stage(
         on_log("Phase 1/2: running Real-ESRGAN NCNN.")
         on_log(f"Real-ESRGAN NCNN input folder: {input_root}")
         on_log(f"Real-ESRGAN NCNN retry tile candidates: {', '.join(str(tile) for tile in attempt_tiles)}")
+        if retry_plan.requested_tile_size == 0 and len(attempt_tiles) > 1:
+            fallback_tiles = ", ".join(str(tile) for tile in attempt_tiles[1:])
+            on_log(
+                f"Tile size 0 uses a full-frame first attempt. If that fails, NCNN will switch to tiled fallback mode: {fallback_tiles}."
+            )
 
     for attempt_index, tile_size in enumerate(attempt_tiles, start=1):
         attempt_output_root = Path(tempfile.mkdtemp(prefix="crimson_texture_forge_ncnn_"))
@@ -290,7 +295,10 @@ def run_realesrgan_ncnn_stage(
             if attempt_index < total_attempts:
                 next_tile = attempt_tiles[attempt_index]
                 if on_log:
-                    on_log(f"Retrying Real-ESRGAN NCNN with smaller tile size {next_tile}.")
+                    if tile_size == 0:
+                        on_log(f"Retrying Real-ESRGAN NCNN in tiled fallback mode with tile size {next_tile}.")
+                    else:
+                        on_log(f"Retrying Real-ESRGAN NCNN with smaller tile size {next_tile}.")
             else:
                 raise
         finally:

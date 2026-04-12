@@ -13,6 +13,7 @@ from crimson_texture_forge.constants import (
     UPSCALE_TEXTURE_PRESET_COLOR_UI,
     UPSCALE_TEXTURE_PRESET_COLOR_UI_EMISSIVE,
 )
+from crimson_texture_forge.core.classification_registry import get_registered_texture_classification
 
 _PATH_TEXTURE_TYPE_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
     ("ui", re.compile(r"(^|[/\\])(ui|hud|menu|cursor|button|font)([/\\]|_|-|$)", re.IGNORECASE)),
@@ -24,7 +25,7 @@ _STEM_TEXTURE_TYPE_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
     (
         "vector",
         re.compile(
-            r"(?:^|[_-])(xvector|yvector|zvector|vector|flow|velocity|pivotpos|pivot|position|pos|dr|op)(?:$|[_-])",
+            r"(?:^|[_-])(xvector|yvector|zvector|vector|flow|velocity|pivotpainter|pivotpos|pivot|position|pos|dr|op)(?:$|[_-])",
             re.IGNORECASE,
         ),
     ),
@@ -39,7 +40,7 @@ _STEM_TEXTURE_TYPE_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
     (
         "mask",
         re.compile(
-            r"(?:^|[_-])(ma|mg|m|mask|masks|orm|rma|arm|ao|opacity|alpha|metal|metallic|spec|specular|sp|o|subsurface|emi|d)(?:$|[_-])",
+            r"(?:^|[_-])(ma|mg|m|mask|masks|orm|rma|arm|ao|opacity|alpha|1bit|grayscale|metal|metallic|spec|specular|sp|o|subsurface|emi|d)(?:$|[_-])",
             re.IGNORECASE,
         ),
     ),
@@ -49,12 +50,22 @@ _STEM_TEXTURE_TYPE_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
 
 _COLOR_INFIX_PATTERN = re.compile(r"[_-]cd(?:$|[_-])", re.IGNORECASE)
 
+_EXACT_STEM_TEXTURE_TYPE_OVERRIDES: Dict[str, str] = {
+    "snownormal": "normal",
+    "snowmask": "mask",
+    "nonetexturespecular": "mask",
+}
+
 _GROUP_SUFFIX_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(r"_(?:cd|dif|diff|color|col|albedo|basecolor|base_color)$", re.IGNORECASE),
     re.compile(r"_d$", re.IGNORECASE),
     re.compile(r"_(?:wn|n|nm|nrm|normal|normalmap)$", re.IGNORECASE),
     re.compile(r"_(?:xvector|yvector|zvector|vector|pivotpos|pivot|position|pos|flow|velocity|dr|op)$", re.IGNORECASE),
     re.compile(r"_(?:height|hgt|disp|displacement|dmap|bump|parallax|pom|ssdm|depth)$", re.IGNORECASE),
+    re.compile(r"_(?:mask_1bit)$", re.IGNORECASE),
+    re.compile(r"_(?:1bit)$", re.IGNORECASE),
+    re.compile(r"_(?:mask_amg)$", re.IGNORECASE),
+    re.compile(r"_(?:ct)$", re.IGNORECASE),
     re.compile(r"_(?:sp|spec|specular|gloss|gls)$", re.IGNORECASE),
     re.compile(r"_(?:ma|mg|m|mask|masks|orm|mra|rma|arm|ao|o|metal|metallic)$", re.IGNORECASE),
     re.compile(r"_(?:rough|roughness|rgh|smooth|smoothness)$", re.IGNORECASE),
@@ -216,9 +227,15 @@ def describe_texture_preset(preset: str) -> str:
 
 
 def classify_texture_type(path_value: str) -> str:
+    registered = get_registered_texture_classification(path_value)
+    if registered is not None:
+        return str(registered.texture_type or "unknown").strip().lower() or "unknown"
     normalized = path_value.replace("\\", "/")
     lowered = normalized.lower()
     stem = PurePosixPath(normalized).stem.lower()
+    exact_override = _EXACT_STEM_TEXTURE_TYPE_OVERRIDES.get(stem)
+    if exact_override is not None:
+        return exact_override
     if re.search(r"(?:^|[_-])ct$", stem, re.IGNORECASE):
         return "color"
     for texture_type, pattern in _PATH_TEXTURE_TYPE_PATTERNS:
@@ -227,6 +244,10 @@ def classify_texture_type(path_value: str) -> str:
     for texture_type, pattern in _STEM_TEXTURE_TYPE_PATTERNS:
         if pattern.search(stem):
             return texture_type
+    if stem.endswith("normal"):
+        return "normal"
+    if stem.endswith("specular") or stem.endswith("mask"):
+        return "mask"
     if _COLOR_INFIX_PATTERN.search(stem):
         return "color"
     return "unknown"
@@ -415,6 +436,10 @@ def infer_texture_semantics(
             semantic_subtype = "effect_vector"
             confidence = 90
             evidence.append("effect/distortion vector suffix")
+        elif _contains_any(lowered, ("pivotpainter",)):
+            semantic_subtype = "pivot_position"
+            confidence = 94
+            evidence.append("pivot-painter naming")
         elif _contains_any(lowered, ("pivotpos", "pivot_pos")):
             semantic_subtype = "pivot_position"
             confidence = 96
@@ -517,6 +542,10 @@ def infer_texture_semantics(
             packed_channels.append("alpha")
             confidence = 90
             evidence.append("opacity/alpha mask hint")
+        elif _contains_any(lowered, ("depth_grayscale", "grayscale")):
+            semantic_subtype = "grayscale_data"
+            confidence = 86
+            evidence.append("grayscale scalar-data hint")
         elif _stem_has_token(stem_lower, "d"):
             semantic_subtype = "detail_support"
             confidence = 74
@@ -639,30 +668,6 @@ def infer_texture_semantics(
             confidence = 70
             evidence.append("sidecar color hint")
 
-    if texture_type == "unknown" and _stem_has_token(stem_lower, "rough"):
-        sibling_types = {
-            classify_texture_type(member)
-            for member in family_members
-            if str(member).replace("\\", "/").lower() != lowered
-        }
-        sibling_types.discard("unknown")
-        visible_family_types = {"color", "ui", "emissive", "impostor"}
-        if _contains_any(combined_sidecar_text, ("roughness", "gloss", "smoothness")):
-            texture_type = "roughness"
-            semantic_subtype = "roughness"
-            confidence = max(confidence, 72)
-            evidence.append("ambiguous rough token confirmed by sidecar hint")
-        elif not sibling_types.intersection(visible_family_types) and preview_sample is not None and preview_sample.mean_chroma <= 7.0 and preview_sample.luma_range >= 18.0:
-            texture_type = "roughness"
-            semantic_subtype = "roughness"
-            confidence = max(confidence, 64)
-            evidence.append("ambiguous rough token confirmed by grayscale preview")
-        elif not sibling_types.intersection(visible_family_types) and (original_upper.startswith("BC4") or original_upper.startswith("R8")):
-            texture_type = "roughness"
-            semantic_subtype = "roughness"
-            confidence = max(confidence, 64)
-            evidence.append(f"ambiguous rough token with single-channel-like source format {original_upper}")
-
     if texture_type == "unknown":
         if original_upper.endswith("_SRGB"):
             texture_type = "color"
@@ -700,6 +705,18 @@ def infer_texture_semantics(
     if "FLOAT" in original_upper or "SNORM" in original_upper:
         evidence.append(f"precision-sensitive format {original_upper}")
         confidence = max(confidence, 90)
+
+    registered = get_registered_texture_classification(path_value)
+    if registered is not None:
+        texture_type = str(registered.texture_type or texture_type).strip().lower() or texture_type
+        semantic_subtype = str(registered.semantic_subtype or texture_type).strip().lower() or texture_type
+        confidence = 100
+        evidence = [
+            f"user classification registry: {texture_type}/{semantic_subtype}",
+            *[item for item in evidence if not item.startswith("user classification registry:")],
+        ]
+        if texture_type in {"color", "ui", "emissive", "impostor", "normal", "roughness", "height", "vector"}:
+            packed_channels = []
 
     return TextureSemanticProfile(
         path=path_value,
@@ -897,7 +914,13 @@ def build_ncnn_retry_tile_candidates(
     requested = max(0, int(tile_size))
     minimum = max(1, int(minimum_tile_size))
     candidates: List[int] = []
-    current = 512 if requested <= 0 else max(0, requested // 2)
+    if requested == 0:
+        for candidate in (512, 256, 128, 64, 32):
+            if candidate >= minimum and candidate not in candidates:
+                candidates.append(candidate)
+        return NcnnRetryPlan(requested_tile_size=requested, candidate_tile_sizes=tuple(candidates))
+
+    current = max(0, requested // 2)
     while current >= minimum:
         if current not in candidates:
             candidates.append(current)
