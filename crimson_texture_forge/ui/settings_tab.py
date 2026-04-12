@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -24,6 +24,10 @@ class SettingsTab(QWidget):
         super().__init__(parent)
         self.settings = settings
         self._settings_ready = False
+        self._settings_save_timer = QTimer(self)
+        self._settings_save_timer.setSingleShot(True)
+        self._settings_save_timer.setInterval(250)
+        self._settings_save_timer.timeout.connect(self._save_settings)
 
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(12, 12, 12, 12)
@@ -97,7 +101,7 @@ class SettingsTab(QWidget):
             self.confirm_workflow_cleanup_checkbox,
             self.confirm_archive_cleanup_checkbox,
         ):
-            checkbox.toggled.connect(self._save_settings)
+            checkbox.toggled.connect(self.schedule_settings_save)
 
         self._load_settings(theme_key)
         self._settings_ready = True
@@ -158,6 +162,16 @@ class SettingsTab(QWidget):
         self.settings.sync()
         self._apply_checkbox_states()
 
+    def schedule_settings_save(self, *_args) -> None:
+        if not self._settings_ready:
+            return
+        self._settings_save_timer.start()
+
+    def flush_settings_save(self) -> None:
+        if self._settings_save_timer.isActive():
+            self._settings_save_timer.stop()
+        self._save_settings()
+
     def _apply_checkbox_states(self) -> None:
         self.prefer_cache_checkbox.setEnabled(self.auto_load_archive_checkbox.isChecked())
 
@@ -180,4 +194,3 @@ class SettingsTab(QWidget):
     def current_theme_key(self) -> str:
         data = self.theme_combo.currentData()
         return str(data) if data is not None else DEFAULT_UI_THEME
-

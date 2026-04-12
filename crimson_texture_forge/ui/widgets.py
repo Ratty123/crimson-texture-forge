@@ -75,17 +75,17 @@ class PreviewLabel(QLabel):
 
     def set_zoom_factor(self, zoom_factor: float) -> None:
         self._zoom_factor = max(0.1, zoom_factor)
-        if self._source_pixmap is not None:
+        if self._has_source_image():
             self._apply_scaled_pixmap(self.text())
 
     def set_fit_to_view(self, fit_to_view: bool) -> None:
         self._fit_to_view = fit_to_view
-        if self._source_pixmap is not None:
+        if self._has_source_image():
             self._apply_scaled_pixmap(self.text())
 
     def set_fit_scale(self, fit_scale: float) -> None:
         self._fit_scale = max(0.5, min(4.0, fit_scale))
-        if self._source_pixmap is not None and self._fit_to_view:
+        if self._has_source_image() and self._fit_to_view:
             self._apply_scaled_pixmap(self.text())
 
     def set_preview_pixmap(self, pixmap: QPixmap, fallback_text: str) -> None:
@@ -114,11 +114,11 @@ class PreviewLabel(QLabel):
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
-        if self._source_pixmap is not None:
+        if self._has_source_image():
             self._apply_scaled_pixmap(self.text())
 
     def _handle_viewport_resize(self) -> None:
-        if self._source_pixmap is not None and self._fit_to_view:
+        if self._has_source_image() and self._fit_to_view:
             self._apply_scaled_pixmap(self.text())
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
@@ -158,8 +158,7 @@ class PreviewLabel(QLabel):
         delta_y = event.angleDelta().y()
         if (
             self._wheel_zoom_handler is not None
-            and self._source_pixmap is not None
-            and not self._source_pixmap.isNull()
+            and self._has_source_image()
             and delta_y != 0
         ):
             step = 1 if delta_y > 0 else -1
@@ -169,10 +168,15 @@ class PreviewLabel(QLabel):
         super().wheelEvent(event)
 
     def _can_pan(self) -> bool:
-        if self._source_pixmap is None or self._source_pixmap.isNull() or self._scroll_area is None:
+        if not self._has_source_image() or self._scroll_area is None:
             return False
         viewport = self._scroll_area.viewport().size()
         return self.width() > viewport.width() or self.height() > viewport.height()
+
+    def _has_source_image(self) -> bool:
+        return (
+            self._source_pixmap is not None and not self._source_pixmap.isNull()
+        ) or bool(self._source_image_path)
 
     def _update_cursor(self) -> None:
         if self._drag_active:
@@ -569,7 +573,10 @@ class LogHighlighter(QSyntaxHighlighter):
         re.IGNORECASE,
     )
     _backend_re = re.compile(r"\b(Real-ESRGAN NCNN|ONNX Runtime|chaiNNer|texconv(?:\.exe)?)\b", re.IGNORECASE)
-    _correction_mode_re = re.compile(r"\b(Match Mean Luma|Match Levels|Match Histogram)\b", re.IGNORECASE)
+    _correction_mode_re = re.compile(
+        r"\b(Match Mean Luma|Match Levels|Match Histogram|Source Match Balanced|Source Match Extended|Source Match Experimental)\b",
+        re.IGNORECASE,
+    )
     _texture_type_re = re.compile(r"\[(color|ui|emissive|impostor|normal|height|vector|roughness|mask|unknown)\]")
     _key_value_re = re.compile(r"\b([a-z_]+)=([^\s,;()]+)", re.IGNORECASE)
     _label_re = re.compile(
@@ -816,7 +823,7 @@ class QuickStartDialog(QDialog):
               <li>Run a small subset first, then review the output in <b>Compare</b> before trying a larger batch.</li>
             </ol>
             <h3>Backend chooser</h3>
-            <p><b>Safe Upscale Wizard</b> gives you a guided way to pick a backend, choose a safer preset, set direct scale/tile values, enable retry behavior, and configure optional loose export.</p>
+            <p><b>Run Summary</b> gives you a read-only overview of the current sources, backend, texture policy, direct-backend settings, and export behavior before you start.</p>
             <ul>
               <li><b>Disabled</b>: rebuild DDS from existing PNGs or test DDS output settings without upscaling.</li>
               <li><b>Real-ESRGAN NCNN</b>: easiest direct in-app route if you want scale, tile, retry, and optional post correction controlled from the app.</li>
@@ -829,7 +836,7 @@ class QuickStartDialog(QDialog):
               <li>Start with a safer preset.</li>
               <li>Keep automatic rules enabled.</li>
               <li>Remember that presets decide what enters the upscale path, but model choice can still shift brightness, contrast, and detail.</li>
-              <li>Optional post correction such as <b>match_levels</b> or <b>match_histogram</b> only applies to direct NCNN / ONNX runs and only to visible texture classes.</li>
+              <li>Source Match post correction only applies to direct NCNN / ONNX runs, and the app decides per texture whether to apply visible RGB correction, grayscale correction, limited RGB-only correction, or a full skip.</li>
             </ul>
             <h3>Compare and review</h3>
             <p><b>Compare</b> is meant to be the review step before large runs. When the Compare tab is active, the layout gives more room to the previews.</p>
@@ -850,7 +857,7 @@ class QuickStartDialog(QDialog):
               <li><b>Missing NCNN models or ONNX runtime/models</b>: direct backends need working runtime setup plus compatible models.</li>
               <li><b>No matching PNG outputs</b>: if a chain or backend produces no usable PNG output, DDS rebuild has nothing to convert.</li>
               <li><b>Wrong chaiNNer paths</b>: hardcoded chain folders can make chaiNNer read from or write to the wrong place.</li>
-              <li><b>Brightness drift</b>: review in <b>Compare</b>, try a different model, or test direct post correction for visible textures.</li>
+              <li><b>Brightness drift</b>: review in <b>Compare</b>, try a different model, or test a Source Match correction mode.</li>
             </ul>
             <h3>Local state</h3>
             <p>The app auto-saves its settings beside the EXE and also stores archive scan cache beside it.</p>

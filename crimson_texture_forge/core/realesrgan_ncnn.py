@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 import shutil
 import tempfile
 import threading
@@ -17,17 +18,15 @@ from crimson_texture_forge.constants import (
 from crimson_texture_forge.core.common import raise_if_cancelled, run_process_with_cancellation
 from crimson_texture_forge.core.upscale_postprocess import (
     apply_post_upscale_color_correction,
+    build_source_match_plan_for_decision,
     describe_post_upscale_correction_mode,
-    should_apply_post_upscale_correction,
 )
 from crimson_texture_forge.core.upscale_profiles import (
     build_ncnn_retry_tile_candidates,
-    classify_texture_type,
     copy_mod_ready_loose_tree,
     describe_texture_preset,
-    should_upscale_texture,
 )
-from crimson_texture_forge.models import NormalizedConfig
+from crimson_texture_forge.models import NormalizedConfig, TextureProcessingPlan
 
 
 def resolve_ncnn_model_dir(ncnn_exe_path: Optional[Path], explicit_model_dir: Optional[Path]) -> Optional[Path]:
@@ -69,8 +68,9 @@ def build_realesrgan_ncnn_command(
     model_name: str,
     scale: int,
     tile_size: int,
+    extra_args: Sequence[str] = (),
 ) -> List[str]:
-    return [
+    cmd = [
         str(ncnn_exe_path),
         "-i",
         str(input_path),
@@ -87,6 +87,19 @@ def build_realesrgan_ncnn_command(
         "-f",
         "png",
     ]
+    if extra_args:
+        cmd.extend(str(arg) for arg in extra_args if str(arg).strip())
+    return cmd
+
+
+def parse_realesrgan_ncnn_extra_args(raw_text: str) -> List[str]:
+    text = str(raw_text or "").strip()
+    if not text:
+        return []
+    try:
+        return shlex.split(text, posix=True)
+    except ValueError as exc:
+        raise ValueError(f"Real-ESRGAN NCNN extra args are invalid: {exc}") from exc
 
 
 def _run_single_ncnn_attempt(
@@ -95,12 +108,21 @@ def _run_single_ncnn_attempt(
     input_root: Path,
     output_root: Path,
     tile_size: int,
+    processing_plan: Sequence[TextureProcessingPlan] = (),
     on_log: Optional[Callable[[str], None]] = None,
     on_phase_progress: Optional[Callable[[int, int, str], None]] = None,
     on_current_file: Optional[Callable[[str], None]] = None,
     stop_event: Optional[threading.Event] = None,
 ) -> None:
-    png_inputs = sorted(path for path in input_root.rglob("*.png") if path.is_file())
+    plan_entries = [entry for entry in processing_plan if entry.requires_png_processing]
+    if not plan_entries:
+        if on_log:
+            on_log("No PNG files require Real-ESRGAN NCNN processing under the current plan; skipping backend stage.")
+        if on_phase_progress:
+            on_phase_progress(0, 0, "0 / 0 PNG files")
+        return
+
+    png_inputs = [input_root / entry.relative_path.with_suffix(".png") for entry in plan_entries]
     total = len(png_inputs)
     if total == 0:
         raise ValueError(
@@ -113,6 +135,8 @@ def _run_single_ncnn_attempt(
         on_log(f"Real-ESRGAN NCNN model folder: {config.ncnn_model_dir}")
         on_log(f"Real-ESRGAN NCNN model: {config.ncnn_model_name}")
         on_log(f"Real-ESRGAN NCNN scale={config.ncnn_scale}, tile={tile_size}, preset={config.upscale_texture_preset}")
+        if config.ncnn_extra_args.strip():
+            on_log(f"Real-ESRGAN NCNN extra args={config.ncnn_extra_args}")
         on_log(
             f"Real-ESRGAN NCNN post correction={describe_post_upscale_correction_mode(config.upscale_post_correction_mode)}"
         )
@@ -123,18 +147,34 @@ def _run_single_ncnn_attempt(
 
     assert config.ncnn_exe_path is not None
     assert config.ncnn_model_dir is not None
+    parsed_extra_args = parse_realesrgan_ncnn_extra_args(config.ncnn_extra_args)
+
+    plan_by_rel = {entry.relative_path.as_posix(): entry for entry in processing_plan}
 
     for index, input_png in enumerate(png_inputs, start=1):
         raise_if_cancelled(stop_event)
+        if not input_png.exists() or not input_png.is_file():
+            raise ValueError(f"Expected planner-selected PNG does not exist: {input_png}")
         rel_path = input_png.relative_to(input_root)
         rel_display = rel_path.as_posix()
-        texture_type = classify_texture_type(rel_display)
+        plan_entry = plan_by_rel.get(rel_path.with_suffix(".dds").as_posix()) or plan_by_rel.get(rel_display.replace(".png", ".dds"))
+        if plan_entry is None:
+            raise ValueError(f"Missing planner entry for NCNN input: {rel_display}")
+        decision = plan_entry.decision
+        correction_plan = build_source_match_plan_for_decision(
+            config.upscale_post_correction_mode,
+            decision,
+            direct_backend_supported=True,
+            planner_path_kind=plan_entry.path_kind,
+            planner_profile_key=plan_entry.profile.key,
+        )
+        texture_type = decision.texture_type or "unknown"
         output_png = output_root / rel_path
         output_png.parent.mkdir(parents=True, exist_ok=True)
         if on_current_file:
             on_current_file(f"Upscale: {rel_display}")
 
-        if should_upscale_texture(texture_type, config.upscale_texture_preset):
+        if plan_entry.action == "upscale_then_rebuild":
             cmd = build_realesrgan_ncnn_command(
                 config.ncnn_exe_path,
                 input_path=input_png,
@@ -143,6 +183,7 @@ def _run_single_ncnn_attempt(
                 model_name=config.ncnn_model_name,
                 scale=config.ncnn_scale,
                 tile_size=tile_size,
+                extra_args=parsed_extra_args,
             )
             action = "DRYRUN" if config.dry_run else "UPSCALE"
             if on_log:
@@ -154,25 +195,21 @@ def _run_single_ncnn_attempt(
                     raise ValueError(f"Real-ESRGAN NCNN failed for {rel_display}: {detail}")
                 if config.upscale_post_correction_mode != UPSCALE_POST_CORRECTION_NONE:
                     raise_if_cancelled(stop_event)
-                    if should_apply_post_upscale_correction(texture_type):
-                        correction_result = apply_post_upscale_color_correction(
-                            input_png,
-                            output_png,
-                            config.upscale_post_correction_mode,
-                        )
-                        if on_log and correction_result.applied:
-                            on_log(f"[{index}/{total}] CORRECT {rel_display} [{texture_type}] -> {correction_result.detail}")
-                    elif on_log:
+                    correction_result = apply_post_upscale_color_correction(
+                        input_png,
+                        output_png,
+                        config.upscale_post_correction_mode,
+                        correction_plan=correction_plan,
+                    )
+                    if on_log and correction_result.applied:
+                        on_log(f"[{index}/{total}] CORRECT {rel_display} [{texture_type}] -> {correction_result.detail}")
+                    elif on_log and correction_result.correction_action == "skip":
                         on_log(
                             f"[{index}/{total}] SKIP CORRECTION {rel_display} [{texture_type}] "
-                            "-> limited to visible color, UI, emissive, and impostor textures."
+                            f"-> {correction_result.correction_reason}"
                         )
         else:
-            action = "DRYRUN COPY" if config.dry_run else "COPY"
-            if on_log:
-                on_log(f"[{index}/{total}] {action} {rel_display} [{texture_type}] -> preset keeps source PNG")
-            if not config.dry_run:
-                shutil.copy2(input_png, output_png)
+            raise ValueError(f"Planner selected unexpected NCNN action for {rel_display}: {plan_entry.action}")
 
         if on_phase_progress:
             on_phase_progress(index, total, f"{index} / {total} PNG files")
@@ -181,6 +218,7 @@ def _run_single_ncnn_attempt(
 def run_realesrgan_ncnn_stage(
     config: NormalizedConfig,
     *,
+    processing_plan: Sequence[TextureProcessingPlan] = (),
     on_log: Optional[Callable[[str], None]] = None,
     on_phase: Optional[Callable[[str, str, bool], None]] = None,
     on_phase_progress: Optional[Callable[[int, int, str], None]] = None,
@@ -197,11 +235,11 @@ def run_realesrgan_ncnn_stage(
         raise ValueError(f"Real-ESRGAN NCNN input folder does not exist: {input_root}")
 
     retry_plan = build_ncnn_retry_tile_candidates(config.ncnn_tile_size, include_full_frame_fallback=False)
-    candidate_tiles = retry_plan.candidate_tile_sizes or (max(0, int(config.ncnn_tile_size)),)
+    candidate_tiles = (retry_plan.requested_tile_size, *retry_plan.candidate_tile_sizes)
     attempt_tiles = (
         candidate_tiles
         if config.retry_smaller_tile_on_failure and not config.dry_run
-        else (candidate_tiles[0],)
+        else (retry_plan.requested_tile_size,)
     )
 
     last_error: Optional[Exception] = None
@@ -225,6 +263,7 @@ def run_realesrgan_ncnn_stage(
                 input_root=input_root,
                 output_root=attempt_output_root,
                 tile_size=tile_size,
+                processing_plan=processing_plan,
                 on_log=on_log,
                 on_phase_progress=on_phase_progress,
                 on_current_file=on_current_file,

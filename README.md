@@ -34,8 +34,11 @@ The app is intentionally focused on **read-only archive access** and **loose-fil
 - DDS rebuild with configurable format, size, and mip behavior
 - direct backend support for `Real-ESRGAN NCNN` and `ONNX Runtime`
 - external `chaiNNer` support for users who already have a working chain
-- `Safe Upscale Wizard` for guided backend and preset setup
-- `Texture Policy` presets, family-aware suffix classification, and automatic rules for safer handling of technical maps
+- `Run Summary` dialog for a read-only overview of sources, backend, and texture policy before you start
+- `Texture Policy` presets, family-aware suffix classification, planner-aware automatic safety rules, and safer preserve/high-precision handling for technical maps
+- optional expert override to force technical maps through the generic PNG/upscale path when you explicitly want unsafe technical processing
+- automatic `Source Match` post-correction modes for direct `NCNN` / `ONNX` runs
+- optional `NCNN extra args` for advanced direct `Real-ESRGAN NCNN` flags such as `-dn 0.2`
 - `Preview Policy` to inspect the planned per-texture action before `Start`
 - compare view with shared preview-size presets, per-side zoom, mouse-wheel zoom, drag pan, `Sync Pan`, and focused compare layout
 - `Research` tools for shared classifier output, grouped texture sets, sidecar/reference discovery, texture analysis, heatmap views, and local notes
@@ -76,6 +79,7 @@ Use this when you want:
 - the simplest in-app direct upscale path
 - a portable external executable + local model folder
 - direct scale/tile controls in the app
+- optional advanced flags through `NCNN extra args`
 
 Setup support in the app includes:
 
@@ -117,7 +121,9 @@ What it does:
 
 - classifies textures into kinds such as `color`, `normal`, `mask`, `height`, `ui`, `emissive`, and `unknown`
 - applies presets that decide which kinds are safe to process
-- uses automatic rules to preserve higher-risk technical DDS files instead of rebuilding them from PNG
+- uses automatic rules to preserve higher-risk technical DDS files instead of blindly rebuilding them from generic PNG output
+- can route eligible non-packed scalar technical DDS files through a safer high-precision path instead of the normal visible-color PNG path
+- can optionally force technical maps through the generic visible-color PNG/upscale path with an explicit expert override, but this is intentionally marked unsafe
 - can use more than file names alone, including texture-family context and preview-derived hints
 - recognizes common explicit names and suffix families such as `_color`, `_normal`, `_subsurface`, `_dmap`, `_n`, `_wn`, `_sp`, `_m`, `_ma`, `_mg`, `_o`, `_disp`, `_dr`, `_op`, `_emc`, and `_emi`
 - treats ambiguous names like `_d` more cautiously instead of assuming they are always safe color/diffuse textures
@@ -125,6 +131,7 @@ What it does:
 What to keep in mind:
 
 - presets control **what gets sent to the upscaler**
+- the expert unsafe technical override can still force preserved technical maps onto the generic visible-color path if you explicitly enable it
 - presets do **not** guarantee visual correctness
 - model choice can still shift brightness, contrast, detail, or color range
 
@@ -142,8 +149,20 @@ Direct `Real-ESRGAN NCNN` and direct `ONNX Runtime` support optional post-upscal
 - `match_mean_luma`
 - `match_levels`
 - `match_histogram`
+- `Source Match Balanced`
+- `Source Match Extended`
+- `Source Match Experimental`
 
-These are intended for visible textures such as:
+`Source Match` modes are the recommended option for most direct-backend runs. They automatically decide per texture whether to:
+
+- apply visible RGB correction
+- apply grayscale/scalar-only correction
+- limit correction to RGB while leaving alpha untouched
+- skip correction entirely when the texture looks technical or unsafe
+
+The older `match_*` modes are still available as simpler visible-texture correction tools.
+
+These correction paths are intended mainly for visible textures such as:
 
 - `color`
 - `ui`
@@ -262,6 +281,8 @@ The DDS output section now also explains the difference between:
 - final PNG output
 - rebuilt DDS output
 
+When automatic safety rules are enabled, the planner can also keep some technical DDS files unchanged or route eligible scalar technical files through a safer high-precision rebuild path instead of treating everything like a normal visible-color PNG workflow.
+
 ## Troubleshooting
 
 ### Missing texconv
@@ -296,7 +317,9 @@ If rebuilt color textures look darker, flatter, or otherwise shifted:
 - compare it in `Compare`
 - try a safer preset
 - try a different model
-- test post correction such as `match_levels` or `match_histogram` on direct NCNN / ONNX
+- try `Source Match Balanced` first on direct `NCNN` / `ONNX`
+- test `match_levels` or `match_histogram` if you want a simpler visible-texture-only correction path
+- remember that automatic texture safety rules are mainly about safer format/preserve policy, not about fixing tonal drift by themselves
 
 ### Too many files are `unknown`
 

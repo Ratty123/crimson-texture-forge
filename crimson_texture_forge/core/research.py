@@ -15,10 +15,14 @@ from crimson_texture_forge.constants import ARCHIVE_IMAGE_EXTENSIONS
 from crimson_texture_forge.core.archive import ArchiveEntry, archive_entry_role, read_archive_entry_data
 from crimson_texture_forge.core.common import raise_if_cancelled
 from crimson_texture_forge.core.pipeline import (
-    collect_compare_relative_paths,
+    _SCALAR_HIGH_PRECISION_MASK_SUBTYPES,
+    build_texture_processing_plan,
     collect_dds_files,
+    describe_processing_path_kind,
     ensure_dds_preview_png,
     max_mips_for_size,
+    normalize_config_for_planning,
+    normalize_config,
     parse_dds,
 )
 from crimson_texture_forge.core.upscale_profiles import (
@@ -26,6 +30,7 @@ from crimson_texture_forge.core.upscale_profiles import (
     infer_texture_semantics,
     is_png_intermediate_high_risk,
 )
+from crimson_texture_forge.models import AppConfig, TextureProcessingPlan
 
 try:
     from PySide6.QtGui import QColor, QImage
@@ -167,6 +172,11 @@ class MipAnalysisRow:
     original_mips: int
     rebuilt_mips: int
     warning_count: int
+    planner_profile: str = ""
+    planner_path_kind: str = ""
+    planner_backend_mode: str = ""
+    planner_alpha_policy: str = ""
+    planner_preserve_reason: str = ""
     warnings: List[str] = field(default_factory=list)
 
 
@@ -177,6 +187,12 @@ class NormalValidationRow:
     texconv_format: str
     size_text: str
     issue_count: int
+    root_path: str = ""
+    planner_profile: str = ""
+    planner_path_kind: str = ""
+    planner_backend_mode: str = ""
+    planner_alpha_policy: str = ""
+    planner_preserve_reason: str = ""
     issues: List[str] = field(default_factory=list)
 
 
@@ -900,12 +916,18 @@ def export_texture_analysis_report(
             "report_type",
             "path",
             "root",
+            "root_path",
             "original_format",
             "rebuilt_format",
             "original_size",
             "rebuilt_size",
             "original_mips",
             "rebuilt_mips",
+            "planner_profile",
+            "planner_path_kind",
+            "planner_backend_mode",
+            "planner_alpha_policy",
+            "planner_preserve_reason",
             "format",
             "size",
             "issue_count",
@@ -924,6 +946,12 @@ def export_texture_analysis_report(
                     "rebuilt_size": row.rebuilt_size,
                     "original_mips": row.original_mips,
                     "rebuilt_mips": row.rebuilt_mips,
+                    "planner_profile": row.planner_profile,
+                    "planner_path_kind": row.planner_path_kind,
+                    "planner_backend_mode": row.planner_backend_mode,
+                    "planner_alpha_policy": row.planner_alpha_policy,
+                    "planner_preserve_reason": row.planner_preserve_reason,
+                    "root_path": "",
                     "issue_count": row.warning_count,
                     "summary": " | ".join(row.warnings),
                 }
@@ -934,6 +962,12 @@ def export_texture_analysis_report(
                     "report_type": "normal",
                     "path": row.path,
                     "root": row.root_label,
+                    "root_path": row.root_path,
+                    "planner_profile": row.planner_profile,
+                    "planner_path_kind": row.planner_path_kind,
+                    "planner_backend_mode": row.planner_backend_mode,
+                    "planner_alpha_policy": row.planner_alpha_policy,
+                    "planner_preserve_reason": row.planner_preserve_reason,
                     "format": row.texconv_format,
                     "size": row.size_text,
                     "issue_count": row.issue_count,
@@ -941,6 +975,23 @@ def export_texture_analysis_report(
                 }
             )
     return report_path
+
+
+def build_processing_plan_lookup(
+    app_config: AppConfig,
+    *,
+    original_root_override: Optional[Path] = None,
+    stop_event: Optional[object] = None,
+) -> Dict[str, TextureProcessingPlan]:
+    working_config = AppConfig(**asdict(app_config))
+    if original_root_override is not None:
+        working_config.original_dds_root = str(original_root_override)
+    normalized = normalize_config_for_planning(working_config)
+    if not normalized.original_dds_root.exists():
+        return {}
+    dds_files = collect_dds_files(normalized.original_dds_root, (), stop_event=stop_event)
+    plan = build_texture_processing_plan(normalized, dds_files)
+    return {entry.relative_path.as_posix(): entry for entry in plan}
 
 
 def _format_bytes(value: int) -> str:
@@ -1132,6 +1183,63 @@ def _compare_preview_stats(original: Optional[TexturePreviewStats], rebuilt: Opt
     return warnings
 
 
+def _planner_path_specific_mip_warnings(
+    plan_entry: Optional[TextureProcessingPlan],
+    original_dds: "DdsInfo",
+    rebuilt_dds: "DdsInfo",
+    texture_type: str,
+) -> List[str]:
+    if plan_entry is None:
+        return []
+
+    warnings: List[str] = []
+    path_kind = str(plan_entry.path_kind or "").strip().lower()
+    rebuilt_format = rebuilt_dds.texconv_format.upper()
+    original_format = original_dds.texconv_format.upper()
+    semantic_subtype = str(getattr(plan_entry.decision, "semantic_subtype", "") or "").strip().lower()
+    scalar_friendly_semantic = (
+        texture_type in {"height", "roughness"}
+        or (texture_type == "mask" and semantic_subtype in _SCALAR_HIGH_PRECISION_MASK_SUBTYPES)
+    )
+
+    if path_kind == "technical_high_precision_path":
+        if texture_type not in {"height", "roughness", "mask"}:
+            warnings.append("Technical high-precision path was used for a non-scalar texture classification; verify planner routing.")
+        if rebuilt_format.endswith("_SRGB"):
+            warnings.append("Technical high-precision path rebuilt into an sRGB DDS format, which is suspicious for scalar technical data.")
+        if scalar_friendly_semantic and rebuilt_format not in {"BC4_UNORM", "BC4_SNORM", "R8_UNORM", "R16_UNORM"}:
+            warnings.append("Technical high-precision scalar map did not rebuild into a typical scalar-friendly DDS format.")
+        if texture_type == "mask" and plan_entry.alpha_policy == "none" and rebuilt_dds.has_alpha:
+            warnings.append("Technical high-precision mask path unexpectedly rebuilt with alpha capability.")
+        if rebuilt_dds.width != original_dds.width or rebuilt_dds.height != original_dds.height:
+            warnings.append("Technical high-precision path changed dimensions; verify that scalar data still aligns with the source.")
+        if "FLOAT" in original_format or "SNORM" in original_format:
+            warnings.append("Original DDS format is float/snorm, but the current high-precision path is still not a true float-preserving runtime path.")
+    elif path_kind == "visible_color_png_path" and texture_type in {"height", "roughness", "mask", "vector"}:
+        warnings.append("Technical texture appears to have used the generic visible-color path; verify planner routing.")
+
+    return warnings
+
+
+def _planner_path_specific_normal_warnings(
+    plan_entry: Optional[TextureProcessingPlan],
+    info: "DdsInfo",
+) -> List[str]:
+    if plan_entry is None:
+        return []
+    warnings: List[str] = []
+    path_kind = str(plan_entry.path_kind or "").strip().lower()
+    if path_kind == "technical_high_precision_path":
+        warnings.append("Normal map was routed to the technical high-precision scalar path, which is suspicious.")
+    elif path_kind == "visible_color_png_path":
+        warnings.append("Normal map was routed to the generic visible-color path, which is suspicious.")
+    if plan_entry.alpha_policy == "premultiplied":
+        warnings.append("Normal map is marked premultiplied, which usually indicates incorrect semantic routing.")
+    if ("FLOAT" in info.texconv_format.upper() or "SNORM" in info.texconv_format.upper()) and path_kind != "technical_preserve_path":
+        warnings.append("Precision-sensitive normal format is not on the technical preserve path; verify planner routing.")
+    return warnings
+
+
 def _dedupe_preserve_order(messages: Sequence[str]) -> List[str]:
     seen: set[str] = set()
     deduped: List[str] = []
@@ -1227,6 +1335,18 @@ def _format_preview_pair_section(label: str, stats: Optional[TexturePreviewStats
     ]
 
 
+def _collect_matching_compare_relative_paths(original_root: Path, rebuilt_root: Path) -> List[str]:
+    original_paths = {
+        path.relative_to(original_root).as_posix()
+        for path in collect_dds_files(original_root, ())
+    }
+    rebuilt_paths = {
+        path.relative_to(rebuilt_root).as_posix()
+        for path in collect_dds_files(rebuilt_root, ())
+    }
+    return sorted(original_paths.intersection(rebuilt_paths))
+
+
 def build_mip_analysis_detail(
     original_root: Path,
     rebuilt_root: Path,
@@ -1238,7 +1358,7 @@ def build_mip_analysis_detail(
     original_path = original_root / relative
     rebuilt_path = rebuilt_root / relative
     family_members_by_path = _build_family_members_by_relative_path(
-        [path.as_posix() for path in collect_compare_relative_paths(original_root, rebuilt_root)]
+        _collect_matching_compare_relative_paths(original_root, rebuilt_root)
     )
     family_members = family_members_by_path.get(row.relative_path, ())
     texture_type, confidence, reason = classify_texture_path(row.relative_path, family_members=family_members)
@@ -1250,11 +1370,18 @@ def build_mip_analysis_detail(
         "- It checks header-level DDS settings first, then uses texconv previews when available for a safer visual check.",
         "",
         f"Texture semantic hint: {texture_type} ({confidence}% confidence, {reason})",
+        f"Planner profile: {row.planner_profile or 'unavailable'}",
+        f"Planner path: {row.planner_path_kind or 'unavailable'}",
+        f"Planner path detail: {describe_processing_path_kind(row.planner_path_kind) if row.planner_path_kind else 'unavailable'}",
+        f"Planner backend mode: {row.planner_backend_mode or 'unavailable'}",
+        f"Planner alpha policy: {row.planner_alpha_policy or 'unavailable'}",
         f"Original DDS: {original_path}",
         f"Rebuilt DDS: {rebuilt_path}",
         f"Original header: {row.original_size} | {row.original_format} | mips={row.original_mips}",
         f"Rebuilt header: {row.rebuilt_size} | {row.rebuilt_format} | mips={row.rebuilt_mips}",
     ]
+    if row.planner_preserve_reason:
+        detail_lines.append(f"Planner preserve reason: {row.planner_preserve_reason}")
     size_summary, size_warnings = _compare_file_sizes(original_path, rebuilt_path)
     compare_warnings: List[str] = []
     detail_lines.extend(["", size_summary])
@@ -1339,11 +1466,19 @@ def build_normal_validation_detail(
         "- This row comes from scanning normal-like DDS files in one root independently.",
         "- It checks format, dimensions, preview stability, and normal-map integrity signals.",
         "",
+        f"Root label: {row.root_label}",
         f"Source root: {root}",
         f"Source path: {source_path}",
         f"Format: {row.texconv_format}",
         f"Size: {row.size_text}",
+        f"Planner profile: {row.planner_profile or 'unavailable'}",
+        f"Planner path: {row.planner_path_kind or 'unavailable'}",
+        f"Planner path detail: {describe_processing_path_kind(row.planner_path_kind) if row.planner_path_kind else 'unavailable'}",
+        f"Planner backend mode: {row.planner_backend_mode or 'unavailable'}",
+        f"Planner alpha policy: {row.planner_alpha_policy or 'unavailable'}",
     ]
+    if row.planner_preserve_reason:
+        detail_lines.append(f"Planner preserve reason: {row.planner_preserve_reason}")
 
     if texconv_path is not None and texconv_path.exists() and source_path.exists():
         try:
@@ -1400,10 +1535,11 @@ def analyze_mip_behavior(
     *,
     texconv_path: Optional[Path] = None,
     limit: int = 3000,
+    processing_plan_lookup: Optional[Dict[str, TextureProcessingPlan]] = None,
     stop_event: Optional[object] = None,
 ) -> List[MipAnalysisRow]:
     rows: List[MipAnalysisRow] = []
-    compare_relative_paths = [path.as_posix() for path in collect_compare_relative_paths(original_root, rebuilt_root)]
+    compare_relative_paths = _collect_matching_compare_relative_paths(original_root, rebuilt_root)
     family_members_by_path = _build_family_members_by_relative_path(compare_relative_paths)
     for relative_path_text in compare_relative_paths:
         raise_if_cancelled(stop_event)
@@ -1411,6 +1547,7 @@ def analyze_mip_behavior(
         original_path = original_root / relative_path
         rebuilt_path = rebuilt_root / relative_path
         family_members = family_members_by_path.get(relative_path_text, ())
+        plan_entry = (processing_plan_lookup or {}).get(relative_path_text)
         try:
             original_dds = parse_dds(original_path)
             rebuilt_dds = parse_dds(rebuilt_path)
@@ -1425,6 +1562,11 @@ def analyze_mip_behavior(
                     original_mips=0,
                     rebuilt_mips=0,
                     warning_count=1,
+                    planner_profile=plan_entry.profile.key if plan_entry is not None else "",
+                    planner_path_kind=plan_entry.path_kind if plan_entry is not None else "",
+                    planner_backend_mode=plan_entry.backend_capability.execution_mode if plan_entry is not None else "",
+                    planner_alpha_policy=plan_entry.alpha_policy if plan_entry is not None else "",
+                    planner_preserve_reason=plan_entry.preserve_reason if plan_entry is not None else "",
                     warnings=[f"Could not parse DDS headers: {exc}"],
                 )
             )
@@ -1457,8 +1599,19 @@ def analyze_mip_behavior(
         if original_dds.has_alpha != rebuilt_dds.has_alpha:
             warnings.append("Alpha capability changed between original and rebuilt DDS.")
         texture_type = classify_texture_path(relative_path_text, family_members=family_members)[0]
+        warnings.extend(
+            _planner_path_specific_mip_warnings(
+                plan_entry,
+                original_dds,
+                rebuilt_dds,
+                texture_type,
+            )
+        )
         if is_png_intermediate_high_risk(texture_type, original_dds.texconv_format):
-            warnings.append("Source format is precision-sensitive; PNG intermediates can hide detail loss.")
+            if plan_entry is not None and str(plan_entry.path_kind).strip().lower() == "technical_high_precision_path":
+                warnings.append("Source format is precision-sensitive; the high-precision path reduces generic PNG loss risk, but careful review is still required.")
+            else:
+                warnings.append("Source format is precision-sensitive; PNG intermediates can hide detail loss.")
         if texconv_path is not None and texconv_path.exists():
             original_preview: Optional[TexturePreviewStats]
             rebuilt_preview: Optional[TexturePreviewStats]
@@ -1496,6 +1649,11 @@ def analyze_mip_behavior(
                 original_mips=original_dds.mip_count,
                 rebuilt_mips=rebuilt_dds.mip_count,
                 warning_count=len(warnings),
+                planner_profile=plan_entry.profile.key if plan_entry is not None else "",
+                planner_path_kind=plan_entry.path_kind if plan_entry is not None else "",
+                planner_backend_mode=plan_entry.backend_capability.execution_mode if plan_entry is not None else "",
+                planner_alpha_policy=plan_entry.alpha_policy if plan_entry is not None else "",
+                planner_preserve_reason=plan_entry.preserve_reason if plan_entry is not None else "",
                 warnings=warnings,
             )
         )
@@ -1544,10 +1702,13 @@ def _sample_image_channel_stats(image_path: Path) -> Optional[Dict[str, float]]:
 def validate_normal_maps(
     root: Path,
     *,
+    root_label: Optional[str] = None,
     texconv_path: Optional[Path] = None,
     limit: int = 1500,
+    processing_plan_lookup: Optional[Dict[str, TextureProcessingPlan]] = None,
     stop_event: Optional[object] = None,
 ) -> List[NormalValidationRow]:
+    display_root_label = (root_label or root.name or str(root)).strip() or str(root)
     dds_files = collect_dds_files(root, ())
     grouped_by_key: Dict[str, List[Path]] = defaultdict(list)
     for dds_path in dds_files:
@@ -1573,6 +1734,7 @@ def validate_normal_maps(
         texture_type, _confidence, _reason = classify_texture_path(relative_path, family_members=family_member_paths)
         if texture_type != "normal":
             continue
+        plan_entry = (processing_plan_lookup or {}).get(relative_path)
         issues: List[str] = []
         try:
             info = parse_dds(dds_path)
@@ -1580,10 +1742,16 @@ def validate_normal_maps(
             rows.append(
                 NormalValidationRow(
                     path=relative_path,
-                    root_label=root.name or str(root),
+                    root_label=display_root_label,
+                    root_path=str(root),
                     texconv_format="-",
                     size_text="-",
                     issue_count=1,
+                    planner_profile=plan_entry.profile.key if plan_entry is not None else "",
+                    planner_path_kind=plan_entry.path_kind if plan_entry is not None else "",
+                    planner_backend_mode=plan_entry.backend_capability.execution_mode if plan_entry is not None else "",
+                    planner_alpha_policy=plan_entry.alpha_policy if plan_entry is not None else "",
+                    planner_preserve_reason=plan_entry.preserve_reason if plan_entry is not None else "",
                     issues=[f"DDS header parse failed: {exc}"],
                 )
             )
@@ -1599,6 +1767,7 @@ def validate_normal_maps(
             issues.append("Dimensions are not power-of-two.")
         if ("BC" in info.texconv_format or info.texconv_format.startswith("R")) and (info.width % 4 != 0 or info.height % 4 != 0):
             issues.append("Compressed DDS dimensions are not aligned to a 4x4 block size.")
+        issues.extend(_planner_path_specific_normal_warnings(plan_entry, info))
 
         color_partner = next(
             (
@@ -1645,10 +1814,16 @@ def validate_normal_maps(
         rows.append(
             NormalValidationRow(
                 path=relative_path,
-                root_label=root.name or str(root),
+                root_label=display_root_label,
+                root_path=str(root),
                 texconv_format=info.texconv_format,
                 size_text=f"{info.width}x{info.height}",
                 issue_count=len(issues),
+                planner_profile=plan_entry.profile.key if plan_entry is not None else "",
+                planner_path_kind=plan_entry.path_kind if plan_entry is not None else "",
+                planner_backend_mode=plan_entry.backend_capability.execution_mode if plan_entry is not None else "",
+                planner_alpha_policy=plan_entry.alpha_policy if plan_entry is not None else "",
+                planner_preserve_reason=plan_entry.preserve_reason if plan_entry is not None else "",
                 issues=issues or ["No obvious issues detected."],
             )
         )

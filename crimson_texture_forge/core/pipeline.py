@@ -13,7 +13,7 @@ import sys
 import tempfile
 import threading
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
 
@@ -28,12 +28,17 @@ from crimson_texture_forge.core.common import *
 from crimson_texture_forge.core.chainner import *
 from crimson_texture_forge.core.realesrgan_ncnn import *
 from crimson_texture_forge.core.upscale_onnx import *
+from crimson_texture_forge.core.upscale_postprocess import (
+    build_source_match_plan_for_decision,
+    describe_post_upscale_correction_mode,
+)
 from crimson_texture_forge.core.upscale_profiles import (
     classify_texture_type,
     copy_mod_ready_loose_tree,
     derive_texture_group_key,
     is_png_intermediate_high_risk,
     is_technical_texture_type,
+    should_upscale_texture,
     suggest_texture_upscale_decision,
     TexturePreviewSample,
     TextureUpscaleDecision,
@@ -71,6 +76,166 @@ _LOOSE_SEMANTIC_SIDECAR_EXTENSIONS = {
 _LOOSE_SIDECAR_TEXT_LIMIT = 196_608
 _PREVIEW_CACHE_LOCKS: Dict[str, threading.Lock] = {}
 _PREVIEW_CACHE_LOCKS_GUARD = threading.Lock()
+_VISIBLE_COLOR_TEXTURE_TYPES = frozenset({"color", "ui", "emissive", "impostor"})
+_COMPARE_DISPLAY_PREVIEW_MAX_DIMENSION = 2048
+_VALID_RULE_COLORSPACE_OVERRIDES = frozenset({"srgb", "linear", "match_source"})
+_VALID_RULE_ALPHA_POLICIES = frozenset({"none", "straight", "cutout_coverage", "channel_data", "premultiplied"})
+_VALID_RULE_INTERMEDIATE_OVERRIDES = frozenset(
+    {"visible_color_png_path", "technical_preserve_path", "technical_high_precision_path"}
+)
+_SCALAR_HIGH_PRECISION_MASK_SUBTYPES = frozenset(
+    {
+        "mask",
+        "ao",
+        "grayscale_data",
+        "opacity_mask",
+        "detail_support",
+        "metallic",
+        "specular",
+        "subsurface",
+        "emissive_intensity",
+    }
+)
+
+_DEFAULT_SEMANTIC_SUBTYPES: Dict[str, str] = {
+    "color": "albedo",
+    "ui": "ui",
+    "emissive": "emissive",
+    "impostor": "impostor",
+    "normal": "normal",
+    "height": "height",
+    "vector": "vector",
+    "roughness": "roughness",
+    "mask": "mask",
+    "unknown": "unknown",
+}
+
+_SEMANTIC_OVERRIDE_TEXTURE_TYPES: Dict[str, str] = {
+    "albedo": "color",
+    "albedo_variant": "color",
+    "ui": "ui",
+    "emissive": "emissive",
+    "impostor": "impostor",
+    "normal": "normal",
+    "height": "height",
+    "displacement": "height",
+    "bump": "height",
+    "parallax_height": "height",
+    "vector": "vector",
+    "direction_vector": "vector",
+    "effect_vector": "vector",
+    "pivot_position": "vector",
+    "flow_vector": "vector",
+    "position_vector": "vector",
+    "roughness": "roughness",
+    "mask": "mask",
+    "orm": "mask",
+    "rma": "mask",
+    "mra": "mask",
+    "arm": "mask",
+    "packed_mask": "mask",
+    "opacity_mask": "mask",
+    "material_mask": "mask",
+    "material_response": "mask",
+    "ao": "mask",
+    "metallic": "mask",
+    "specular": "mask",
+    "detail_support": "mask",
+    "subsurface": "mask",
+    "emissive_intensity": "mask",
+    "grayscale_data": "mask",
+    "unknown": "unknown",
+}
+
+_PROFILE_TABLE: Dict[str, TextureProcessingProfile] = {
+    "color_default": TextureProcessingProfile(
+        key="color_default",
+        label="Color Default",
+        allowed_intermediate_kinds=("visible_color_png_path",),
+        preferred_texconv_format="BC7_UNORM_SRGB",
+        colorspace_policy="srgb",
+        alpha_policy="straight",
+        mip_policy_hint="standard_color",
+    ),
+    "color_cutout_alpha": TextureProcessingProfile(
+        key="color_cutout_alpha",
+        label="Color Cutout Alpha",
+        allowed_intermediate_kinds=("visible_color_png_path",),
+        preferred_texconv_format="BC7_UNORM_SRGB",
+        colorspace_policy="srgb",
+        alpha_policy="cutout_coverage",
+        mip_policy_hint="keep_coverage",
+    ),
+    "ui_alpha": TextureProcessingProfile(
+        key="ui_alpha",
+        label="UI Alpha",
+        allowed_intermediate_kinds=("visible_color_png_path",),
+        preferred_texconv_format="BC7_UNORM_SRGB",
+        colorspace_policy="srgb",
+        alpha_policy="straight",
+        mip_policy_hint="ui_alpha_safe",
+    ),
+    "normal_bc5": TextureProcessingProfile(
+        key="normal_bc5",
+        label="Normal BC5",
+        allowed_intermediate_kinds=("technical_preserve_path",),
+        preferred_texconv_format="BC5_UNORM",
+        colorspace_policy="linear",
+        alpha_policy="none",
+        mip_policy_hint="normal_linear",
+        preserve_only=True,
+    ),
+    "scalar_bc4": TextureProcessingProfile(
+        key="scalar_bc4",
+        label="Scalar BC4",
+        allowed_intermediate_kinds=("technical_preserve_path",),
+        preferred_texconv_format="BC4_UNORM",
+        colorspace_policy="linear",
+        alpha_policy="none",
+        mip_policy_hint="scalar_linear",
+        preserve_only=True,
+    ),
+    "scalar_high_precision_bc4": TextureProcessingProfile(
+        key="scalar_high_precision_bc4",
+        label="Scalar High Precision BC4",
+        allowed_intermediate_kinds=("technical_high_precision_path",),
+        preferred_texconv_format="BC4_UNORM",
+        colorspace_policy="linear",
+        alpha_policy="none",
+        mip_policy_hint="scalar_high_precision",
+        preserve_only=False,
+    ),
+    "packed_mask_preserve_layout": TextureProcessingProfile(
+        key="packed_mask_preserve_layout",
+        label="Packed Mask Preserve Layout",
+        allowed_intermediate_kinds=("technical_preserve_path",),
+        preferred_texconv_format="MATCH_ORIGINAL",
+        colorspace_policy="linear",
+        alpha_policy="channel_data",
+        mip_policy_hint="preserve_channels",
+        preserve_only=True,
+    ),
+    "premultiplied_alpha_review_required": TextureProcessingProfile(
+        key="premultiplied_alpha_review_required",
+        label="Premultiplied Alpha Review Required",
+        allowed_intermediate_kinds=("technical_preserve_path",),
+        preferred_texconv_format="MATCH_ORIGINAL",
+        colorspace_policy="match_source",
+        alpha_policy="premultiplied",
+        mip_policy_hint="review_required",
+        preserve_only=True,
+    ),
+    "float_or_vector_preserve_only": TextureProcessingProfile(
+        key="float_or_vector_preserve_only",
+        label="Float Or Vector Preserve Only",
+        allowed_intermediate_kinds=("technical_preserve_path",),
+        preferred_texconv_format="MATCH_ORIGINAL",
+        colorspace_policy="match_source",
+        alpha_policy="none",
+        mip_policy_hint="preserve_precision",
+        preserve_only=True,
+    ),
+}
 
 
 def _get_preview_cache_lock(cache_key: str) -> threading.Lock:
@@ -81,16 +246,13 @@ def _get_preview_cache_lock(cache_key: str) -> threading.Lock:
             _PREVIEW_CACHE_LOCKS[cache_key] = lock
         return lock
 
-
-@dataclass(slots=True)
-class TextureProcessingPlanEntry:
-    dds_path: Path
-    relative_path: Path
-    dds_info: DdsInfo
-    decision: TextureUpscaleDecision
-    action: str
-    action_reason: str
-    requires_png_processing: bool
+def _dds_colorspace_intent_from_format(texconv_format: str) -> str:
+    normalized = str(texconv_format or "").strip().upper()
+    if normalized.endswith("_SRGB"):
+        return "srgb"
+    if normalized:
+        return "linear"
+    return "unknown"
 
 def parse_dds(dds_path: Path) -> DdsInfo:
     with dds_path.open("rb") as handle:
@@ -189,6 +351,8 @@ def parse_dds(dds_path: Path) -> DdsInfo:
         texconv_format=texconv_format,
         source_path=dds_path,
         has_alpha=has_alpha,
+        colorspace_intent=_dds_colorspace_intent_from_format(texconv_format),
+        precision_sensitive=("FLOAT" in texconv_format.upper() or "SNORM" in texconv_format.upper()),
     )
 
 
@@ -205,7 +369,7 @@ def read_png_dimensions(png_path: Path) -> Tuple[int, int]:
         return width, height
 
 
-def png_has_alpha_channel(png_path: Path) -> bool:
+def read_png_header_info(png_path: Path) -> Tuple[int, int, int, int]:
     with png_path.open("rb") as handle:
         signature = handle.read(8)
         if signature != PNG_MAGIC:
@@ -214,12 +378,27 @@ def png_has_alpha_channel(png_path: Path) -> bool:
         chunk_type = handle.read(4)
         if chunk_type != b"IHDR" or ihdr_len != 13:
             raise ValueError("PNG IHDR chunk is missing or invalid.")
-        handle.read(8)
-        handle.read(1)
+        width, height = struct.unpack(">II", handle.read(8))
+        bit_depth = handle.read(1)
         color_type = handle.read(1)
-        if len(color_type) != 1:
-            raise ValueError("PNG IHDR color type is missing.")
-        return color_type[0] in {4, 6}
+        if len(bit_depth) != 1 or len(color_type) != 1:
+            raise ValueError("PNG IHDR bit depth or color type is missing.")
+        return width, height, bit_depth[0], color_type[0]
+
+
+def describe_png_color_type(color_type: int) -> str:
+    return {
+        0: "grayscale",
+        2: "rgb",
+        3: "indexed",
+        4: "grayscale_alpha",
+        6: "rgba",
+    }.get(int(color_type), f"unknown({color_type})")
+
+
+def png_has_alpha_channel(png_path: Path) -> bool:
+    _width, _height, _bit_depth, color_type = read_png_header_info(png_path)
+    return color_type in {4, 6}
 
 
 def max_mips_for_size(width: int, height: int) -> int:
@@ -556,6 +735,555 @@ def _linear_variant(texconv_format: str) -> str:
     return mapping.get(texconv_format, texconv_format)
 
 
+def _normalize_alpha_policy(alpha_mode: str) -> str:
+    normalized = str(alpha_mode or "").strip().lower()
+    if normalized == "cutout":
+        return "cutout_coverage"
+    if normalized in {"none", "straight", "channel_data", "premultiplied"}:
+        return normalized
+    return "straight" if normalized else "none"
+
+
+def _semantic_override_components(value: str) -> Tuple[str, str]:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        raise ValueError("Semantic override cannot be empty.")
+    for separator in (":", "/"):
+        if separator in normalized:
+            texture_type, semantic_subtype = [piece.strip() for piece in normalized.split(separator, 1)]
+            if texture_type not in _DEFAULT_SEMANTIC_SUBTYPES:
+                raise ValueError(f"Unsupported semantic override texture type: {texture_type}")
+            if not semantic_subtype:
+                raise ValueError("Semantic override subtype cannot be empty.")
+            return texture_type, semantic_subtype
+    texture_type = _SEMANTIC_OVERRIDE_TEXTURE_TYPES.get(normalized)
+    if texture_type is not None:
+        if normalized in _DEFAULT_SEMANTIC_SUBTYPES:
+            return normalized, _DEFAULT_SEMANTIC_SUBTYPES[normalized]
+        return texture_type, normalized
+    raise ValueError(f"Unsupported semantic override: {value}")
+
+
+def _profile_for_key(key: str) -> TextureProcessingProfile:
+    profile = _PROFILE_TABLE.get(str(key or "").strip().lower())
+    if profile is None:
+        raise ValueError(f"Unsupported texture processing profile: {key}")
+    return profile
+
+
+def _infer_profile_key(
+    decision: TextureUpscaleDecision,
+    alpha_policy: str,
+    dds_info: DdsInfo,
+    explicit_profile: Optional[str] = None,
+) -> str:
+    if explicit_profile:
+        return _profile_for_key(explicit_profile).key
+
+    if decision.precision_sensitive or decision.texture_type == "vector" or "FLOAT" in dds_info.texconv_format.upper() or "SNORM" in dds_info.texconv_format.upper():
+        return "float_or_vector_preserve_only"
+    if alpha_policy == "premultiplied":
+        return "premultiplied_alpha_review_required"
+    if decision.texture_type == "normal":
+        return "normal_bc5"
+    if decision.texture_type in {"height", "roughness"}:
+        return "scalar_high_precision_bc4"
+    if decision.texture_type == "mask":
+        if decision.semantic_subtype in {"orm", "rma", "mra", "arm", "packed_mask", "material_mask", "material_response"} or decision.packed_channels:
+            return "packed_mask_preserve_layout"
+        if (
+            not dds_info.has_alpha
+            and alpha_policy == "none"
+            and decision.semantic_subtype in _SCALAR_HIGH_PRECISION_MASK_SUBTYPES
+        ):
+            return "scalar_high_precision_bc4"
+        return "scalar_bc4"
+    if decision.texture_type == "ui" and alpha_policy in {"straight", "cutout_coverage"} and dds_info.has_alpha:
+        return "ui_alpha"
+    if alpha_policy == "cutout_coverage":
+        return "color_cutout_alpha"
+    return "color_default"
+
+
+def _is_scalar_high_precision_candidate(
+    decision: TextureUpscaleDecision,
+    dds_info: DdsInfo,
+    alpha_policy: str,
+    profile: TextureProcessingProfile,
+) -> bool:
+    if profile.key != "scalar_high_precision_bc4":
+        return False
+    if dds_info.precision_sensitive or decision.precision_sensitive:
+        return False
+    if alpha_policy != "none":
+        return False
+    if decision.packed_channels:
+        return False
+    if decision.texture_type in {"height", "roughness"}:
+        return True
+    if decision.texture_type == "mask" and decision.semantic_subtype in _SCALAR_HIGH_PRECISION_MASK_SUBTYPES:
+        return not dds_info.has_alpha
+    return False
+
+
+def _decision_with_texture_rule_overrides(
+    decision: TextureUpscaleDecision,
+    rule: Optional[TextureRule],
+    dds_info: DdsInfo,
+    *,
+    preset: str,
+) -> TextureUpscaleDecision:
+    if rule is None:
+        return decision
+
+    next_decision = decision
+    notes = list(decision.notes)
+    source_evidence = list(decision.source_evidence)
+
+    if rule.semantic_value:
+        override_type, override_subtype = _semantic_override_components(rule.semantic_value)
+        next_decision = replace(
+            next_decision,
+            texture_type=override_type,
+            semantic_subtype=override_subtype,
+            should_upscale=should_upscale_texture(override_type, preset),
+        )
+        source_evidence.append(f"texture rule semantic override -> {override_type}/{override_subtype}")
+        notes.append(f"texture rule overrides semantic classification to {override_type}/{override_subtype}.")
+
+    if rule.colorspace_value:
+        colorspace_value = str(rule.colorspace_value).strip().lower()
+        target_colorspace = _dds_colorspace_intent_from_format(dds_info.texconv_format) if colorspace_value == "match_source" else colorspace_value
+        next_decision = replace(next_decision, recommended_colorspace=target_colorspace or next_decision.recommended_colorspace)
+        notes.append(f"texture rule overrides colorspace policy to {target_colorspace or 'match_source'}.")
+
+    if rule.alpha_policy_value:
+        alpha_override = str(rule.alpha_policy_value).strip().lower()
+        mapped_alpha_mode = "cutout" if alpha_override == "cutout_coverage" else alpha_override
+        next_decision = replace(
+            next_decision,
+            alpha_mode=mapped_alpha_mode,
+            preserve_alpha=alpha_override != "none" and dds_info.has_alpha,
+        )
+        notes.append(f"texture rule overrides alpha policy to {alpha_override}.")
+
+    if rule.intermediate_value:
+        intermediate = str(rule.intermediate_value).strip().lower()
+        preserve_original = intermediate == "technical_preserve_path"
+        next_decision = replace(
+            next_decision,
+            intermediate_policy="preserve_original" if preserve_original else "png_ok",
+            preserve_original_due_to_intermediate=preserve_original,
+        )
+        notes.append(f"texture rule overrides processing path to {intermediate}.")
+
+    return replace(next_decision, notes=notes, source_evidence=source_evidence)
+
+
+def _plan_path_kind(
+    normalized: NormalizedConfig,
+    decision: TextureUpscaleDecision,
+    profile: TextureProcessingProfile,
+    rule: Optional[TextureRule],
+    dds_info: DdsInfo,
+    alpha_policy: str,
+) -> IntermediateKind | str:
+    if rule is not None and rule.intermediate_value:
+        return str(rule.intermediate_value).strip().lower()
+    if (
+        normalized.enable_unsafe_technical_override
+        and decision.should_upscale
+        and is_technical_texture_type(decision.texture_type)
+    ):
+        return "visible_color_png_path"
+    if _is_scalar_high_precision_candidate(decision, dds_info, alpha_policy, profile):
+        return "technical_high_precision_path"
+    if profile.preserve_only or decision.preserve_original_due_to_intermediate:
+        return "technical_preserve_path"
+    if decision.texture_type in _VISIBLE_COLOR_TEXTURE_TYPES:
+        return "visible_color_png_path"
+    if decision.texture_type == "unknown" and not normalized.enable_automatic_texture_rules and decision.should_upscale:
+        return "visible_color_png_path"
+    return "technical_preserve_path"
+
+
+def _build_backend_capability_matrix(
+    normalized: NormalizedConfig,
+    *,
+    chain_analysis: Optional[ChainnerChainAnalysis] = None,
+) -> BackendCapabilityMatrix:
+    normalized_backend = str(normalized.upscale_backend or "").strip().lower()
+    decisions_by_path_kind: Dict[str, BackendCapabilityDecision] = {
+        "technical_preserve_path": BackendCapabilityDecision(
+            backend=normalized_backend,
+            path_kind="technical_preserve_path",
+            compatible=True,
+            execution_mode="preserve_original",
+            reason="Pass 1 keeps this file on the technical preserve path instead of routing it through a PNG intermediate.",
+        ),
+        "technical_high_precision_path": BackendCapabilityDecision(
+            backend=normalized_backend,
+            path_kind="technical_high_precision_path",
+            compatible=False,
+            execution_mode="preserve_original",
+            reason="Technical high-precision path requires a backend/path combination that has not been enabled for this run.",
+        ),
+    }
+    planner_notes: List[str] = []
+    if normalized.enable_unsafe_technical_override:
+        planner_notes.append(
+            "Expert unsafe technical override is enabled: technical maps may be forced through the generic visible-color PNG path instead of preserve/high-precision paths."
+        )
+
+    if normalized_backend == UPSCALE_BACKEND_NONE:
+        visible_decision = BackendCapabilityDecision(
+            backend=normalized_backend,
+            path_kind="visible_color_png_path",
+            compatible=True,
+            execution_mode="rebuild_from_png",
+            reason="Backend is disabled, so the planner will rebuild DDS from the current PNG input.",
+        )
+        if normalized.enable_dds_staging and normalized.dds_staging_root is not None:
+            decisions_by_path_kind["technical_high_precision_path"] = BackendCapabilityDecision(
+                backend=normalized_backend,
+                path_kind="technical_high_precision_path",
+                compatible=True,
+                execution_mode="rebuild_from_high_precision_png",
+                reason="Backend is disabled, but DDS staging is enabled, so eligible scalar technical maps can rebuild from high-precision staged PNG data.",
+            )
+        else:
+            decisions_by_path_kind["technical_high_precision_path"] = BackendCapabilityDecision(
+                backend=normalized_backend,
+                path_kind="technical_high_precision_path",
+                compatible=True,
+                execution_mode="rebuild_from_high_precision_png",
+                reason="Backend is disabled, so the technical high-precision path will use matching PNG files from PNG root when they are valid 16-bit grayscale intermediates.",
+            )
+    elif normalized_backend == UPSCALE_BACKEND_CHAINNER:
+        if chain_analysis is not None and not chain_analysis.planner_compatible:
+            preview_reasons = "; ".join(chain_analysis.blocking_warnings[:3])
+            extra = "" if len(chain_analysis.blocking_warnings) <= 3 else f" (+{len(chain_analysis.blocking_warnings) - 3} more)"
+            reason = (
+                "chaiNNer is not planner-compatible for the visible-color path with the current chain configuration: "
+                f"{preview_reasons}{extra}"
+            )
+            visible_decision = BackendCapabilityDecision(
+                backend=normalized_backend,
+                path_kind="visible_color_png_path",
+                compatible=False,
+                execution_mode="preserve_original",
+                reason=reason,
+            )
+            planner_notes.extend(chain_analysis.blocking_warnings[:5])
+        else:
+            reason = (
+                "chaiNNer is allowed on the visible-color path when the chain reads from the planned input roots "
+                "and writes planner-selected PNG outputs into the configured PNG root."
+            )
+            if chain_analysis is None:
+                reason += " Runtime chain validation is still pending."
+            visible_decision = BackendCapabilityDecision(
+                backend=normalized_backend,
+                path_kind="visible_color_png_path",
+                compatible=True,
+                execution_mode="upscale_then_rebuild",
+                reason=reason,
+            )
+        decisions_by_path_kind["technical_high_precision_path"] = BackendCapabilityDecision(
+            backend=normalized_backend,
+            path_kind="technical_high_precision_path",
+            compatible=False,
+            execution_mode="preserve_original",
+            reason="chaiNNer is only trusted on the visible-color path in this tranche. Technical high-precision scalar paths stay preserve-first.",
+        )
+    elif normalized_backend in {UPSCALE_BACKEND_REALESRGAN_NCNN, UPSCALE_BACKEND_ONNX_RUNTIME}:
+        visible_decision = BackendCapabilityDecision(
+            backend=normalized_backend,
+            path_kind="visible_color_png_path",
+            compatible=True,
+            execution_mode="upscale_then_rebuild",
+            reason=f"{normalized_backend} is allowed on the visible-color path in this tranche.",
+        )
+        decisions_by_path_kind["technical_high_precision_path"] = BackendCapabilityDecision(
+            backend=normalized_backend,
+            path_kind="technical_high_precision_path",
+            compatible=False,
+            execution_mode="preserve_original",
+            reason=f"{normalized_backend} does not support the technical high-precision path in this tranche.",
+        )
+    else:
+        visible_decision = BackendCapabilityDecision(
+            backend=normalized_backend,
+            path_kind="visible_color_png_path",
+            compatible=False,
+            execution_mode="preserve_original",
+            reason=f"Unsupported upscale backend: {normalized_backend}",
+        )
+
+    decisions_by_path_kind["visible_color_png_path"] = visible_decision
+    return BackendCapabilityMatrix(
+        backend=normalized_backend,
+        decisions_by_path_kind=decisions_by_path_kind,
+        planner_notes=tuple(planner_notes),
+    )
+
+
+def _resolve_backend_capability(
+    backend_matrix: BackendCapabilityMatrix,
+    path_kind: str,
+) -> BackendCapabilityDecision:
+    return backend_matrix.decision_for(path_kind)
+
+
+def _plan_preserve_reason(
+    decision: TextureUpscaleDecision,
+    profile: TextureProcessingProfile,
+    path_kind: str,
+    backend_capability: BackendCapabilityDecision,
+    rule: Optional[TextureRule],
+) -> str:
+    if rule is not None and rule.action == "skip":
+        return f"texture rule matched: {rule.pattern} -> skip"
+    if rule is not None and rule.intermediate_value == "technical_preserve_path":
+        return f"texture rule forces technical preserve path for {decision.texture_type}/{decision.semantic_subtype}"
+    if rule is not None and rule.intermediate_value == "technical_high_precision_path" and not backend_capability.compatible:
+        return backend_capability.reason
+    if not backend_capability.compatible:
+        return backend_capability.reason
+    if path_kind not in {"technical_preserve_path", "technical_high_precision_path"}:
+        return ""
+    if profile.preserve_only:
+        return f"profile {profile.key} is preserve-only for {decision.texture_type}/{decision.semantic_subtype}"
+    if decision.preserve_original_due_to_intermediate:
+        return f"automatic rules preserve {decision.texture_type}/{decision.semantic_subtype}"
+    if path_kind == "technical_high_precision_path":
+        return ""
+    return f"planner preserved {decision.texture_type}/{decision.semantic_subtype} on the technical preserve path"
+
+
+def _lossy_intermediate_warning(decision: TextureUpscaleDecision, path_kind: str) -> str:
+    if path_kind != "visible_color_png_path":
+        return ""
+    if decision.intermediate_policy == "risky_png":
+        return f"Visible-color path still uses a lossy PNG intermediate for {decision.texture_type}/{decision.semantic_subtype}; review the rebuilt DDS carefully."
+    return ""
+
+
+def describe_processing_path_kind(path_kind: str) -> str:
+    normalized = str(path_kind or "").strip().lower()
+    if normalized == "visible_color_png_path":
+        return "Visible-color PNG path: generic 8-bit image staging for color-like textures."
+    if normalized == "technical_preserve_path":
+        return "Technical preserve path: keep the original DDS unchanged because the current workflow is not trusted for this texture."
+    if normalized == "technical_high_precision_path":
+        return "Technical high-precision path: use high-bit-depth staged PNG data for eligible scalar technical textures instead of the generic visible-color path."
+    return f"Unknown planner path: {path_kind}"
+
+
+def _build_texture_processing_plan_entry(
+    normalized: NormalizedConfig,
+    dds_path: Path,
+    rel_path: Path,
+    dds_info: DdsInfo,
+    decision: TextureUpscaleDecision,
+    rule: Optional[TextureRule],
+    backend_matrix: BackendCapabilityMatrix,
+) -> TextureProcessingPlan:
+    decision = _decision_with_texture_rule_overrides(
+        decision,
+        rule,
+        dds_info,
+        preset=normalized.upscale_texture_preset,
+    )
+    base_alpha_policy = _normalize_alpha_policy(decision.alpha_mode)
+    profile = _profile_for_key(_infer_profile_key(decision, base_alpha_policy, dds_info, rule.profile_value if rule else None))
+    alpha_policy = str(rule.alpha_policy_value).strip().lower() if rule and rule.alpha_policy_value else profile.alpha_policy or base_alpha_policy
+    path_kind = _plan_path_kind(normalized, decision, profile, rule, dds_info, alpha_policy)
+    if (
+        normalized.enable_unsafe_technical_override
+        and rule is None
+        and path_kind == "visible_color_png_path"
+        and is_technical_texture_type(decision.texture_type)
+    ):
+        notes = list(decision.notes)
+        notes.append(
+            "expert override forced this technical texture onto the generic visible-color PNG path; expect a higher risk of broken normals, mask drift, or shading errors."
+        )
+        decision = replace(decision, notes=notes)
+    if path_kind == "technical_high_precision_path" and decision.preserve_original_due_to_intermediate:
+        notes = list(decision.notes)
+        notes.append("planner upgraded this scalar technical map from preserve-only to the technical high-precision path.")
+        decision = replace(
+            decision,
+            preserve_original_due_to_intermediate=False,
+            intermediate_policy="high_precision_png",
+            notes=notes,
+        )
+    backend_capability = _resolve_backend_capability(backend_matrix, path_kind)
+    preserve_reason = _plan_preserve_reason(decision, profile, path_kind, backend_capability, rule)
+    lossy_warning = _lossy_intermediate_warning(decision, path_kind)
+
+    dds_info.colorspace_intent = _dds_colorspace_intent_from_format(dds_info.texconv_format)
+    dds_info.precision_sensitive = dds_info.precision_sensitive or decision.precision_sensitive
+    dds_info.packed_channel_risk = bool(decision.packed_channels) or decision.semantic_subtype in {"orm", "rma", "mra", "arm", "packed_mask", "material_mask", "material_response"}
+    dds_info.preserve_only_source = bool(preserve_reason) or profile.preserve_only
+
+    if rule is not None and rule.action == "skip":
+        action = "skip_by_rule"
+        action_reason = preserve_reason
+        requires_png_processing = False
+    elif (
+        normalized.upscale_backend == UPSCALE_BACKEND_NONE
+        and backend_capability.compatible
+        and path_kind in {"visible_color_png_path", "technical_high_precision_path"}
+    ):
+        action = backend_capability.execution_mode
+        action_reason = backend_capability.reason
+        requires_png_processing = action in {"rebuild_from_png", "rebuild_from_high_precision_png"}
+    elif not decision.should_upscale:
+        action = "preserve_original"
+        action_reason = f"preset excludes {decision.texture_type}/{decision.semantic_subtype}"
+        preserve_reason = action_reason
+        requires_png_processing = False
+    elif path_kind == "technical_preserve_path" or not backend_capability.compatible:
+        action = "preserve_original"
+        action_reason = preserve_reason or backend_capability.reason
+        requires_png_processing = False
+    else:
+        action = backend_capability.execution_mode
+        action_reason = backend_capability.reason
+        requires_png_processing = action in {"rebuild_from_png", "rebuild_from_high_precision_png", "upscale_then_rebuild"}
+
+    return TextureProcessingPlan(
+        dds_path=dds_path,
+        relative_path=rel_path,
+        dds_info=dds_info,
+        decision=decision,
+        action=action,
+        action_reason=action_reason,
+        path_kind=path_kind,
+        intermediate_kind=path_kind,
+        profile=profile,
+        alpha_policy=alpha_policy,
+        backend_capability=backend_capability,
+        requires_png_processing=requires_png_processing,
+        preserve_reason=preserve_reason,
+        lossy_intermediate_warning=lossy_warning,
+        matched_rule=rule,
+        semantic_evidence=TextureSemanticEvidence(tuple(decision.source_evidence)),
+    )
+
+
+def build_single_texture_processing_plan(
+    normalized: NormalizedConfig,
+    dds_path: Path,
+    *,
+    relative_path: Optional[Path] = None,
+    decision: Optional[TextureUpscaleDecision] = None,
+    backend_matrix: Optional[BackendCapabilityMatrix] = None,
+) -> TextureProcessingPlan:
+    resolved_relative = relative_path or dds_path.relative_to(normalized.original_dds_root)
+    dds_info = parse_dds(dds_path)
+    resolved_decision = decision or suggest_texture_upscale_decision(
+        resolved_relative.as_posix(),
+        preset=normalized.upscale_texture_preset,
+        original_texconv_format=dds_info.texconv_format,
+        has_alpha=dds_info.has_alpha,
+        enable_automatic_rules=normalized.enable_automatic_texture_rules,
+    )
+    rule = find_matching_texture_rule(resolved_relative, normalized.texture_rules)
+    resolved_backend_matrix = backend_matrix or _build_backend_capability_matrix(normalized)
+    return _build_texture_processing_plan_entry(
+        normalized,
+        dds_path,
+        resolved_relative,
+        dds_info,
+        resolved_decision,
+        rule,
+        resolved_backend_matrix,
+    )
+
+
+def _resolve_plan_output_settings(
+    normalized: NormalizedConfig,
+    plan: TextureProcessingPlan,
+    png_width: int,
+    png_height: int,
+    *,
+    has_alpha: bool,
+) -> DdsOutputSettings:
+    output_settings = resolve_dds_output_settings(normalized, plan.dds_info, png_width, png_height)
+    if plan.matched_rule is not None:
+        updated_settings, _ = apply_texture_rule_to_output_settings(output_settings, plan.matched_rule)
+        if updated_settings is not None:
+            output_settings = updated_settings
+    explicit_rule_format = (
+        str(plan.matched_rule.format_value or "").strip().lower()
+        if plan.matched_rule is not None and plan.matched_rule.format_value
+        else ""
+    )
+    explicit_profile_override = bool(
+        plan.matched_rule is not None and str(plan.matched_rule.profile_value or "").strip()
+    )
+    if normalized.enable_automatic_texture_rules:
+        output_settings = apply_automatic_texture_rule_adjustments(
+            output_settings,
+            plan.relative_path,
+            plan.dds_info,
+            has_alpha=has_alpha,
+            preset=normalized.upscale_texture_preset,
+            intermediate_kind=plan.path_kind,
+            semantic_decision=plan.decision,
+            allow_auto_format_override=(plan.path_kind == "technical_high_precision_path"),
+            prefer_manual_visible_format=(
+                normalized.dds_format_mode == DDS_FORMAT_MODE_MATCH_ORIGINAL
+                and explicit_rule_format == ""
+                and not explicit_profile_override
+            ),
+        )
+
+    allow_profile_format_override = (
+        plan.profile.preferred_texconv_format not in {"", "MATCH_ORIGINAL"}
+        and explicit_rule_format == ""
+        and (
+            explicit_profile_override
+            or plan.path_kind == "technical_high_precision_path"
+        )
+    )
+    if allow_profile_format_override:
+        output_settings.texconv_format = plan.profile.preferred_texconv_format
+    elif (
+        plan.profile.preferred_texconv_format not in {"", "MATCH_ORIGINAL"}
+        and normalized.dds_format_mode == DDS_FORMAT_MODE_MATCH_ORIGINAL
+        and not normalized.enable_automatic_texture_rules
+        and explicit_rule_format == ""
+        and not explicit_profile_override
+    ):
+        output_settings.notes.append(
+            f"planner profile suggests {plan.profile.preferred_texconv_format}, but manual Match original DDS format remains in effect because automatic color/format rules are disabled."
+        )
+    elif (
+        plan.profile.preferred_texconv_format not in {"", "MATCH_ORIGINAL"}
+        and plan.path_kind != "technical_high_precision_path"
+        and explicit_rule_format == ""
+        and not explicit_profile_override
+        and output_settings.texconv_format != plan.profile.preferred_texconv_format
+    ):
+        output_settings.notes.append(
+            f"planner profile suggests {plan.profile.preferred_texconv_format}, but the explicit DDS Output format setting remains in effect."
+        )
+    output_settings.notes.append(f"planner profile: {plan.profile.key}")
+    output_settings.notes.append(f"planner path: {plan.path_kind}")
+    output_settings.notes.append(f"planner alpha policy: {plan.alpha_policy}")
+    if plan.path_kind == "technical_high_precision_path":
+        output_settings.notes.append(
+            "planner path detail: expects a 16-bit grayscale-style PNG intermediate and falls back to preserving the original DDS if that intermediate is missing or invalid."
+        )
+    if plan.lossy_intermediate_warning:
+        output_settings.notes.append(plan.lossy_intermediate_warning)
+    return output_settings
+
+
 def apply_automatic_texture_rule_adjustments(
     output_settings: DdsOutputSettings,
     rel_path: Path,
@@ -563,8 +1291,11 @@ def apply_automatic_texture_rule_adjustments(
     *,
     has_alpha: bool,
     preset: str,
+    intermediate_kind: str = "visible_color_png_path",
     sidecar_texts: Sequence[str] = (),
     semantic_decision: Optional[TextureUpscaleDecision] = None,
+    allow_auto_format_override: bool = True,
+    prefer_manual_visible_format: bool = False,
 ) -> DdsOutputSettings:
     decision = semantic_decision or suggest_texture_upscale_decision(
         rel_path.as_posix(),
@@ -586,18 +1317,23 @@ def apply_automatic_texture_rule_adjustments(
     )
     current_format = next_settings.texconv_format.upper()
     recommended = decision.recommended_texconv_format.upper()
+    preserve_visible_format = (
+        prefer_manual_visible_format
+        and decision.texture_type in _VISIBLE_COLOR_TEXTURE_TYPES
+    )
 
     updated_format = current_format
     if decision.texture_type in {"color", "ui", "emissive", "impostor"}:
-        srgb_candidate = _srgb_variant(current_format)
-        if srgb_candidate != current_format:
-            updated_format = srgb_candidate
-        elif current_format == dds_info.texconv_format.upper() and recommended.endswith("_SRGB"):
-            updated_format = recommended
-    elif decision.texture_type == "normal":
+        if allow_auto_format_override and not preserve_visible_format:
+            srgb_candidate = _srgb_variant(current_format)
+            if srgb_candidate != current_format:
+                updated_format = srgb_candidate
+            elif current_format == dds_info.texconv_format.upper() and recommended.endswith("_SRGB"):
+                updated_format = recommended
+    elif decision.texture_type == "normal" and allow_auto_format_override:
         if current_format.endswith("_SRGB") or current_format not in {"BC5_UNORM", "BC5_SNORM"}:
             updated_format = recommended
-    elif decision.texture_type == "height":
+    elif decision.texture_type == "height" and allow_auto_format_override:
         linear_candidate = _linear_variant(current_format)
         if "FLOAT" in dds_info.texconv_format.upper():
             updated_format = dds_info.texconv_format.upper()
@@ -605,7 +1341,7 @@ def apply_automatic_texture_rule_adjustments(
             updated_format = linear_candidate
         elif current_format.endswith("_SRGB") or current_format not in {"BC4_UNORM", "BC4_SNORM", "R8G8B8A8_UNORM", "B8G8R8A8_UNORM"}:
             updated_format = recommended
-    elif decision.texture_type == "vector":
+    elif decision.texture_type == "vector" and allow_auto_format_override:
         linear_candidate = _linear_variant(current_format)
         if "FLOAT" in dds_info.texconv_format.upper():
             updated_format = dds_info.texconv_format.upper()
@@ -613,10 +1349,10 @@ def apply_automatic_texture_rule_adjustments(
             updated_format = linear_candidate
         elif current_format.endswith("_SRGB") or current_format != dds_info.texconv_format.upper():
             updated_format = recommended
-    elif decision.texture_type == "roughness":
+    elif decision.texture_type == "roughness" and allow_auto_format_override:
         if current_format.endswith("_SRGB") or current_format not in {"BC4_UNORM", "BC4_SNORM"}:
             updated_format = recommended
-    elif decision.texture_type == "mask":
+    elif decision.texture_type == "mask" and allow_auto_format_override:
         linear_candidate = _linear_variant(current_format)
         if linear_candidate != current_format:
             updated_format = linear_candidate
@@ -628,14 +1364,21 @@ def apply_automatic_texture_rule_adjustments(
         next_settings.notes.append(
             f"automatic texture rule: {decision.texture_type}/{decision.semantic_subtype} -> {updated_format}"
         )
+    elif not allow_auto_format_override:
+        next_settings.notes.append(
+            f"automatic texture rule: keeping explicit DDS Output format {current_format}; safety rules are limited to path, alpha, and colorspace handling for this file."
+        )
+    elif preserve_visible_format:
+        next_settings.notes.append(
+            f"automatic texture rule: preserved original visible-texture format {current_format} to avoid unintended luminance shifts under manual Match original DDS format."
+        )
     next_settings.texconv_color_args.clear()
-    if decision.recommended_colorspace == "srgb":
-        if next_settings.texconv_format.upper().endswith("_SRGB"):
-            next_settings.texconv_color_args.extend(["-srgb"])
-        else:
-            next_settings.texconv_color_args.extend(["-srgbi"])
-    elif decision.recommended_colorspace == "linear":
+    if decision.recommended_colorspace == "linear":
         next_settings.texconv_color_args.extend(["--ignore-srgb"])
+    elif decision.recommended_colorspace == "srgb":
+        next_settings.notes.append(
+            "auto-rule: visible texture rebuild keeps PNG pixel values as-is and avoids extra texconv sRGB conversion flags to reduce luminance drift."
+        )
 
     next_settings.texconv_extra_args = [
         arg
@@ -666,9 +1409,13 @@ def apply_automatic_texture_rule_adjustments(
             next_settings.notes.append(
                 f"auto-rule: {decision.texture_type} map is using resized PNG dimensions; verify that the semantic data still makes sense."
             )
-        if is_png_intermediate_high_risk(decision.texture_type, dds_info.texconv_format):
+        if intermediate_kind == "visible_color_png_path" and is_png_intermediate_high_risk(decision.texture_type, dds_info.texconv_format):
             next_settings.notes.append(
                 f"auto-rule: {decision.texture_type} map may lose precision through PNG intermediates; compare carefully against the source."
+            )
+        elif intermediate_kind == "technical_high_precision_path":
+            next_settings.notes.append(
+                f"auto-rule: {decision.texture_type} map is using the technical high-precision path instead of the generic visible-color PNG path."
             )
     if decision.semantic_subtype in {"orm", "rma", "mra", "arm", "packed_mask", "opacity_mask"}:
         next_settings.notes.append(
@@ -849,6 +1596,24 @@ def parse_texture_rules(raw_text: str) -> Tuple[TextureRule, ...]:
                     rule.mip_value = lowered_value
                 else:
                     raise ValueError(f"Texture rule line {line_number} has an invalid mip setting: {value}")
+            elif lowered_key in {"semantic", "semantics"}:
+                _semantic_override_components(value)
+                rule.semantic_value = lowered_value
+            elif lowered_key == "profile":
+                _profile_for_key(lowered_value)
+                rule.profile_value = lowered_value
+            elif lowered_key == "colorspace":
+                if lowered_value not in _VALID_RULE_COLORSPACE_OVERRIDES:
+                    raise ValueError(f"Texture rule line {line_number} has an invalid colorspace override: {value}")
+                rule.colorspace_value = lowered_value
+            elif lowered_key in {"alpha", "alpha_policy"}:
+                if lowered_value not in _VALID_RULE_ALPHA_POLICIES:
+                    raise ValueError(f"Texture rule line {line_number} has an invalid alpha policy override: {value}")
+                rule.alpha_policy_value = lowered_value
+            elif lowered_key in {"intermediate", "path"}:
+                if lowered_value not in _VALID_RULE_INTERMEDIATE_OVERRIDES:
+                    raise ValueError(f"Texture rule line {line_number} has an invalid intermediate override: {value}")
+                rule.intermediate_value = lowered_value
             else:
                 raise ValueError(f"Texture rule line {line_number} has an unknown key: {key}")
 
@@ -1079,14 +1844,17 @@ def _preview_sample_for_unknown_dds(texconv_path: Path, dds_path: Path, texture_
 def build_texture_processing_plan(
     normalized: NormalizedConfig,
     dds_files: Sequence[Path],
-) -> List[TextureProcessingPlanEntry]:
+    *,
+    backend_matrix: Optional[BackendCapabilityMatrix] = None,
+) -> List[TextureProcessingPlan]:
+    resolved_backend_matrix = backend_matrix or _build_backend_capability_matrix(normalized)
     sidecars_by_group, sidecars_by_folder = _build_loose_sidecar_index(normalized.original_dds_root)
     sidecar_text_cache: Dict[Path, str] = {}
     family_members_by_group: Dict[str, List[str]] = defaultdict(list)
     for dds_path in dds_files:
         rel_text = dds_path.relative_to(normalized.original_dds_root).as_posix()
         family_members_by_group[derive_texture_group_key(rel_text)].append(rel_text)
-    plan: List[TextureProcessingPlanEntry] = []
+    plan: List[TextureProcessingPlan] = []
     for dds_path in dds_files:
         rel_path = dds_path.relative_to(normalized.original_dds_root)
         rel_display = rel_path.as_posix()
@@ -1111,36 +1879,16 @@ def build_texture_processing_plan(
             family_members=family_members,
             preview_sample=preview_sample,
         )
-
-        if normalized.enable_automatic_texture_rules and decision.preserve_original_due_to_intermediate:
-            action = "preserve_original"
-            action_reason = f"automatic rules preserve {decision.texture_type}/{decision.semantic_subtype}"
-            requires_png_processing = False
-        elif normalized.upscale_backend == UPSCALE_BACKEND_NONE:
-            action = "rebuild_from_png"
-            action_reason = "using the existing or staged PNG as DDS rebuild input"
-            requires_png_processing = True
-        elif not decision.should_upscale:
-            action = "preserve_original"
-            action_reason = f"preset excludes {decision.texture_type}/{decision.semantic_subtype}"
-            requires_png_processing = False
-        else:
-            action = "upscale_then_rebuild"
-            if decision.intermediate_policy == "risky_png":
-                action_reason = f"upscale then rebuild, but PNG intermediate is risky for {decision.texture_type}/{decision.semantic_subtype}"
-            else:
-                action_reason = f"upscale then rebuild as {decision.texture_type}/{decision.semantic_subtype}"
-            requires_png_processing = True
-
+        rule = find_matching_texture_rule(rel_path, normalized.texture_rules)
         plan.append(
-            TextureProcessingPlanEntry(
-                dds_path=dds_path,
-                relative_path=rel_path,
-                dds_info=dds_info,
-                decision=decision,
-                action=action,
-                action_reason=action_reason,
-                requires_png_processing=requires_png_processing,
+            _build_texture_processing_plan_entry(
+                normalized,
+                dds_path,
+                rel_path,
+                dds_info,
+                decision,
+                rule,
+                resolved_backend_matrix,
             )
         )
     return plan
@@ -1148,7 +1896,7 @@ def build_texture_processing_plan(
 
 def _summarize_policy_size(
     normalized: NormalizedConfig,
-    entry: TextureProcessingPlanEntry,
+    entry: TextureProcessingPlan,
 ) -> str:
     dds_info = entry.dds_info
     if entry.action == "preserve_original":
@@ -1161,6 +1909,10 @@ def _summarize_policy_size(
         estimated_width = max(1, dds_info.width * max(1, normalized.ncnn_scale))
         estimated_height = max(1, dds_info.height * max(1, normalized.ncnn_scale))
         return f"{estimated_width}x{estimated_height} (estimated {normalized.ncnn_scale}x direct backend PNG)"
+    if entry.action == "rebuild_from_high_precision_png" and normalized.enable_dds_staging:
+        return "staged high-precision PNG size (resolved from DDS-to-PNG conversion)"
+    if entry.action == "rebuild_from_high_precision_png":
+        return "existing high-precision PNG size (resolved from PNG root)"
     if normalized.upscale_backend == UPSCALE_BACKEND_NONE and normalized.enable_dds_staging:
         return "staged PNG size (resolved from DDS-to-PNG conversion)"
     return "final PNG size (resolved at rebuild time)"
@@ -1168,7 +1920,7 @@ def _summarize_policy_size(
 
 def _summarize_policy_mips(
     normalized: NormalizedConfig,
-    entry: TextureProcessingPlanEntry,
+    entry: TextureProcessingPlan,
 ) -> str:
     dds_info = entry.dds_info
     if entry.action == "preserve_original":
@@ -1186,47 +1938,57 @@ def build_texture_policy_preview_payload(
     normalized: NormalizedConfig,
     dds_files: Sequence[Path],
     *,
-    processing_plan: Sequence[TextureProcessingPlanEntry] = (),
+    processing_plan: Sequence[TextureProcessingPlan] = (),
+    backend_matrix: Optional[BackendCapabilityMatrix] = None,
 ) -> Dict[str, object]:
-    plan = list(processing_plan) if processing_plan else build_texture_processing_plan(normalized, dds_files)
+    resolved_backend_matrix = backend_matrix or _build_backend_capability_matrix(normalized)
+    plan = list(processing_plan) if processing_plan else build_texture_processing_plan(
+        normalized,
+        dds_files,
+        backend_matrix=resolved_backend_matrix,
+    )
     rows: List[Dict[str, object]] = []
     action_counts: Dict[str, int] = defaultdict(int)
     semantic_counts: Dict[str, int] = defaultdict(int)
+    direct_backend_supported = normalized.upscale_backend in {
+        UPSCALE_BACKEND_REALESRGAN_NCNN,
+        UPSCALE_BACKEND_ONNX_RUNTIME,
+    }
     for entry in plan:
         final_action = entry.action
         final_reason = entry.action_reason
         output_format = entry.dds_info.texconv_format
         detail_notes = list(entry.decision.notes)
-        if entry.action != "preserve_original":
-            output_settings = resolve_dds_output_settings(
+        correction_plan = build_source_match_plan_for_decision(
+            normalized.upscale_post_correction_mode,
+            entry.decision,
+            direct_backend_supported=direct_backend_supported,
+            planner_path_kind=entry.path_kind,
+            planner_profile_key=entry.profile.key,
+        )
+        detail_notes.append(
+            "post-correction: "
+            f"{describe_post_upscale_correction_mode(normalized.upscale_post_correction_mode)} -> "
+            f"{correction_plan.correction_action} ({correction_plan.correction_reason})"
+        )
+        if entry.matched_rule is not None:
+            detail_notes.append(f"matched texture rule: {entry.matched_rule.source_line or entry.matched_rule.pattern}")
+        if entry.preserve_reason:
+            detail_notes.append(f"preserve reason: {entry.preserve_reason}")
+        if entry.lossy_intermediate_warning:
+            detail_notes.append(entry.lossy_intermediate_warning)
+        if entry.action not in {"preserve_original", "skip_by_rule"}:
+            output_settings = _resolve_plan_output_settings(
                 normalized,
-                entry.dds_info,
+                entry,
                 entry.dds_info.width,
                 entry.dds_info.height,
+                has_alpha=entry.dds_info.has_alpha,
             )
-            rule = find_matching_texture_rule(entry.relative_path, normalized.texture_rules)
-            if rule is not None:
-                updated_settings, rule_message = apply_texture_rule_to_output_settings(output_settings, rule)
-                detail_notes.append(rule_message)
-                if updated_settings is None:
-                    final_action = "skip_by_rule"
-                    final_reason = rule_message
-                else:
-                    output_settings = updated_settings
-            if final_action != "skip_by_rule" and normalized.enable_automatic_texture_rules:
-                output_settings = apply_automatic_texture_rule_adjustments(
-                    output_settings,
-                    entry.relative_path,
-                    entry.dds_info,
-                    has_alpha=entry.dds_info.has_alpha,
-                    preset=normalized.upscale_texture_preset,
-                    semantic_decision=entry.decision,
-                )
-            if final_action == "skip_by_rule":
-                output_format = "-"
-            else:
-                output_format = output_settings.texconv_format
-                detail_notes.extend(output_settings.notes)
+            output_format = output_settings.texconv_format
+            detail_notes.extend(output_settings.notes)
+        elif entry.action == "skip_by_rule":
+            output_format = "-"
         action_counts[final_action] += 1
         semantic_counts[entry.decision.semantic_subtype] += 1
         rows.append(
@@ -1236,8 +1998,16 @@ def build_texture_policy_preview_payload(
                 "semantic_subtype": entry.decision.semantic_subtype,
                 "semantic_confidence": entry.decision.semantic_confidence,
                 "alpha_mode": entry.decision.alpha_mode,
+                "alpha_policy": entry.alpha_policy,
                 "packed_channels": list(entry.decision.packed_channels),
                 "intermediate_policy": entry.decision.intermediate_policy,
+                "path_kind": entry.path_kind,
+                "path_description": describe_processing_path_kind(entry.path_kind),
+                "profile_key": entry.profile.key,
+                "profile_label": entry.profile.label,
+                "backend_compatible": entry.backend_capability.compatible,
+                "backend_execution_mode": entry.backend_capability.execution_mode,
+                "backend_reason": entry.backend_capability.reason,
                 "original_format": entry.dds_info.texconv_format,
                 "planned_format": output_format,
                 "size_policy": _summarize_policy_size(normalized, entry),
@@ -1245,6 +2015,11 @@ def build_texture_policy_preview_payload(
                 "action": final_action,
                 "action_reason": final_reason,
                 "requires_png_processing": entry.requires_png_processing,
+                "preserve_reason": entry.preserve_reason,
+                "correction_mode": describe_post_upscale_correction_mode(normalized.upscale_post_correction_mode),
+                "correction_eligibility": correction_plan.correction_eligibility,
+                "correction_action": correction_plan.correction_action,
+                "correction_reason": correction_plan.correction_reason,
                 "source_evidence": list(entry.decision.source_evidence),
                 "notes": detail_notes,
             }
@@ -1257,6 +2032,13 @@ def build_texture_policy_preview_payload(
             "actions": dict(sorted(action_counts.items())),
             "semantic_subtypes": dict(sorted(semantic_counts.items())),
             "backend": normalized.upscale_backend,
+            "backend_visible_path_mode": resolved_backend_matrix.decision_for("visible_color_png_path").execution_mode,
+            "backend_visible_path_allowed": resolved_backend_matrix.decision_for("visible_color_png_path").compatible,
+            "backend_high_precision_path_mode": resolved_backend_matrix.decision_for("technical_high_precision_path").execution_mode,
+            "backend_high_precision_path_allowed": resolved_backend_matrix.decision_for("technical_high_precision_path").compatible,
+            "backend_planner_notes": list(resolved_backend_matrix.planner_notes),
+            "correction_mode": describe_post_upscale_correction_mode(normalized.upscale_post_correction_mode),
+            "path_kinds": dict(sorted((key, sum(1 for entry in plan if entry.path_kind == key)) for key in {entry.path_kind for entry in plan})),
             "png_root": str(normalized.png_root),
             "output_root": str(normalized.output_root),
             "staging_root": str(normalized.dds_staging_root) if normalized.dds_staging_root else "",
@@ -1264,21 +2046,71 @@ def build_texture_policy_preview_payload(
     }
 
 
+def _scan_direct_high_precision_png_inputs(
+    normalized: NormalizedConfig,
+    processing_plan: Sequence[TextureProcessingPlan],
+    *,
+    stop_event: Optional[threading.Event] = None,
+) -> Tuple[int, List[str], List[str]]:
+    if normalized.enable_dds_staging:
+        return 0, [], []
+    planned_entries = [
+        entry
+        for entry in processing_plan
+        if entry.path_kind == "technical_high_precision_path"
+        and entry.action == "rebuild_from_high_precision_png"
+    ]
+    if not planned_entries:
+        return 0, [], []
+
+    relative_index, basename_index, _png_count = find_png_matches(normalized.png_root, stop_event=stop_event)
+    missing_examples: List[str] = []
+    invalid_examples: List[str] = []
+
+    for entry in planned_entries:
+        raise_if_cancelled(stop_event, "Preflight scan cancelled by user.")
+        png_path, match_note = resolve_png(
+            entry.relative_path,
+            relative_index,
+            basename_index,
+            normalized.allow_unique_basename_fallback,
+        )
+        rel_text = entry.relative_path.as_posix()
+        if png_path is None:
+            if len(missing_examples) < 5:
+                missing_examples.append(f"{rel_text} ({match_note})")
+            continue
+        validation_message = _validate_high_precision_staged_png(png_path, entry)
+        if validation_message is not None and len(invalid_examples) < 5:
+            invalid_examples.append(f"{rel_text} ({validation_message})")
+
+    return len(planned_entries), missing_examples, invalid_examples
+
+
 def build_preflight_report_lines(
     normalized: NormalizedConfig,
     dds_files: Sequence[Path],
     *,
-    processing_plan: Sequence[TextureProcessingPlanEntry] = (),
+    processing_plan: Sequence[TextureProcessingPlan] = (),
     chain_analysis: Optional[ChainnerChainAnalysis] = None,
+    backend_matrix: Optional[BackendCapabilityMatrix] = None,
     texture_rules: Sequence[TextureRule] = (),
+    stop_event: Optional[threading.Event] = None,
 ) -> List[str]:
     total_dds_bytes = 0
     texture_type_counts: Dict[str, int] = defaultdict(int)
     semantic_subtype_counts: Dict[str, int] = defaultdict(int)
     action_counts: Dict[str, int] = defaultdict(int)
+    path_kind_counts: Dict[str, int] = defaultdict(int)
+    preserve_reason_counts: Dict[str, int] = defaultdict(int)
     high_risk_examples: List[str] = []
     high_precision_examples: List[str] = []
-    plan_by_rel: Dict[str, TextureProcessingPlanEntry] = {
+    high_precision_path_examples: List[str] = []
+    blocked_high_precision_examples: List[str] = []
+    high_precision_input_scan_total = 0
+    missing_high_precision_input_examples: List[str] = []
+    invalid_high_precision_input_examples: List[str] = []
+    plan_by_rel: Dict[str, TextureProcessingPlan] = {
         entry.relative_path.as_posix(): entry for entry in processing_plan
     }
     policy_examples: List[str] = []
@@ -1293,10 +2125,21 @@ def build_preflight_report_lines(
             texture_type = plan_entry.decision.texture_type
             semantic_subtype = plan_entry.decision.semantic_subtype
             action_counts[plan_entry.action] += 1
+            path_kind_counts[plan_entry.path_kind] += 1
+            if plan_entry.preserve_reason:
+                preserve_reason_counts[plan_entry.preserve_reason] += 1
             semantic_subtype_counts[semantic_subtype] += 1
+            if plan_entry.path_kind == "technical_high_precision_path" and len(high_precision_path_examples) < 5:
+                high_precision_path_examples.append(rel_text)
+            if (
+                plan_entry.path_kind == "technical_high_precision_path"
+                and plan_entry.action == "preserve_original"
+                and len(blocked_high_precision_examples) < 5
+            ):
+                blocked_high_precision_examples.append(f"{rel_text} ({plan_entry.action_reason})")
             if len(policy_examples) < 8:
                 policy_examples.append(
-                    f"{rel_text} -> {plan_entry.action} [{texture_type}/{semantic_subtype}]"
+                    f"{rel_text} -> {plan_entry.action} [{texture_type}/{semantic_subtype}] profile={plan_entry.profile.key} path={plan_entry.path_kind}"
                 )
         else:
             texture_type = classify_texture_type(rel_text)
@@ -1311,6 +2154,15 @@ def build_preflight_report_lines(
                 info = None
             if info is not None and ("FLOAT" in info.texconv_format or "SNORM" in info.texconv_format):
                 high_precision_examples.append(f"{rel_text} [{info.texconv_format}]")
+    (
+        high_precision_input_scan_total,
+        missing_high_precision_input_examples,
+        invalid_high_precision_input_examples,
+    ) = _scan_direct_high_precision_png_inputs(
+        normalized,
+        processing_plan,
+        stop_event=stop_event,
+    )
 
     lines = [
         "Preflight report:",
@@ -1350,6 +2202,19 @@ def build_preflight_report_lines(
             f"- Estimated source DDS data: {total_dds_bytes / (1024 * 1024):.1f} MiB",
         ]
     )
+    if backend_matrix is not None:
+        visible_capability = backend_matrix.decision_for("visible_color_png_path")
+        technical_capability = backend_matrix.decision_for("technical_high_precision_path")
+        lines.append(
+            "- Planner backend matrix: "
+            f"visible_color_png_path={'allow' if visible_capability.compatible else 'preserve'} "
+            f"({visible_capability.execution_mode}), "
+            f"technical_high_precision_path={'allow' if technical_capability.compatible else 'preserve'} "
+            f"({technical_capability.execution_mode})"
+        )
+        if backend_matrix.planner_notes:
+            for note in backend_matrix.planner_notes[:5]:
+                lines.append(f"- Planner backend note: {note}")
     if texture_type_counts:
         type_summary = ", ".join(
             f"{texture_type}={count}"
@@ -1368,6 +2233,32 @@ def build_preflight_report_lines(
             for action, count in sorted(action_counts.items(), key=lambda item: (-item[1], item[0]))
         )
         lines.append(f"- Per-texture policy summary: {action_summary}")
+    if path_kind_counts:
+        path_summary = ", ".join(
+            f"{path_kind}={count}"
+            for path_kind, count in sorted(path_kind_counts.items(), key=lambda item: (-item[1], item[0]))
+        )
+        lines.append(f"- Planner path summary: {path_summary}")
+    if preserve_reason_counts:
+        preserved_due_to_technical = sum(
+            count for reason, count in preserve_reason_counts.items() if "technical preserve path" in reason or "profile" in reason
+        )
+        preserved_due_to_precision = sum(
+            count for reason, count in preserve_reason_counts.items() if "precision" in reason or "float" in reason or "snorm" in reason
+        )
+        preserved_due_to_alpha = sum(
+            count for reason, count in preserve_reason_counts.items() if "alpha" in reason or "premultiplied" in reason
+        )
+        rebuilt_visible = path_kind_counts.get("visible_color_png_path", 0)
+        rebuilt_high_precision = path_kind_counts.get("technical_high_precision_path", 0)
+        lines.append(
+            "- Planner summary counts: "
+            f"technical_preserve={preserved_due_to_technical}, "
+            f"precision_preserve={preserved_due_to_precision}, "
+            f"alpha_preserve={preserved_due_to_alpha}, "
+            f"visible_color_path={rebuilt_visible}, "
+            f"technical_high_precision_path={rebuilt_high_precision}"
+        )
     if policy_examples:
         lines.append("- Policy examples:")
         for example in policy_examples[:6]:
@@ -1381,6 +2272,31 @@ def build_preflight_report_lines(
         lines.append(
             "- Warning: float/snorm DDS formats were detected "
             f"({'; '.join(high_precision_examples[:3])}). PNG intermediates can lose precision for these assets."
+        )
+    if high_precision_path_examples:
+        lines.append(
+            "- Technical high-precision path examples: "
+            + "; ".join(high_precision_path_examples[:3])
+        )
+    if high_precision_input_scan_total:
+        lines.append(
+            "- Technical high-precision PNG input preflight: "
+            f"checked {high_precision_input_scan_total} planned files in PNG root because DDS staging is disabled."
+        )
+    if missing_high_precision_input_examples:
+        lines.append(
+            "- Warning: some planned technical high-precision files have no matching PNG input and will preserve the original DDS: "
+            + "; ".join(missing_high_precision_input_examples[:3])
+        )
+    if invalid_high_precision_input_examples:
+        lines.append(
+            "- Warning: some planned technical high-precision files matched invalid PNG inputs and will preserve the original DDS: "
+            + "; ".join(invalid_high_precision_input_examples[:3])
+        )
+    if blocked_high_precision_examples:
+        lines.append(
+            "- Technical high-precision path blocked under current settings: "
+            + "; ".join(blocked_high_precision_examples[:3])
         )
 
     try:
@@ -1396,6 +2312,8 @@ def build_preflight_report_lines(
         lines.append(
             f"- Real-ESRGAN NCNN scale/tile/preset: {normalized.ncnn_scale}x / tile {normalized.ncnn_tile_size} / {normalized.upscale_texture_preset}"
         )
+        if normalized.ncnn_extra_args:
+            lines.append(f"- Real-ESRGAN NCNN extra args: {normalized.ncnn_extra_args}")
         lines.append(f"- Direct post-upscale correction: {normalized.upscale_post_correction_mode}")
     elif normalized.upscale_backend == UPSCALE_BACKEND_ONNX_RUNTIME:
         lines.append(f"- ONNX model folder: {normalized.onnx_model_dir}")
@@ -1408,11 +2326,18 @@ def build_preflight_report_lines(
         f"- Automatic color/format rules: {'enabled' if normalized.enable_automatic_texture_rules else 'disabled'}"
     )
     lines.append(
+        f"- Expert unsafe technical override: {'enabled' if normalized.enable_unsafe_technical_override else 'disabled'}"
+    )
+    lines.append(
         f"- Retry with smaller tile: {'enabled' if normalized.retry_smaller_tile_on_failure else 'disabled'}"
     )
     if normalized.enable_automatic_texture_rules:
         lines.append(
             "- Automatic rules now keep color-like textures sRGB-aware, prefer BC5 for normals, apply alpha-aware mip hints for cutout data, distinguish grayscale/packed technical maps more explicitly, and preserve original float/vector or packed-data DDS files when the PNG intermediate would be unsafe."
+        )
+    if normalized.enable_unsafe_technical_override:
+        lines.append(
+            "- Warning: expert unsafe technical override is enabled, so technical maps may be forced through the generic visible-color PNG/upscale path instead of being preserved."
         )
     if normalized.upscale_backend != UPSCALE_BACKEND_NONE:
         lines.append(
@@ -1449,13 +2374,68 @@ def collect_compare_relative_paths(original_root: Path, output_root: Path) -> Li
     return sorted(combined)
 
 
-def build_preview_png_command(texconv_path: Path, dds_path: Path, output_dir: Path) -> List[str]:
-    return [
+def build_preview_png_command(
+    texconv_path: Path,
+    dds_path: Path,
+    output_dir: Path,
+    *,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+) -> List[str]:
+    cmd = [
         str(texconv_path),
         "-nologo",
         "-y",
         "-f",
         "R8G8B8A8_UNORM",
+        "-ft",
+        "png",
+        "-o",
+        str(output_dir),
+    ]
+    if width is not None and height is not None and width > 0 and height > 0:
+        cmd.extend(["-w", str(int(width)), "-h", str(int(height))])
+    cmd.append(str(dds_path))
+    return cmd
+
+
+def _staging_png_format_for_plan(entry: TextureProcessingPlan) -> str:
+    if entry.path_kind == "technical_high_precision_path":
+        return "R16_UNORM"
+    return "R8G8B8A8_UNORM"
+
+
+def _validate_high_precision_staged_png(
+    png_path: Path,
+    plan_entry: TextureProcessingPlan,
+) -> Optional[str]:
+    if str(plan_entry.path_kind or "").strip().lower() != "technical_high_precision_path":
+        return None
+    try:
+        _width, _height, bit_depth, color_type = read_png_header_info(png_path)
+    except Exception as exc:
+        return f"Could not validate high-precision staged PNG: {exc}"
+    if bit_depth < 16:
+        return f"Expected a 16-bit staged PNG for the technical high-precision path, but got {bit_depth}-bit {describe_png_color_type(color_type)}."
+    if color_type not in {0, 4}:
+        return f"Expected a grayscale staged PNG for the technical high-precision path, but got {describe_png_color_type(color_type)}."
+    if str(plan_entry.alpha_policy or "").strip().lower() == "none" and color_type == 4:
+        return "Technical high-precision path unexpectedly staged grayscale+alpha PNG data for an alpha-free scalar texture."
+    return None
+
+
+def build_staging_png_command(
+    texconv_path: Path,
+    dds_path: Path,
+    output_dir: Path,
+    entry: TextureProcessingPlan,
+) -> List[str]:
+    return [
+        str(texconv_path),
+        "-nologo",
+        "-y",
+        "-f",
+        _staging_png_format_for_plan(entry),
         "-ft",
         "png",
         "-o",
@@ -1466,8 +2446,12 @@ def build_preview_png_command(texconv_path: Path, dds_path: Path, output_dir: Pa
 
 def ensure_dds_preview_png(texconv_path: Path, dds_path: Path) -> Path:
     stat = dds_path.stat()
+    texconv_stat = texconv_path.stat()
     cache_key = hashlib.sha256(
-        f"{dds_path.resolve()}::{stat.st_size}::{stat.st_mtime_ns}".encode("utf-8")
+        (
+            f"{dds_path.resolve()}::{stat.st_size}::{stat.st_mtime_ns}"
+            f"::{texconv_path.resolve()}::{texconv_stat.st_size}::{texconv_stat.st_mtime_ns}"
+        ).encode("utf-8")
     ).hexdigest()
     cache_dir = Path(tempfile.gettempdir()) / APP_NAME / "preview_cache" / cache_key
     preview_path = cache_dir / f"{dds_path.stem}.png"
@@ -1508,9 +2492,97 @@ def ensure_dds_preview_png(texconv_path: Path, dds_path: Path) -> Path:
     raise ValueError(f"texconv did not produce a PNG preview for {dds_path.name}.")
 
 
+def _preview_resize_dimensions(
+    width: int,
+    height: int,
+    *,
+    max_dimension: int,
+) -> Optional[Tuple[int, int]]:
+    width = int(width)
+    height = int(height)
+    max_dimension = int(max_dimension)
+    if width <= 0 or height <= 0 or max_dimension <= 0:
+        return None
+    longest = max(width, height)
+    if longest <= max_dimension:
+        return None
+    scale = float(max_dimension) / float(longest)
+    target_width = max(1, int(round(width * scale)))
+    target_height = max(1, int(round(height * scale)))
+    return target_width, target_height
+
+
+def ensure_dds_display_preview_png(
+    texconv_path: Path,
+    dds_path: Path,
+    *,
+    dds_info: Optional[DdsInfo] = None,
+    max_dimension: int = _COMPARE_DISPLAY_PREVIEW_MAX_DIMENSION,
+) -> Path:
+    resolved_info = dds_info or parse_dds(dds_path)
+    resize_dims = _preview_resize_dimensions(
+        resolved_info.width,
+        resolved_info.height,
+        max_dimension=max_dimension,
+    )
+    if resize_dims is None:
+        return ensure_dds_preview_png(texconv_path, dds_path)
+
+    stat = dds_path.stat()
+    texconv_stat = texconv_path.stat()
+    target_width, target_height = resize_dims
+    cache_key = hashlib.sha256(
+        (
+            f"display::{dds_path.resolve()}::{stat.st_size}::{stat.st_mtime_ns}"
+            f"::{texconv_path.resolve()}::{texconv_stat.st_size}::{texconv_stat.st_mtime_ns}"
+            f"::{target_width}x{target_height}"
+        ).encode("utf-8")
+    ).hexdigest()
+    cache_dir = Path(tempfile.gettempdir()) / APP_NAME / "preview_cache_display" / cache_key
+    preview_path = cache_dir / f"{dds_path.stem}.png"
+    preview_lock = _get_preview_cache_lock(cache_key)
+
+    with preview_lock:
+        if preview_path.exists():
+            try:
+                if preview_path.stat().st_size > 0:
+                    return preview_path
+            except OSError:
+                pass
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cmd = build_preview_png_command(
+            texconv_path,
+            dds_path,
+            cache_dir,
+            width=target_width,
+            height=target_height,
+        )
+        return_code, stdout, stderr = run_process_with_cancellation(cmd, stop_event=None)
+        if return_code != 0:
+            detail = stderr.strip() or stdout.strip() or f"texconv failed with exit code {return_code}"
+            raise ValueError(f"Could not generate display preview for {dds_path.name}: {detail}")
+
+        if preview_path.exists():
+            try:
+                if preview_path.stat().st_size > 0:
+                    return preview_path
+            except OSError:
+                pass
+
+        for candidate in sorted(cache_dir.glob("*.png")):
+            try:
+                if candidate.stat().st_size > 0:
+                    return candidate
+            except OSError:
+                continue
+
+    raise ValueError(f"texconv did not produce a display PNG preview for {dds_path.name}.")
+
+
 def stage_dds_to_pngs(
     config: NormalizedConfig,
-    dds_files: Sequence[Path],
+    processing_plan: Sequence[TextureProcessingPlan],
     *,
     on_log: Optional[Callable[[str], None]] = None,
     on_phase: Optional[Callable[[str, str, bool], None]] = None,
@@ -1524,7 +2596,7 @@ def stage_dds_to_pngs(
     stage_root = config.dds_staging_root
     stage_root.mkdir(parents=True, exist_ok=True)
 
-    total = len(dds_files)
+    total = len(processing_plan)
     if on_phase:
         on_phase("DDS Staging", "Extracting DDS files to PNG...", False)
     if on_log:
@@ -1532,8 +2604,9 @@ def stage_dds_to_pngs(
     if on_phase_progress:
         on_phase_progress(0, total, f"0 / {total} DDS staging files")
 
-    for index, dds_path in enumerate(dds_files, start=1):
+    for index, entry in enumerate(processing_plan, start=1):
         raise_if_cancelled(stop_event)
+        dds_path = entry.dds_path
         relative_path = dds_path.relative_to(config.original_dds_root)
         if on_current_file:
             on_current_file(f"Stage: {relative_path.as_posix()}")
@@ -1556,15 +2629,29 @@ def stage_dds_to_pngs(
                 on_phase_progress(index, total, f"{index} / {total} DDS staging files")
             continue
 
-        cmd = build_preview_png_command(config.texconv_path, dds_path, target_dir)
+        cmd = build_staging_png_command(config.texconv_path, dds_path, target_dir, entry)
         if config.dry_run:
             if on_log:
-                on_log(f"[{index}/{total}] STAGE DRYRUN {relative_path.as_posix()}")
+                on_log(
+                    f"[{index}/{total}] STAGE DRYRUN {relative_path.as_posix()} -> "
+                    f"{_staging_png_format_for_plan(entry)} staging PNG"
+                )
         else:
             return_code, stdout, stderr = run_process_with_cancellation(cmd, stop_event=stop_event)
             if return_code != 0:
                 detail = stderr.strip() or stdout.strip() or f"texconv failed with exit code {return_code}"
                 raise ValueError(f"Could not stage {relative_path.as_posix()} to PNG: {detail}")
+            if entry.path_kind == "technical_high_precision_path":
+                validation_message = _validate_high_precision_staged_png(target_png, entry)
+                if validation_message is not None and on_log:
+                    on_log(
+                        f"[{index}/{total}] STAGE WARNING {relative_path.as_posix()} -> {validation_message}"
+                    )
+            if on_log:
+                on_log(
+                    f"[{index}/{total}] STAGE {relative_path.as_posix()} -> "
+                    f"{_staging_png_format_for_plan(entry)} staging PNG"
+                )
         if on_phase_progress:
             on_phase_progress(index, total, f"{index} / {total} DDS staging files")
 
@@ -1573,6 +2660,7 @@ def build_compare_preview_pane_result(
     texconv_path: Optional[Path],
     dds_path: Optional[Path],
     missing_message: str,
+    planner_summary: str = "",
 ) -> ComparePreviewPaneResult:
     if texconv_path is None:
         return ComparePreviewPaneResult(status="missing", message="Set texconv.exe to enable DDS previews.")
@@ -1582,12 +2670,19 @@ def build_compare_preview_pane_result(
 
     try:
         metadata_summary = ""
+        dds_info: Optional[DdsInfo] = None
         try:
             dds_info = parse_dds(dds_path.resolve())
             metadata_summary = f"Format: {dds_info.texconv_format} | Size: {dds_info.width}x{dds_info.height} | Mips: {dds_info.mip_count}"
         except Exception:
             metadata_summary = "DDS metadata unavailable."
-        preview_png = ensure_dds_preview_png(texconv_path.resolve(), dds_path.resolve())
+        if planner_summary.strip():
+            metadata_summary = f"{metadata_summary} | {planner_summary.strip()}"
+        preview_png = ensure_dds_display_preview_png(
+            texconv_path.resolve(),
+            dds_path.resolve(),
+            dds_info=dds_info,
+        )
         return ComparePreviewPaneResult(
             status="ok",
             title=dds_path.name,
@@ -1596,6 +2691,78 @@ def build_compare_preview_pane_result(
         )
     except Exception as exc:
         return ComparePreviewPaneResult(status="error", message=str(exc))
+
+
+def normalize_config_for_planning(config: AppConfig) -> NormalizedConfig:
+    upscale_backend = str(getattr(config, "upscale_backend", "") or "").strip().lower()
+    if upscale_backend not in {
+        UPSCALE_BACKEND_NONE,
+        UPSCALE_BACKEND_CHAINNER,
+        UPSCALE_BACKEND_REALESRGAN_NCNN,
+        UPSCALE_BACKEND_ONNX_RUNTIME,
+    }:
+        upscale_backend = UPSCALE_BACKEND_CHAINNER if config.enable_chainner else UPSCALE_BACKEND_NONE
+
+    original_dds_root = ensure_existing_dir(
+        normalize_required_path(config.original_dds_root, "Original DDS root"),
+        "Original DDS root",
+    )
+    png_root = normalize_required_path(config.png_root, "PNG root")
+    output_root = normalize_required_path(config.output_root, "Output root")
+    dds_staging_root = normalize_optional_path(config.dds_staging_root)
+    texconv_path = normalize_optional_path(config.texconv_path) or Path(str(config.texconv_path).strip() or ".").expanduser().resolve()
+    csv_log_path = normalize_optional_path(config.csv_log_path) if config.csv_log_enabled else None
+    chainner_exe_path = normalize_optional_path(config.chainner_exe_path)
+    chainner_chain_path = normalize_optional_path(config.chainner_chain_path)
+    ncnn_exe_path = normalize_optional_path(config.ncnn_exe_path)
+    explicit_model_dir = normalize_optional_path(config.ncnn_model_dir)
+    ncnn_model_dir = resolve_ncnn_model_dir(ncnn_exe_path, explicit_model_dir) or explicit_model_dir
+    onnx_model_dir = resolve_onnx_model_dir(normalize_optional_path(getattr(config, "onnx_model_dir", "")))
+    mod_ready_export_root = normalize_optional_path(config.mod_ready_export_root)
+
+    return NormalizedConfig(
+        original_dds_root=original_dds_root,
+        png_root=png_root,
+        output_root=output_root,
+        dds_staging_root=dds_staging_root,
+        texconv_path=texconv_path,
+        dds_format_mode=str(config.dds_format_mode or DEFAULT_DDS_FORMAT_MODE).strip().lower() or DEFAULT_DDS_FORMAT_MODE,
+        dds_custom_format=str(config.dds_custom_format or DEFAULT_DDS_CUSTOM_FORMAT).strip() or DEFAULT_DDS_CUSTOM_FORMAT,
+        dds_size_mode=str(config.dds_size_mode or DEFAULT_DDS_SIZE_MODE).strip().lower() or DEFAULT_DDS_SIZE_MODE,
+        dds_custom_width=int(config.dds_custom_width),
+        dds_custom_height=int(config.dds_custom_height),
+        dds_mip_mode=str(config.dds_mip_mode or DEFAULT_DDS_MIP_MODE).strip().lower() or DEFAULT_DDS_MIP_MODE,
+        dds_custom_mip_count=int(config.dds_custom_mip_count),
+        enable_dds_staging=bool(config.enable_dds_staging),
+        enable_incremental_resume=bool(config.enable_incremental_resume),
+        texture_rules_text=str(config.texture_rules_text or ""),
+        texture_rules=parse_texture_rules(str(config.texture_rules_text or "")),
+        dry_run=bool(config.dry_run),
+        csv_log_path=csv_log_path,
+        allow_unique_basename_fallback=bool(config.allow_unique_basename_fallback),
+        overwrite_existing_dds=bool(config.overwrite_existing_dds),
+        include_filter_patterns=parse_filter_patterns(str(config.include_filters or "")),
+        upscale_backend=upscale_backend,
+        enable_chainner=upscale_backend == UPSCALE_BACKEND_CHAINNER,
+        chainner_exe_path=chainner_exe_path,
+        chainner_chain_path=chainner_chain_path,
+        chainner_override_json=str(config.chainner_override_json or ""),
+        ncnn_exe_path=ncnn_exe_path,
+        ncnn_model_dir=ncnn_model_dir,
+        ncnn_model_name=str(config.ncnn_model_name or "").strip(),
+        ncnn_scale=int(getattr(config, "ncnn_scale", REALESRGAN_NCNN_SCALE)),
+        ncnn_tile_size=int(getattr(config, "ncnn_tile_size", REALESRGAN_NCNN_TILE_SIZE)),
+        ncnn_extra_args=str(getattr(config, "ncnn_extra_args", REALESRGAN_NCNN_EXTRA_ARGS) or "").strip(),
+        upscale_post_correction_mode=str(getattr(config, "upscale_post_correction_mode", DEFAULT_UPSCALE_POST_CORRECTION) or "").strip().lower() or DEFAULT_UPSCALE_POST_CORRECTION,
+        onnx_model_dir=onnx_model_dir,
+        onnx_model_name=str(getattr(config, "onnx_model_name", "") or "").strip(),
+        upscale_texture_preset=str(getattr(config, "upscale_texture_preset", DEFAULT_UPSCALE_TEXTURE_PRESET) or "").strip().lower() or DEFAULT_UPSCALE_TEXTURE_PRESET,
+        enable_automatic_texture_rules=bool(getattr(config, "enable_automatic_texture_rules", ENABLE_AUTOMATIC_TEXTURE_RULES)),
+        enable_unsafe_technical_override=bool(getattr(config, "enable_unsafe_technical_override", ENABLE_UNSAFE_TECHNICAL_OVERRIDE)),
+        retry_smaller_tile_on_failure=bool(getattr(config, "retry_smaller_tile_on_failure", RETRY_SMALLER_TILE_ON_FAILURE)),
+        enable_mod_ready_loose_export=bool(getattr(config, "enable_mod_ready_loose_export", ENABLE_MOD_READY_LOOSE_EXPORT)),
+        mod_ready_export_root=mod_ready_export_root,
+    )
 
 
 def normalize_config(config: AppConfig, *, validate_backend_runtime: bool = True) -> NormalizedConfig:
@@ -1654,6 +2821,7 @@ def normalize_config(config: AppConfig, *, validate_backend_runtime: bool = True
     ncnn_model_name = ""
     ncnn_scale = int(getattr(config, "ncnn_scale", REALESRGAN_NCNN_SCALE))
     ncnn_tile_size = int(getattr(config, "ncnn_tile_size", REALESRGAN_NCNN_TILE_SIZE))
+    ncnn_extra_args = str(getattr(config, "ncnn_extra_args", REALESRGAN_NCNN_EXTRA_ARGS) or "").strip()
     upscale_post_correction_mode = str(
         getattr(config, "upscale_post_correction_mode", DEFAULT_UPSCALE_POST_CORRECTION) or ""
     ).strip().lower() or DEFAULT_UPSCALE_POST_CORRECTION
@@ -1665,6 +2833,9 @@ def normalize_config(config: AppConfig, *, validate_backend_runtime: bool = True
             UPSCALE_POST_CORRECTION_MATCH_MEAN_LUMA,
             UPSCALE_POST_CORRECTION_MATCH_LEVELS,
             UPSCALE_POST_CORRECTION_MATCH_HISTOGRAM,
+            UPSCALE_POST_CORRECTION_SOURCE_MATCH_BALANCED,
+            UPSCALE_POST_CORRECTION_SOURCE_MATCH_EXTENDED,
+            UPSCALE_POST_CORRECTION_SOURCE_MATCH_EXPERIMENTAL,
         ),
         "post-upscale correction mode",
     )
@@ -1740,6 +2911,7 @@ def normalize_config(config: AppConfig, *, validate_backend_runtime: bool = True
             raise ValueError(f"Unknown upscale texture preset: {upscale_texture_preset}")
 
     enable_automatic_texture_rules = bool(getattr(config, "enable_automatic_texture_rules", ENABLE_AUTOMATIC_TEXTURE_RULES))
+    enable_unsafe_technical_override = bool(getattr(config, "enable_unsafe_technical_override", ENABLE_UNSAFE_TECHNICAL_OVERRIDE))
     retry_smaller_tile_on_failure = bool(getattr(config, "retry_smaller_tile_on_failure", RETRY_SMALLER_TILE_ON_FAILURE))
     enable_mod_ready_loose_export = bool(getattr(config, "enable_mod_ready_loose_export", ENABLE_MOD_READY_LOOSE_EXPORT))
     mod_ready_export_root: Optional[Path] = None
@@ -1820,11 +2992,13 @@ def normalize_config(config: AppConfig, *, validate_backend_runtime: bool = True
         ncnn_model_name=ncnn_model_name,
         ncnn_scale=ncnn_scale,
         ncnn_tile_size=ncnn_tile_size,
+        ncnn_extra_args=ncnn_extra_args,
         upscale_post_correction_mode=upscale_post_correction_mode,
         onnx_model_dir=onnx_model_dir,
         onnx_model_name=onnx_model_name,
         upscale_texture_preset=upscale_texture_preset,
         enable_automatic_texture_rules=enable_automatic_texture_rules,
+        enable_unsafe_technical_override=enable_unsafe_technical_override,
         retry_smaller_tile_on_failure=retry_smaller_tile_on_failure,
         enable_mod_ready_loose_export=enable_mod_ready_loose_export,
         mod_ready_export_root=mod_ready_export_root,
@@ -2162,6 +3336,10 @@ def rebuild_dds_files(
         f"dds_mip_mode={normalized.dds_mip_mode}, "
         f"overwrite_existing_dds={'on' if normalized.overwrite_existing_dds else 'off'}."
     )
+    if normalized.enable_unsafe_technical_override:
+        emit_log(
+            "Expert unsafe technical override is enabled. Technical maps may be forced through the generic visible-color PNG/upscale path instead of being preserved."
+        )
     if normalized.upscale_backend == UPSCALE_BACKEND_CHAINNER:
         emit_log(f"chaiNNer executable: {normalized.chainner_exe_path}")
         emit_log(f"chaiNNer chain: {normalized.chainner_chain_path}")
@@ -2237,9 +3415,11 @@ def rebuild_dds_files(
         on_total(total)
     emit_progress(0, total, 0, 0, 0)
 
-    processing_plan = build_texture_processing_plan(normalized, dds_files)
+    backend_matrix = _build_backend_capability_matrix(normalized)
+    processing_plan = build_texture_processing_plan(normalized, dds_files, backend_matrix=backend_matrix)
     plan_by_rel = {entry.relative_path.as_posix(): entry for entry in processing_plan}
-    dds_files_requiring_png = [entry.dds_path for entry in processing_plan if entry.requires_png_processing]
+    plan_entries_requiring_png = [entry for entry in processing_plan if entry.requires_png_processing]
+    dds_files_requiring_png = [entry.dds_path for entry in plan_entries_requiring_png]
 
     if normalized.upscale_backend == UPSCALE_BACKEND_NONE or dds_files_requiring_png:
         normalized = validate_backend_runtime_requirements(normalized)
@@ -2253,19 +3433,27 @@ def rebuild_dds_files(
         if normalized.enable_chainner and normalized.chainner_chain_path and dds_files_requiring_png
         else None
     )
+    if chain_analysis is not None:
+        backend_matrix = _build_backend_capability_matrix(normalized, chain_analysis=chain_analysis)
+        processing_plan = build_texture_processing_plan(normalized, dds_files, backend_matrix=backend_matrix)
+        plan_by_rel = {entry.relative_path.as_posix(): entry for entry in processing_plan}
+        plan_entries_requiring_png = [entry for entry in processing_plan if entry.requires_png_processing]
+        dds_files_requiring_png = [entry.dds_path for entry in plan_entries_requiring_png]
     for line in build_preflight_report_lines(
         normalized,
         dds_files,
         processing_plan=processing_plan,
         chain_analysis=chain_analysis,
+        backend_matrix=backend_matrix,
         texture_rules=normalized.texture_rules,
+        stop_event=stop_event,
     ):
         emit_log(line)
 
     if normalized.enable_dds_staging and dds_files_requiring_png:
         stage_dds_to_pngs(
             normalized,
-            dds_files_requiring_png,
+            plan_entries_requiring_png,
             on_log=on_log,
             on_phase=on_phase,
             on_phase_progress=on_phase_progress,
@@ -2280,6 +3468,8 @@ def rebuild_dds_files(
     if normalized.upscale_backend == UPSCALE_BACKEND_CHAINNER and dds_files_requiring_png:
         run_chainner_stage(
             normalized,
+            input_root=active_png_root,
+            expected_relative_paths=[entry.relative_path.with_suffix(".png") for entry in plan_entries_requiring_png],
             expected_output_total=len(dds_files_requiring_png),
             on_log=on_log,
             on_phase=on_phase,
@@ -2290,6 +3480,7 @@ def rebuild_dds_files(
     elif normalized.upscale_backend == UPSCALE_BACKEND_REALESRGAN_NCNN and dds_files_requiring_png:
         run_realesrgan_ncnn_stage(
             normalized,
+            processing_plan=processing_plan,
             on_log=on_log,
             on_phase=on_phase,
             on_phase_progress=on_phase_progress,
@@ -2299,6 +3490,7 @@ def rebuild_dds_files(
     elif normalized.upscale_backend == UPSCALE_BACKEND_ONNX_RUNTIME and dds_files_requiring_png:
         run_onnx_stage(
             normalized,
+            processing_plan=processing_plan,
             on_log=on_log,
             on_phase=on_phase,
             on_phase_progress=on_phase_progress,
@@ -2376,26 +3568,44 @@ def rebuild_dds_files(
             emit_phase_progress(index - 1, total, f"{index - 1} / {total} DDS files")
 
             plan_entry = plan_by_rel.get(rel_display)
-            dds_info = plan_entry.dds_info if plan_entry is not None else parse_dds(dds_path)
-            decision = (
-                plan_entry.decision
-                if plan_entry is not None
-                else suggest_texture_upscale_decision(
-                    rel_display,
-                    preset=normalized.upscale_texture_preset,
-                    original_texconv_format=dds_info.texconv_format,
-                    has_alpha=dds_info.has_alpha,
-                    enable_automatic_rules=normalized.enable_automatic_texture_rules,
-                )
-            )
-            if plan_entry is not None and plan_entry.action == "preserve_original":
+            if plan_entry is None:
+                raise RuntimeError(f"Missing planner entry for DDS rebuild: {rel_display}")
+            dds_info = plan_entry.dds_info
+            decision = plan_entry.decision
+            if plan_entry.action in {"preserve_original", "skip_by_rule"}:
+                if plan_entry.action == "skip_by_rule":
+                    skipped += 1
+                    note = plan_entry.action_reason
+                    results.append(
+                        JobResult(
+                            original_dds=str(dds_path),
+                            png="",
+                            output_dir=str(target_dir),
+                            width=dds_info.width,
+                            height=dds_info.height,
+                            original_mips=dds_info.mip_count,
+                            used_mips=dds_info.mip_count,
+                            texconv_format=dds_info.texconv_format,
+                            status="skipped",
+                            note=note,
+                        )
+                    )
+                    emit_log(f"[{index}/{total}] SKIP {rel_display} -> {note}")
+                    emit_progress(index, total, converted, skipped, failed)
+                    emit_phase_progress(index, total, f"{index} / {total} DDS files")
+                    continue
+
                 target_dir.mkdir(parents=True, exist_ok=True)
                 note_parts = [
-                    (
+                    plan_entry.preserve_reason
+                    or (
                         f"automatic policy preserved source DDS [{decision.texture_type}/{decision.semantic_subtype}]"
                         if decision.preserve_original_due_to_intermediate
                         else f"preset kept source DDS unchanged [{decision.texture_type}/{decision.semantic_subtype}]"
                     ),
+                    f"planner profile={plan_entry.profile.key}",
+                    f"planner path={plan_entry.path_kind}",
+                    f"planner alpha_policy={plan_entry.alpha_policy}",
                     *decision.notes,
                 ]
                 if target_file.exists() and not normalized.overwrite_existing_dds:
@@ -2458,65 +3668,180 @@ def rebuild_dds_files(
             )
 
             if png_path is None:
-                skipped += 1
-                results.append(
-                    JobResult(
-                        original_dds=str(dds_path),
-                        png="",
-                        output_dir=str(target_dir),
-                        width=0,
-                        height=0,
-                        original_mips=0,
-                        used_mips=0,
-                        texconv_format="",
-                        status="skipped",
-                        note=match_note,
+                if plan_entry.path_kind == "technical_high_precision_path":
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    note_parts = [
+                        "technical high-precision path fallback preserved the original DDS",
+                        match_note,
+                        f"planner profile={plan_entry.profile.key}",
+                        f"planner path={plan_entry.path_kind}",
+                        f"planner alpha_policy={plan_entry.alpha_policy}",
+                    ]
+                    if target_file.exists() and not normalized.overwrite_existing_dds:
+                        skipped += 1
+                        note = "; ".join(note_parts + ["existing DDS kept because overwrite is disabled"])
+                        results.append(
+                            JobResult(
+                                original_dds=str(dds_path),
+                                png="",
+                                output_dir=str(target_dir),
+                                width=dds_info.width,
+                                height=dds_info.height,
+                                original_mips=dds_info.mip_count,
+                                used_mips=dds_info.mip_count,
+                                texconv_format=dds_info.texconv_format,
+                                status="skipped",
+                                note=note,
+                            )
+                        )
+                        emit_log(f"[{index}/{total}] SKIP {rel_display} -> {note}")
+                    elif normalized.dry_run:
+                        converted += 1
+                        note = "; ".join(note_parts + ["planned DDS passthrough"])
+                        results.append(
+                            JobResult(
+                                original_dds=str(dds_path),
+                                png="",
+                                output_dir=str(target_dir),
+                                width=dds_info.width,
+                                height=dds_info.height,
+                                original_mips=dds_info.mip_count,
+                                used_mips=dds_info.mip_count,
+                                texconv_format=dds_info.texconv_format,
+                                status="dry-run",
+                                note=note,
+                            )
+                        )
+                        emit_log(f"[{index}/{total}] DRYRUN COPY {rel_display} [{decision.texture_type}] -> high-precision PNG missing fallback")
+                    else:
+                        shutil.copy2(dds_path, target_file)
+                        converted += 1
+                        note = "; ".join(note_parts)
+                        results.append(
+                            JobResult(
+                                original_dds=str(dds_path),
+                                png="",
+                                output_dir=str(target_dir),
+                                width=dds_info.width,
+                                height=dds_info.height,
+                                original_mips=dds_info.mip_count,
+                                used_mips=dds_info.mip_count,
+                                texconv_format=dds_info.texconv_format,
+                                status="converted",
+                                note=note,
+                            )
+                        )
+                        emit_log(f"[{index}/{total}] COPY {rel_display} [{decision.texture_type}] -> high-precision PNG missing fallback kept original DDS")
+                else:
+                    skipped += 1
+                    results.append(
+                        JobResult(
+                            original_dds=str(dds_path),
+                            png="",
+                            output_dir=str(target_dir),
+                            width=0,
+                            height=0,
+                            original_mips=0,
+                            used_mips=0,
+                            texconv_format="",
+                            status="skipped",
+                            note=match_note,
+                        )
                     )
-                )
-                emit_log(f"[{index}/{total}] SKIP {rel_display} -> {match_note}")
+                    emit_log(f"[{index}/{total}] SKIP {rel_display} -> {match_note}")
                 emit_progress(index, total, converted, skipped, failed)
                 emit_phase_progress(index, total, f"{index} / {total} DDS files")
                 continue
 
             try:
-                png_width, png_height = read_png_dimensions(png_path)
-                png_has_alpha = png_has_alpha_channel(png_path)
-                notes = [match_note]
-                output_settings = resolve_dds_output_settings(normalized, dds_info, png_width, png_height)
-                rule = find_matching_texture_rule(rel_path, normalized.texture_rules)
-                if rule is not None:
-                    updated_settings, rule_message = apply_texture_rule_to_output_settings(output_settings, rule)
-                    if updated_settings is None:
+                high_precision_validation_message = _validate_high_precision_staged_png(png_path, plan_entry)
+                if high_precision_validation_message is not None:
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    note_parts = [
+                        "technical high-precision path fallback preserved the original DDS",
+                        high_precision_validation_message,
+                        f"planner profile={plan_entry.profile.key}",
+                        f"planner path={plan_entry.path_kind}",
+                        f"planner alpha_policy={plan_entry.alpha_policy}",
+                    ]
+                    if target_file.exists() and not normalized.overwrite_existing_dds:
                         skipped += 1
-                        note = "; ".join(notes + [rule_message])
+                        note = "; ".join(note_parts + ["existing DDS kept because overwrite is disabled"])
                         results.append(
                             JobResult(
                                 original_dds=str(dds_path),
                                 png=str(png_path),
                                 output_dir=str(target_dir),
-                                width=0,
-                                height=0,
+                                width=dds_info.width,
+                                height=dds_info.height,
                                 original_mips=dds_info.mip_count,
-                                used_mips=0,
-                                texconv_format="",
+                                used_mips=dds_info.mip_count,
+                                texconv_format=dds_info.texconv_format,
                                 status="skipped",
                                 note=note,
                             )
                         )
-                        emit_log(f"[{index}/{total}] SKIP {rel_display} -> {rule_message}")
-                        emit_progress(index, total, converted, skipped, failed)
-                        emit_phase_progress(index, total, f"{index} / {total} DDS files")
-                        continue
-                    output_settings = updated_settings
-                if normalized.enable_automatic_texture_rules:
-                    output_settings = apply_automatic_texture_rule_adjustments(
-                        output_settings,
-                        rel_path,
-                        dds_info,
-                        has_alpha=png_has_alpha,
-                        preset=normalized.upscale_texture_preset,
-                        semantic_decision=decision,
-                    )
+                        emit_log(f"[{index}/{total}] SKIP {rel_display} -> {note}")
+                    elif normalized.dry_run:
+                        converted += 1
+                        note = "; ".join(note_parts + ["planned DDS passthrough"])
+                        results.append(
+                            JobResult(
+                                original_dds=str(dds_path),
+                                png=str(png_path),
+                                output_dir=str(target_dir),
+                                width=dds_info.width,
+                                height=dds_info.height,
+                                original_mips=dds_info.mip_count,
+                                used_mips=dds_info.mip_count,
+                                texconv_format=dds_info.texconv_format,
+                                status="dry-run",
+                                note=note,
+                            )
+                        )
+                        emit_log(f"[{index}/{total}] DRYRUN COPY {rel_display} [{decision.texture_type}] -> high-precision stage validation fallback")
+                    else:
+                        shutil.copy2(dds_path, target_file)
+                        converted += 1
+                        note = "; ".join(note_parts)
+                        results.append(
+                            JobResult(
+                                original_dds=str(dds_path),
+                                png=str(png_path),
+                                output_dir=str(target_dir),
+                                width=dds_info.width,
+                                height=dds_info.height,
+                                original_mips=dds_info.mip_count,
+                                used_mips=dds_info.mip_count,
+                                texconv_format=dds_info.texconv_format,
+                                status="converted",
+                                note=note,
+                            )
+                        )
+                        emit_log(f"[{index}/{total}] COPY {rel_display} [{decision.texture_type}] -> high-precision stage validation fallback kept original DDS")
+                    emit_progress(index, total, converted, skipped, failed)
+                    emit_phase_progress(index, total, f"{index} / {total} DDS files")
+                    continue
+
+                png_width, png_height = read_png_dimensions(png_path)
+                png_has_alpha = png_has_alpha_channel(png_path)
+                notes = [match_note]
+                output_settings = _resolve_plan_output_settings(
+                    normalized,
+                    plan_entry,
+                    png_width,
+                    png_height,
+                    has_alpha=png_has_alpha,
+                )
+                notes.extend(
+                    [
+                        f"planner profile={plan_entry.profile.key}",
+                        f"planner path={plan_entry.path_kind}",
+                        f"planner alpha_policy={plan_entry.alpha_policy}",
+                    ]
+                )
+                if plan_entry.backend_capability.reason:
+                    notes.append(f"planner backend={plan_entry.backend_capability.reason}")
                 notes.extend(output_settings.notes)
 
                 if manifest_path is not None and manifest_entry_matches(

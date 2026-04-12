@@ -70,15 +70,16 @@ class TexturePolicyPreviewDialog(QDialog):
         self.tree.setRootIsDecorated(False)
         self.tree.setAlternatingRowColors(True)
         self.tree.setHeaderLabels(
-            ["Path", "Action", "Original", "Planned", "Semantic", "Alpha", "Intermediate"]
+            ["Path", "Action", "Profile", "Original", "Planned", "Semantic", "Alpha", "Path"]
         )
         self.tree.header().resizeSection(0, 360)
         self.tree.header().resizeSection(1, 140)
-        self.tree.header().resizeSection(2, 150)
-        self.tree.header().resizeSection(3, 170)
-        self.tree.header().resizeSection(4, 160)
-        self.tree.header().resizeSection(5, 110)
-        self.tree.header().resizeSection(6, 120)
+        self.tree.header().resizeSection(2, 170)
+        self.tree.header().resizeSection(3, 150)
+        self.tree.header().resizeSection(4, 170)
+        self.tree.header().resizeSection(5, 160)
+        self.tree.header().resizeSection(6, 110)
+        self.tree.header().resizeSection(7, 150)
         list_layout.addWidget(self.tree, stretch=1)
         content_row.addWidget(list_group, stretch=3)
 
@@ -146,18 +147,35 @@ class TexturePolicyPreviewDialog(QDialog):
         ) or "none"
         total_files = int(summary_dict.get("total_files", 0) or 0)
         backend = str(summary_dict.get("backend", "") or "disabled")
+        correction_mode = str(summary_dict.get("correction_mode", "") or "Off")
+        path_kinds = summary_dict.get("path_kinds", {})
+        path_summary = ", ".join(
+            f"{str(key)}={int(value)}" for key, value in path_kinds.items()
+        ) if isinstance(path_kinds, Mapping) else ""
         png_root = str(summary_dict.get("png_root", "") or "(not set)")
         output_root = str(summary_dict.get("output_root", "") or "(not set)")
         staging_root = str(summary_dict.get("staging_root", "") or "")
         summary_lines = [
             f"Matched DDS files: {total_files:,}",
             f"Backend: {backend}",
+            f"Correction mode: {correction_mode}",
             f"Action summary: {action_summary}",
+            f"Planner paths: {path_summary or 'none'}",
+            "Visible-color path backend: "
+            f"{'allowed' if bool(summary_dict.get('backend_visible_path_allowed', False)) else 'preserve'} "
+            f"({summary_dict.get('backend_visible_path_mode', '')})",
+            "Technical high-precision path backend: "
+            f"{'allowed' if bool(summary_dict.get('backend_high_precision_path_allowed', False)) else 'preserve'} "
+            f"({summary_dict.get('backend_high_precision_path_mode', '')})",
             f"PNG root: {png_root}",
             f"Output root: {output_root}",
         ]
         if staging_root:
             summary_lines.append(f"Staging PNG root: {staging_root}")
+        planner_notes = summary_dict.get("backend_planner_notes", [])
+        if isinstance(planner_notes, Sequence) and not isinstance(planner_notes, (str, bytes)) and planner_notes:
+            summary_lines.append("Planner backend notes:")
+            summary_lines.extend(f"- {note}" for note in planner_notes[:3])
         self.summary_label.setText("\n".join(summary_lines))
 
         runtime_warning = str(payload.get("runtime_validation_warning", "") or "").strip()
@@ -175,11 +193,12 @@ class TexturePolicyPreviewDialog(QDialog):
                 [
                     str(row.get("path", "")),
                     str(row.get("action", "")),
+                    str(row.get("profile_key", "")),
                     str(row.get("original_format", "")),
                     str(row.get("planned_format", "")),
                     f"{row.get('texture_type', '')}/{row.get('semantic_subtype', '')}",
-                    str(row.get("alpha_mode", "")),
-                    str(row.get("intermediate_policy", "")),
+                    str(row.get("alpha_policy", "")),
+                    str(row.get("path_kind", "")),
                 ]
             )
             item.setData(0, Qt.UserRole, dict(row))
@@ -226,9 +245,21 @@ class TexturePolicyPreviewDialog(QDialog):
                     f"Reason: {row.get('action_reason', '')}",
                     f"Original format: {row.get('original_format', '')}",
                     f"Planned format: {row.get('planned_format', '')}",
+                    f"Profile: {row.get('profile_key', '')} ({row.get('profile_label', '')})",
+                    f"Planner path: {row.get('path_kind', '')}",
+                    f"Planner path detail: {row.get('path_description', '')}",
                     f"Size policy: {row.get('size_policy', '')}",
                     f"Mip policy: {row.get('mip_policy', '')}",
                     f"Alpha mode: {row.get('alpha_mode', '')}",
+                    f"Alpha policy: {row.get('alpha_policy', '')}",
+                    f"Backend execution: {row.get('backend_execution_mode', '')}",
+                    f"Backend compatibility: {'yes' if row.get('backend_compatible', False) else 'no'}",
+                    f"Backend reason: {row.get('backend_reason', '')}",
+                    f"Preserve reason: {row.get('preserve_reason', '')}",
+                    f"Correction mode: {row.get('correction_mode', '')}",
+                    f"Correction action: {row.get('correction_action', '')}",
+                    f"Correction eligibility: {row.get('correction_eligibility', '')}",
+                    f"Correction reason: {row.get('correction_reason', '')}",
                     f"Intermediate policy: {row.get('intermediate_policy', '')}",
                     f"Packed channels: {packed_text or 'none'}",
                     "",

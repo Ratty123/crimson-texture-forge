@@ -5,7 +5,7 @@ import threading
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QThread, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -159,6 +159,10 @@ class TextSearchTab(QWidget):
         self.preview_find_spans: List[tuple[int, int]] = []
         self.preview_find_active_index = -1
         self.preview_text_cache = ""
+        self._settings_save_timer = QTimer(self)
+        self._settings_save_timer.setSingleShot(True)
+        self._settings_save_timer.setInterval(250)
+        self._settings_save_timer.timeout.connect(self._save_settings)
 
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(10, 10, 10, 10)
@@ -395,12 +399,12 @@ class TextSearchTab(QWidget):
             self.export_root_edit,
             self.preview_find_edit,
         ):
-            widget.textChanged.connect(self._save_settings)
-        self.source_combo.currentIndexChanged.connect(self._save_settings)
-        self.case_sensitive_checkbox.toggled.connect(self._save_settings)
-        self.regex_checkbox.toggled.connect(self._save_settings)
-        self.preview_wrap_checkbox.toggled.connect(self._save_settings)
-        self.preview_find_case_checkbox.toggled.connect(self._save_settings)
+            widget.textChanged.connect(self.schedule_settings_save)
+        self.source_combo.currentIndexChanged.connect(self.schedule_settings_save)
+        self.case_sensitive_checkbox.toggled.connect(self.schedule_settings_save)
+        self.regex_checkbox.toggled.connect(self.schedule_settings_save)
+        self.preview_wrap_checkbox.toggled.connect(self.schedule_settings_save)
+        self.preview_find_case_checkbox.toggled.connect(self.schedule_settings_save)
 
         self._load_settings()
         self._settings_ready = True
@@ -441,6 +445,7 @@ class TextSearchTab(QWidget):
         }
 
     def shutdown(self) -> None:
+        self.flush_settings_save()
         if self.search_worker is not None:
             self.search_worker.stop()
         if self.search_thread is not None:
@@ -475,7 +480,7 @@ class TextSearchTab(QWidget):
 
     def _handle_source_changed(self) -> None:
         self._apply_source_state()
-        self._save_settings()
+        self.schedule_settings_save()
 
     def _apply_source_state(self) -> None:
         loose_mode = self.source_combo.currentData() == "loose"
@@ -498,6 +503,16 @@ class TextSearchTab(QWidget):
         self.settings.setValue("text_search/preview_find_case_sensitive", self.preview_find_case_checkbox.isChecked())
         self.settings.setValue("text_search/preview_font_size", self.preview_text_edit.font().pointSize())
         self.settings.sync()
+
+    def schedule_settings_save(self, *_args) -> None:
+        if not self._settings_ready:
+            return
+        self._settings_save_timer.start()
+
+    def flush_settings_save(self) -> None:
+        if self._settings_save_timer.isActive():
+            self._settings_save_timer.stop()
+        self._save_settings()
 
     def _load_settings(self) -> None:
         self._settings_ready = False
@@ -586,7 +601,7 @@ class TextSearchTab(QWidget):
         if path_hint.strip():
             self.path_filter_edit.setText(path_hint.strip())
         self.source_combo.setCurrentIndex(max(0, self.source_combo.findData("archive")))
-        self._save_settings()
+        self.flush_settings_save()
         self.status_message_requested.emit("Regex preset applied to Text Search.", False)
 
     def start_search(self) -> None:
@@ -847,11 +862,11 @@ class TextSearchTab(QWidget):
             if self.preview_text_cache
             else f"Font {new_size} pt"
         )
-        self._save_settings()
+        self.schedule_settings_save()
 
     def _handle_preview_wrap_changed(self, enabled: bool) -> None:
         self.preview_text_edit.set_wrap_enabled(enabled)
-        self._save_settings()
+        self.schedule_settings_save()
 
     def _handle_preview_find_changed(self, _text: str = "", *, reset_focus: bool = True) -> None:
         query = self.preview_find_edit.text()

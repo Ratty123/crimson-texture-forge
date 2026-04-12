@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QFrame,
     QLabel,
+    QLineEdit,
     QScrollArea,
     QSpinBox,
     QVBoxLayout,
@@ -33,6 +34,9 @@ from crimson_texture_forge.constants import (
     UPSCALE_POST_CORRECTION_MATCH_LEVELS,
     UPSCALE_POST_CORRECTION_MATCH_MEAN_LUMA,
     UPSCALE_POST_CORRECTION_NONE,
+    UPSCALE_POST_CORRECTION_SOURCE_MATCH_BALANCED,
+    UPSCALE_POST_CORRECTION_SOURCE_MATCH_EXPERIMENTAL,
+    UPSCALE_POST_CORRECTION_SOURCE_MATCH_EXTENDED,
     UPSCALE_BACKEND_REALESRGAN_NCNN,
     UPSCALE_TEXTURE_PRESET_ALL,
     UPSCALE_TEXTURE_PRESET_BALANCED,
@@ -54,8 +58,10 @@ class SafeUpscaleWizardState:
     preset: str = UPSCALE_TEXTURE_PRESET_BALANCED
     scale: float = 4.0
     tile_size: int = 256
+    ncnn_extra_args: str = ""
     post_correction_mode: str = DEFAULT_UPSCALE_POST_CORRECTION
     use_automatic_rules: bool = True
+    unsafe_technical_override: bool = False
     retry_smaller_tile: bool = True
     loose_export: bool = True
     notes: str = ""
@@ -69,14 +75,13 @@ class SafeUpscaleWizard(QDialog):
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self.setObjectName("SafeUpscaleWizard")
-        self.setWindowTitle("Safe Upscale Wizard")
+        self.setObjectName("RunSummaryDialog")
+        self.setWindowTitle("Run Summary")
         self.setModal(True)
         self.resize(880, 720)
         self.setMinimumSize(760, 640)
 
         self._theme_key = theme_key or DEFAULT_UI_THEME
-        self._accepted_state: Optional[SafeUpscaleWizardState] = None
         self._footer_summary_override_text = ""
 
         self._build_ui()
@@ -88,7 +93,7 @@ class SafeUpscaleWizard(QDialog):
         root_layout.setContentsMargins(14, 14, 14, 14)
         root_layout.setSpacing(10)
 
-        title = QLabel("Safe Upscale Wizard")
+        title = QLabel("Run Summary")
         title.setObjectName("WizardTitle")
         title_font = title.font()
         title_font.setPointSize(title_font.pointSize() + 4)
@@ -97,7 +102,7 @@ class SafeUpscaleWizard(QDialog):
         root_layout.addWidget(title)
 
         subtitle = QLabel(
-            "A guided path for choosing how files are upscaled, which texture types are allowed through the backend, and how safely the final DDS files are rebuilt."
+            "A read-only summary of the current workflow: source roots, selected backend, texture policy, direct-backend controls, and the main safety/export behavior that will be used when you run."
         )
         subtitle.setWordWrap(True)
         subtitle.setObjectName("HintLabel")
@@ -139,7 +144,7 @@ class SafeUpscaleWizard(QDialog):
         source_layout.addRow("Notes", self.source_notes_label)
         content_layout.addWidget(self.source_group)
 
-        self.backend_group = QGroupBox("2. Backend Choice")
+        self.backend_group = QGroupBox("2. Backend Summary")
         backend_layout = QVBoxLayout(self.backend_group)
         backend_layout.setContentsMargins(12, 14, 12, 12)
         backend_layout.setSpacing(8)
@@ -159,7 +164,7 @@ class SafeUpscaleWizard(QDialog):
         backend_layout.addWidget(self.backend_summary_label)
         content_layout.addWidget(self.backend_group)
 
-        self.preset_group = QGroupBox("3. Texture Preset")
+        self.preset_group = QGroupBox("3. Texture Policy Summary")
         preset_layout = QVBoxLayout(self.preset_group)
         preset_layout.setContentsMargins(12, 14, 12, 12)
         preset_layout.setSpacing(8)
@@ -186,7 +191,7 @@ class SafeUpscaleWizard(QDialog):
         preset_layout.addWidget(self.preset_warning_label)
         content_layout.addWidget(self.preset_group)
 
-        self.backend_controls_group = QGroupBox("4. Direct Backend Controls (NCNN / ONNX only)")
+        self.backend_controls_group = QGroupBox("4. Direct Backend Summary (NCNN / ONNX only)")
         backend_controls_layout = QFormLayout(self.backend_controls_group)
         backend_controls_layout.setContentsMargins(12, 14, 12, 12)
         backend_controls_layout.setHorizontalSpacing(12)
@@ -207,17 +212,27 @@ class SafeUpscaleWizard(QDialog):
         self.tile_spin.setToolTip(
             "Tile size for direct backends. 0 means no manual tiling. Smaller values use less VRAM and can recover from failures, but run slower."
         )
+        self.ncnn_extra_args_edit = QLineEdit()
+        self.ncnn_extra_args_edit.setPlaceholderText("Example: -dn 0.2")
+        self.ncnn_extra_args_edit.setToolTip(
+            "Optional extra command-line arguments appended to the Real-ESRGAN NCNN call. "
+            "Example: -dn 0.2. Use only flags supported by the selected NCNN build/model."
+        )
         self.post_correction_combo = QComboBox()
-        self.post_correction_combo.addItem("Off (recommended)", UPSCALE_POST_CORRECTION_NONE)
+        self.post_correction_combo.addItem("Off", UPSCALE_POST_CORRECTION_NONE)
         self.post_correction_combo.addItem("Match Mean Luma", UPSCALE_POST_CORRECTION_MATCH_MEAN_LUMA)
         self.post_correction_combo.addItem("Match Levels", UPSCALE_POST_CORRECTION_MATCH_LEVELS)
         self.post_correction_combo.addItem("Match Histogram", UPSCALE_POST_CORRECTION_MATCH_HISTOGRAM)
+        self.post_correction_combo.addItem("Source Match Balanced (recommended)", UPSCALE_POST_CORRECTION_SOURCE_MATCH_BALANCED)
+        self.post_correction_combo.addItem("Source Match Extended", UPSCALE_POST_CORRECTION_SOURCE_MATCH_EXTENDED)
+        self.post_correction_combo.addItem("Source Match Experimental", UPSCALE_POST_CORRECTION_SOURCE_MATCH_EXPERIMENTAL)
         self.post_correction_combo.setToolTip(
-            "Optional post-upscale color correction applied after the direct backend writes PNG output. "
-            "Only visible color, UI, emissive, and impostor textures are corrected automatically."
+            "Optional post-upscale correction applied after the direct backend writes PNG output. "
+            "Source Match modes automatically decide per texture whether to use visible RGB correction, grayscale-only correction, limited RGB-only correction, or a full skip."
         )
         backend_controls_layout.addRow("Scale", self.scale_spin)
         backend_controls_layout.addRow("Tile size", self.tile_spin)
+        backend_controls_layout.addRow("NCNN extra args", self.ncnn_extra_args_edit)
         backend_controls_layout.addRow("Post correction", self.post_correction_combo)
         self.backend_controls_note = QLabel(
             "These controls only affect direct backends like Real-ESRGAN NCNN and ONNX Runtime. "
@@ -233,15 +248,27 @@ class SafeUpscaleWizard(QDialog):
         backend_controls_layout.addRow(self.backend_controls_detail)
         content_layout.addWidget(self.backend_controls_group)
 
-        self.safety_group = QGroupBox("5. Safety Summary")
+        self.safety_group = QGroupBox("5. Safety And Export Summary")
         safety_layout = QVBoxLayout(self.safety_group)
         safety_layout.setContentsMargins(12, 14, 12, 12)
         safety_layout.setSpacing(8)
-        self.automatic_rules_checkbox = QCheckBox("Use automatic color / format rules")
+        self.automatic_rules_checkbox = QCheckBox("Use automatic texture safety rules")
+        self.automatic_rules_checkbox.setToolTip(
+            "Applies safer DDS rebuild recommendations for format flags, alpha handling, and technical-map preservation. "
+            "This is a safety/policy feature, not a brightness correction feature."
+        )
+        self.unsafe_technical_override_checkbox = QCheckBox(
+            "Expert override: force technical maps through PNG/upscale path (unsafe)"
+        )
+        self.unsafe_technical_override_checkbox.setToolTip(
+            "Expert-only override. Forces technical textures such as normals, masks, roughness, height, and vectors onto the generic visible-color PNG/upscale path "
+            "instead of preserving them. This can produce broken normals, bad masks, or incorrect shading."
+        )
         self.retry_smaller_tile_checkbox = QCheckBox("Retry with smaller tile on failure")
         self.automatic_rules_checkbox.setChecked(True)
         self.retry_smaller_tile_checkbox.setChecked(True)
         safety_layout.addWidget(self.automatic_rules_checkbox)
+        safety_layout.addWidget(self.unsafe_technical_override_checkbox)
         safety_layout.addWidget(self.retry_smaller_tile_checkbox)
         self.safety_summary_label = QLabel()
         self.safety_summary_label.setWordWrap(True)
@@ -249,7 +276,7 @@ class SafeUpscaleWizard(QDialog):
         safety_layout.addWidget(self.safety_summary_label)
         content_layout.addWidget(self.safety_group)
 
-        self.export_group = QGroupBox("6. Mod-Ready Loose Export")
+        self.export_group = QGroupBox("6. Export Summary")
         export_layout = QVBoxLayout(self.export_group)
         export_layout.setContentsMargins(12, 14, 12, 12)
         export_layout.setSpacing(8)
@@ -269,26 +296,27 @@ class SafeUpscaleWizard(QDialog):
         self.footer_summary.setObjectName("HintLabel")
         content_layout.addWidget(self.footer_summary)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
+        self.backend_combo.setEnabled(False)
+        self.preset_combo.setEnabled(False)
+        self.scale_spin.setEnabled(False)
+        self.tile_spin.setEnabled(False)
+        self.ncnn_extra_args_edit.setReadOnly(True)
+        self.post_correction_combo.setEnabled(False)
+        self.automatic_rules_checkbox.setEnabled(False)
+        self.unsafe_technical_override_checkbox.setEnabled(False)
+        self.retry_smaller_tile_checkbox.setEnabled(False)
+        self.loose_export_checkbox.setEnabled(False)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(self.reject)
         root_layout.addWidget(buttons)
-
-        self.backend_combo.currentIndexChanged.connect(self._refresh_state_summary)
-        self.preset_combo.currentIndexChanged.connect(self._refresh_state_summary)
-        self.scale_spin.valueChanged.connect(self._refresh_state_summary)
-        self.tile_spin.valueChanged.connect(self._refresh_state_summary)
-        self.post_correction_combo.currentIndexChanged.connect(self._refresh_state_summary)
-        self.automatic_rules_checkbox.toggled.connect(self._refresh_state_summary)
-        self.retry_smaller_tile_checkbox.toggled.connect(self._refresh_state_summary)
-        self.loose_export_checkbox.toggled.connect(self._refresh_state_summary)
 
     def set_theme(self, theme_key: str) -> None:
         resolved = theme_key or DEFAULT_UI_THEME
         self._theme_key = resolved
         theme = get_theme(resolved)
         extra_styles = f"""
-        QDialog#SafeUpscaleWizard {{
+        QDialog#RunSummaryDialog {{
             background: {theme["window"]};
         }}
         QLabel#WizardTitle {{
@@ -339,6 +367,7 @@ class SafeUpscaleWizard(QDialog):
 
         tile = self._coerce_int(config.get("tile_size"), self.tile_spin.value())
         self.set_tile_size(tile)
+        self.set_ncnn_extra_args(str(config.get("ncnn_extra_args") or ""))
         self.set_post_correction_mode(
             self._coerce_post_correction_mode(
                 config.get("post_correction_mode"),
@@ -348,6 +377,9 @@ class SafeUpscaleWizard(QDialog):
 
         self.set_use_automatic_rules(
             self._coerce_bool(config.get("use_automatic_rules"), self.automatic_rules_checkbox.isChecked())
+        )
+        self.set_unsafe_technical_override(
+            self._coerce_bool(config.get("unsafe_technical_override"), self.unsafe_technical_override_checkbox.isChecked())
         )
         self.set_retry_smaller_tile(
             self._coerce_bool(config.get("retry_smaller_tile"), self.retry_smaller_tile_checkbox.isChecked())
@@ -391,6 +423,9 @@ class SafeUpscaleWizard(QDialog):
     def selected_tile_size(self) -> int:
         return int(self.tile_spin.value())
 
+    def selected_ncnn_extra_args(self) -> str:
+        return self.ncnn_extra_args_edit.text().strip()
+
     def selected_post_correction_mode(self) -> str:
         data = self.post_correction_combo.currentData()
         return str(data) if data is not None else DEFAULT_UPSCALE_POST_CORRECTION
@@ -401,11 +436,11 @@ class SafeUpscaleWizard(QDialog):
     def use_automatic_rules(self) -> bool:
         return self.automatic_rules_checkbox.isChecked()
 
+    def unsafe_technical_override(self) -> bool:
+        return self.unsafe_technical_override_checkbox.isChecked()
+
     def retry_smaller_tile(self) -> bool:
         return self.retry_smaller_tile_checkbox.isChecked()
-
-    def accepted_configuration(self) -> Optional[SafeUpscaleWizardState]:
-        return self._accepted_state
 
     def current_configuration(self) -> SafeUpscaleWizardState:
         return SafeUpscaleWizardState(
@@ -414,8 +449,10 @@ class SafeUpscaleWizard(QDialog):
             preset=self.selected_preset(),
             scale=self.selected_scale(),
             tile_size=self.selected_tile_size(),
+            ncnn_extra_args=self.selected_ncnn_extra_args(),
             post_correction_mode=self.selected_post_correction_mode(),
             use_automatic_rules=self.use_automatic_rules(),
+            unsafe_technical_override=self.unsafe_technical_override(),
             retry_smaller_tile=self.retry_smaller_tile(),
             loose_export=self.export_enabled(),
             notes=self.footer_summary.text(),
@@ -449,6 +486,10 @@ class SafeUpscaleWizard(QDialog):
         self.tile_spin.setValue(max(self.tile_spin.minimum(), min(self.tile_spin.maximum(), int(tile_size))))
         self._refresh_state_summary()
 
+    def set_ncnn_extra_args(self, value: str) -> None:
+        self.ncnn_extra_args_edit.setText(str(value or ""))
+        self._refresh_state_summary()
+
     def set_post_correction_mode(self, mode: str) -> None:
         normalized = self._coerce_post_correction_mode(mode, DEFAULT_UPSCALE_POST_CORRECTION)
         index = self.post_correction_combo.findData(normalized)
@@ -467,25 +508,32 @@ class SafeUpscaleWizard(QDialog):
         self.automatic_rules_checkbox.setChecked(bool(enabled))
         self._refresh_state_summary()
 
+    def set_unsafe_technical_override(self, enabled: bool) -> None:
+        self.unsafe_technical_override_checkbox.setChecked(bool(enabled))
+        self._refresh_state_summary()
+
     def set_retry_smaller_tile(self, enabled: bool) -> None:
         self.retry_smaller_tile_checkbox.setChecked(bool(enabled))
         self._refresh_state_summary()
-
-    def accept(self) -> None:  # type: ignore[override]
-        self._accepted_state = self.current_configuration()
-        super().accept()
 
     def _refresh_state_summary(self) -> None:
         backend = self.selected_backend()
         preset = self.selected_preset()
         if backend == UPSCALE_BACKEND_NONE:
-            backend_text = "Upscaling is disabled. The wizard will only capture the chosen safety rules and loose export behavior."
+            backend_text = "Upscaling is disabled. This run summary reflects the current rebuild, preserve, and export behavior without a direct upscale backend."
         elif backend == UPSCALE_BACKEND_CHAINNER:
-            backend_text = "chaiNNer is selected. The chain remains the source of truth for scale, tiling, models, and file flow. The direct controls below do not override the chain."
+            backend_text = "chaiNNer is selected. The chain remains the source of truth for scale, tiling, models, and file flow."
         elif backend == UPSCALE_BACKEND_REALESRGAN_NCNN:
-            backend_text = "Real-ESRGAN NCNN is selected. The direct controls below decide the PNG upscale pass before DDS rebuild happens."
+            extra_args = self.selected_ncnn_extra_args()
+            if extra_args:
+                backend_text = (
+                    "Real-ESRGAN NCNN is selected. The direct backend settings below decide the PNG upscale pass before DDS rebuild happens. "
+                    f"Extra args: {extra_args}"
+                )
+            else:
+                backend_text = "Real-ESRGAN NCNN is selected. The direct backend settings below decide the PNG upscale pass before DDS rebuild happens."
         else:
-            backend_text = "ONNX Runtime is selected. The direct controls below decide the PNG upscale pass before DDS rebuild happens."
+            backend_text = "ONNX Runtime is selected. The direct backend settings below decide the PNG upscale pass before DDS rebuild happens."
         self.backend_summary_label.setText(backend_text)
 
         preset_definition = get_texture_preset_definition(preset)
@@ -504,18 +552,15 @@ class SafeUpscaleWizard(QDialog):
         self.preset_warning_label.setText(warning_text)
 
         direct_enabled = backend in DIRECT_BACKEND_VALUES
-        self.scale_spin.setEnabled(direct_enabled)
-        self.tile_spin.setEnabled(direct_enabled)
-        self.post_correction_combo.setEnabled(direct_enabled)
         if direct_enabled:
             self.backend_controls_detail.setText(
                 "Scale controls final PNG size for the direct backend. Tile size controls memory usage: 0 means no manual tiling, while smaller tiles are slower but safer on low-VRAM systems. "
-                "Post correction can optionally pull visible color textures back toward the source luma or tonal range before DDS rebuild. "
+                "Post correction can automatically decide per texture how aggressively to pull safe outputs back toward the source before DDS rebuild. "
                 "DDS format and mip handling are still decided later by the DDS Output settings in the main workflow."
             )
         else:
             self.backend_controls_detail.setText(
-                "Because chaiNNer or Disabled mode is selected, these direct-backend controls are informational only right now."
+                "No direct NCNN or ONNX backend is active, so this section is informational only."
             )
 
         safety_lines = []
@@ -523,6 +568,10 @@ class SafeUpscaleWizard(QDialog):
             safety_lines.append("Automatic color and format rules are enabled for DDS rebuild.")
         else:
             safety_lines.append("Automatic color and format rules are disabled, so format and color mistakes are more likely.")
+        if self.unsafe_technical_override_checkbox.isChecked():
+            safety_lines.append(
+                "Expert unsafe technical override is enabled, so technical maps may be forced through the generic visible-color PNG/upscale path instead of being preserved."
+            )
         if self.retry_smaller_tile_checkbox.isChecked():
             safety_lines.append("Retry with smaller tile is enabled for direct backends.")
         else:
@@ -532,13 +581,13 @@ class SafeUpscaleWizard(QDialog):
         elif backend == UPSCALE_BACKEND_CHAINNER:
             safety_lines.append("chaiNNer chain behavior still controls the final file flow.")
         else:
-            safety_lines.append("Direct backend mode is active, so model choice matters. Brightness, contrast, and detail character come from the selected model, not from the preset alone.")
+            safety_lines.append("Direct backend mode is active, so model choice matters. The app will also auto-route post correction per texture when a Source Match mode is selected.")
         self.safety_summary_label.setText(" ".join(safety_lines))
 
         export_text = (
             "Loose export is enabled. The workflow should end in a mod-ready loose folder tree with preserved paths."
             if self.loose_export_checkbox.isChecked()
-            else "Loose export is disabled. The wizard will only represent the processing plan."
+            else "Loose export is disabled. Only the configured output roots and rebuild/preserve behavior will apply."
         )
         self.export_summary_label.setText(export_text)
 
@@ -552,9 +601,9 @@ class SafeUpscaleWizard(QDialog):
             if label.text() and label.text() != "Not set"
         ]
         if active_sources:
-            self.footer_summary.setText("Configured sources are present. Start with the recommended preset and compare a small sample before running a full batch.")
+            self.footer_summary.setText("Configured sources are present. Use this summary to verify paths and policy before starting a batch run.")
         else:
-            self.footer_summary.setText("No source summary has been populated yet. Populate the wizard from a selected archive or workflow config later.")
+            self.footer_summary.setText("No source summary has been populated yet. Open this summary after setting workflow roots to verify the run context.")
 
     def _as_display_text(self, value: Any) -> str:
         if value is None:
@@ -629,6 +678,9 @@ class SafeUpscaleWizard(QDialog):
             UPSCALE_POST_CORRECTION_MATCH_MEAN_LUMA,
             UPSCALE_POST_CORRECTION_MATCH_LEVELS,
             UPSCALE_POST_CORRECTION_MATCH_HISTOGRAM,
+            UPSCALE_POST_CORRECTION_SOURCE_MATCH_BALANCED,
+            UPSCALE_POST_CORRECTION_SOURCE_MATCH_EXTENDED,
+            UPSCALE_POST_CORRECTION_SOURCE_MATCH_EXPERIMENTAL,
         }:
             return text
         return default

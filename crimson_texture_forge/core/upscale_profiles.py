@@ -77,7 +77,7 @@ _PRESET_DESCRIPTIONS: Dict[str, str] = {
     UPSCALE_TEXTURE_PRESET_BALANCED: "Recommended first test. Upscale visible color/UI-style maps only; leave normals, masks, grayscale technical maps, vectors, and unknown maps unchanged.",
     UPSCALE_TEXTURE_PRESET_COLOR_UI: "Safer visible-only preset. Upscale color and UI textures only; leave technical maps unchanged.",
     UPSCALE_TEXTURE_PRESET_COLOR_UI_EMISSIVE: "Upscale color, UI, emissive, and impostor textures; leave technical maps unchanged.",
-    UPSCALE_TEXTURE_PRESET_ALL: "Advanced/debug preset. Sends almost every image-like file to the upscaler, including technical maps that can break or darken.",
+    UPSCALE_TEXTURE_PRESET_ALL: "Advanced/debug preset. Broadens eligibility to almost every image-like file, but planner/backend safety can still preserve technical maps unless you explicitly force an unsafe override.",
 }
 
 _ALL_TEXTURE_TYPES: Tuple[str, ...] = (
@@ -120,6 +120,7 @@ class TextureUpscaleDecision:
     preserve_alpha: bool
     alpha_mode: str
     packed_channels: Tuple[str, ...] = ()
+    precision_sensitive: bool = False
     preserve_original_due_to_intermediate: bool = False
     intermediate_policy: str = "png_ok"
     source_evidence: List[str] = field(default_factory=list)
@@ -197,7 +198,7 @@ def get_texture_preset_definition(preset: str) -> TexturePresetDefinition:
     warning = ""
     if normalized == UPSCALE_TEXTURE_PRESET_ALL:
         warning = (
-            "This preset can alter technical maps such as normals, masks, and roughness. "
+            "This preset broadens technical-map eligibility, but unsafe technical upscaling still depends on planner/backend rules unless the expert override is enabled. "
             "Expect more failures, darker output, or broken shading unless you verify the results carefully."
         )
     return TexturePresetDefinition(
@@ -704,6 +705,7 @@ def suggest_texture_upscale_decision(
     preserve_alpha = has_alpha
     preserve_original_due_to_intermediate = False
     intermediate_policy = "png_ok"
+    precision_sensitive = False
     source_evidence = list(semantic.evidence)
 
     if texture_type in {"color", "ui", "emissive", "impostor"}:
@@ -780,6 +782,8 @@ def suggest_texture_upscale_decision(
 
     if original_texconv_format:
         original_upper = original_texconv_format.strip().upper()
+        if "FLOAT" in original_upper or "SNORM" in original_upper:
+            precision_sensitive = True
         if original_upper in SUPPORTED_TEXCONV_FORMAT_CHOICES and original_upper != recommended_texconv_format:
             notes.append(f"Source format is {original_upper}; compare it against the suggested output format before changing it.")
         elif texture_type in {"height", "vector"} and original_upper and original_upper != recommended_texconv_format:
@@ -788,6 +792,7 @@ def suggest_texture_upscale_decision(
     if enable_automatic_rules:
         original_upper = original_texconv_format.strip().upper()
         if "FLOAT" in original_upper or "SNORM" in original_upper:
+            precision_sensitive = True
             preserve_original_due_to_intermediate = True
             intermediate_policy = "preserve_original"
             notes.append("Automatic rules will preserve the original DDS because the source format is precision-sensitive.")
@@ -828,6 +833,7 @@ def suggest_texture_upscale_decision(
         preserve_alpha=preserve_alpha,
         alpha_mode=semantic.alpha_mode,
         packed_channels=semantic.packed_channels,
+        precision_sensitive=precision_sensitive,
         preserve_original_due_to_intermediate=preserve_original_due_to_intermediate,
         intermediate_policy=intermediate_policy,
         source_evidence=source_evidence,
@@ -854,15 +860,9 @@ def build_ncnn_retry_tile_candidates(
     include_full_frame_fallback: bool = False,
 ) -> NcnnRetryPlan:
     requested = max(0, int(tile_size))
-    if requested <= 0:
-        return NcnnRetryPlan(
-            requested_tile_size=requested,
-            candidate_tile_sizes=(0, 512, 256, 128, 64, 32),
-        )
-
     minimum = max(1, int(minimum_tile_size))
     candidates: List[int] = []
-    current = requested
+    current = 512 if requested <= 0 else max(0, requested // 2)
     while current >= minimum:
         if current not in candidates:
             candidates.append(current)
@@ -873,7 +873,7 @@ def build_ncnn_retry_tile_candidates(
             break
         current = next_value
 
-    if include_full_frame_fallback and 0 not in candidates:
+    if requested > 0 and include_full_frame_fallback and 0 not in candidates:
         candidates.append(0)
 
     return NcnnRetryPlan(requested_tile_size=requested, candidate_tile_sizes=tuple(candidates))

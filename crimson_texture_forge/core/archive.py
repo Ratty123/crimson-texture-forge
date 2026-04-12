@@ -33,7 +33,7 @@ except ImportError:
 from crimson_texture_forge.constants import *
 from crimson_texture_forge.models import *
 from crimson_texture_forge.core.common import *
-from crimson_texture_forge.core.pipeline import ensure_dds_preview_png, parse_dds
+from crimson_texture_forge.core.pipeline import ensure_dds_display_preview_png, parse_dds
 from crimson_texture_forge.core.upscale_profiles import classify_texture_type
 
 _PATHC_COLLECTION_CACHE: Dict[str, Tuple[str, "PathcCollection"]] = {}
@@ -2073,7 +2073,7 @@ def build_loose_archive_preview_assets(
             metadata_summary = f"Loose DDS | {resolved_path.name}"
         if texconv_path is None:
             return "", metadata_summary, detail + "\nSet texconv.exe to enable DDS loose-file previews."
-        preview_png = ensure_dds_preview_png(texconv_path.resolve(), resolved_path)
+        preview_png = ensure_dds_display_preview_png(texconv_path.resolve(), resolved_path, dds_info=dds_info)
         return str(preview_png), metadata_summary, detail
 
     if suffix in ARCHIVE_IMAGE_EXTENSIONS:
@@ -2207,7 +2207,7 @@ def build_archive_preview_result(
                     loose_preview_metadata_summary=loose_preview_metadata_summary,
                     loose_preview_detail_text=loose_preview_detail_text,
                 )
-            preview_png = ensure_dds_preview_png(texconv_path.resolve(), source_path.resolve())
+            preview_png = ensure_dds_display_preview_png(texconv_path.resolve(), source_path.resolve())
             return ArchivePreviewResult(
                 status="ok",
                 title=entry.basename,

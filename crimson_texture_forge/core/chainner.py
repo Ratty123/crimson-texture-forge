@@ -184,6 +184,21 @@ def summarize_png_output_changes(
     return changed_count, latest_relative_path
 
 
+def missing_expected_png_outputs(
+    png_root: Path,
+    expected_relative_paths: Sequence[str | Path],
+) -> List[str]:
+    missing: List[str] = []
+    for relative_path in expected_relative_paths:
+        normalized = Path(str(relative_path)).as_posix().lstrip("./")
+        if not normalized:
+            continue
+        candidate = png_root / normalized
+        if not candidate.exists() or not candidate.is_file():
+            missing.append(normalized)
+    return missing
+
+
 def substitute_chainner_tokens(value: object, token_map: Dict[str, str]) -> object:
     if isinstance(value, str):
         def replace_token(match: re.Match[str]) -> str:
@@ -492,77 +507,96 @@ def analyze_chainner_chain_paths(
     chain_path: Path,
     *,
     original_dds_root: Optional[Path],
+    staging_png_root: Optional[Path],
     png_root: Optional[Path],
     chainner_override_json: str = "",
 ) -> ChainnerChainAnalysis:
     analysis = inspect_chainner_chain(chain_path)
     if analysis.warnings:
+        analysis.blocking_warnings.extend(list(analysis.warnings))
+        analysis.planner_compatible = False
         return analysis
+
+    def add_warning(message: str, *, blocking: bool = False) -> None:
+        analysis.warnings.append(message)
+        if blocking:
+            analysis.blocking_warnings.append(message)
 
     chain_uses_overrides = bool(chainner_override_json.strip())
     if original_dds_root is not None and not _contains_any_files(original_dds_root):
-        analysis.warnings.append(
-            f"Original DDS root does not contain any files right now: {original_dds_root}"
-        )
+        add_warning(f"Original DDS root does not contain any files right now: {original_dds_root}")
 
     if not analysis.upscaler_nodes:
-        analysis.warnings.append(
+        add_warning(
             "No obvious chaiNNer upscale node was detected in the chain. "
-            "Verify that the chain actually performs an upscale step."
+            "Verify that the chain actually performs an upscale step.",
+            blocking=True,
         )
 
     if not chain_uses_overrides:
+        expected_load_dirs = {
+            path.resolve()
+            for path in (original_dds_root, staging_png_root, png_root)
+            if path is not None
+        }
         if not analysis.load_image_dirs:
-            analysis.warnings.append(
+            add_warning(
                 "The chain does not expose any detectable Load Images folder path. "
-                "If it uses dynamic inputs or custom nodes, verify the input path in chaiNNer directly."
+                "If it uses dynamic inputs or custom nodes, verify the input path in chaiNNer directly.",
+                blocking=True,
             )
         for load_dir in analysis.load_image_dirs:
             if (
-                original_dds_root is not None
-                and png_root is not None
-                and load_dir.resolve() != original_dds_root.resolve()
-                and load_dir.resolve() != png_root.resolve()
+                expected_load_dirs
+                and load_dir.resolve() not in expected_load_dirs
             ):
-                analysis.warnings.append(
-                    f"The chain loads images from a hardcoded folder that does not match this app's roots: {load_dir}"
+                add_warning(
+                    f"The chain loads images from a hardcoded folder that does not match this app's roots: {load_dir}",
+                    blocking=True,
                 )
             if not load_dir.exists():
-                analysis.warnings.append(
-                    f"The chaiNNer Load Images node points at a folder that does not exist: {load_dir}"
+                add_warning(
+                    f"The chaiNNer Load Images node points at a folder that does not exist: {load_dir}",
+                    blocking=True,
                 )
             elif not _contains_any_files(load_dir):
-                analysis.warnings.append(
-                    f"The chaiNNer Load Images node points at {load_dir}, but that folder does not contain any files."
+                add_warning(
+                    f"The chaiNNer Load Images node points at {load_dir}, but that folder does not contain any files.",
+                    blocking=True,
                 )
 
         for save_dir in analysis.save_image_dirs:
             if png_root is not None and save_dir.resolve() != png_root.resolve():
-                analysis.warnings.append(
-                    f"The chain saves images to a hardcoded folder that does not match the configured PNG root: {save_dir}"
+                add_warning(
+                    f"The chain saves images to a hardcoded folder that does not match the configured PNG root: {save_dir}",
+                    blocking=True,
                 )
 
         if not analysis.save_image_dirs:
-            analysis.warnings.append(
+            add_warning(
                 "No chaiNNer Save Images folder was detected. "
-                "Verify that the chain writes image outputs the app can pick up."
+                "Verify that the chain writes image outputs the app can pick up.",
+                blocking=True,
             )
 
         non_png_formats = [fmt for fmt in analysis.save_image_formats if fmt and fmt != "png"]
         if non_png_formats:
-            analysis.warnings.append(
+            add_warning(
                 "The chain Save Images node is configured to write non-PNG output format(s): "
                 + ", ".join(sorted(dict.fromkeys(non_png_formats)))
-                + ". The DDS rebuild stage expects PNG files in PNG root."
+                + ". The DDS rebuild stage expects PNG files in PNG root.",
+                blocking=True,
             )
 
         missing_models = [model for model in analysis.model_files if not model.exists()]
         if missing_models:
-            analysis.warnings.append(
+            add_warning(
                 "The chain references model file(s) that do not exist: "
-                + ", ".join(str(path) for path in missing_models)
+                + ", ".join(str(path) for path in missing_models),
+                blocking=True,
             )
 
+    analysis.planner_compatible = not analysis.blocking_warnings
     return analysis
 
 
@@ -570,6 +604,7 @@ def analyze_chainner_chain(chain_path: Path, config: NormalizedConfig) -> Chainn
     return analyze_chainner_chain_paths(
         chain_path,
         original_dds_root=config.original_dds_root,
+        staging_png_root=config.dds_staging_root,
         png_root=config.png_root,
         chainner_override_json=config.chainner_override_json,
     )
@@ -859,6 +894,8 @@ def detect_chainner_runtime_failure(stdout: str, stderr: str) -> Optional[str]:
 def run_chainner_stage(
     config: NormalizedConfig,
     *,
+    input_root: Optional[Path] = None,
+    expected_relative_paths: Sequence[str | Path] = (),
     expected_output_total: int = 0,
     on_log: Optional[Callable[[str], None]] = None,
     on_phase: Optional[Callable[[str, str, bool], None]] = None,
@@ -984,12 +1021,35 @@ def run_chainner_stage(
         )
 
         after_png_state = get_png_root_state(config.png_root)
+        after_png_snapshot = snapshot_png_outputs(config.png_root)
         png_progress_monitor.flush()
         if on_phase_progress and expected_output_total <= 0 and chainner_log_monitor.last_progress is not None:
             _, total_nodes = chainner_log_monitor.last_progress
             on_phase_progress(total_nodes, total_nodes, f"{total_nodes} / {total_nodes} nodes")
+
+        expected_missing = missing_expected_png_outputs(config.png_root, expected_relative_paths)
+        if expected_relative_paths and expected_missing:
+            preview_missing = ", ".join(expected_missing[:6])
+            extra = "" if len(expected_missing) <= 6 else f" (+{len(expected_missing) - 6} more)"
+            input_root_text = str(input_root) if input_root is not None else "(unknown input root)"
+            raise ValueError(
+                "chaiNNer finished, but it did not produce every planner-selected PNG in the configured PNG root. "
+                f"Input root: {input_root_text}. PNG root: {config.png_root}. Missing output(s): {preview_missing}{extra}. "
+                "This usually means the chain is reading from a different folder, filtering a different file set, or saving elsewhere."
+            )
         if on_log:
             on_log("chaiNNer completed successfully.")
+            if expected_relative_paths:
+                changed_expected = 0
+                for relative_path in expected_relative_paths:
+                    normalized = Path(str(relative_path)).as_posix().lower().lstrip("./")
+                    before_state = before_png_snapshot.get(normalized)
+                    after_state = after_png_snapshot.get(normalized)
+                    if after_state is not None and after_state != before_state:
+                        changed_expected += 1
+                on_log(
+                    f"chaiNNer planner output check: {changed_expected} / {len(expected_relative_paths)} expected PNG path(s) changed or were created in PNG root."
+                )
             if after_png_state == before_png_state:
                 message = (
                     "Warning: chaiNNer exited successfully, but the PNG root did not appear to change. "

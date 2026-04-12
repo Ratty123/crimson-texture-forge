@@ -9,6 +9,46 @@ The format is intentionally simple:
 - `Fixed` for bug fixes
 - `Docs` for README, guide, or release-note changes
 
+## [0.5.0] - 2026-04-12
+
+### Added
+- Automatic `Source Match` reconstruction modes for direct `Real-ESRGAN NCNN` and `ONNX Runtime` workflows, including `Source Match Balanced`, `Source Match Extended`, and `Source Match Experimental`.
+- A planner-owned `technical_high_precision_path` for eligible non-packed scalar technical DDS files, with support for high-precision staged PNGs or validated direct `PNG root` inputs when the backend is disabled.
+- An optional `NCNN extra args` field for advanced Real-ESRGAN NCNN flags such as `-dn 0.2`, with settings/profile persistence and command-line validation.
+- An explicit expert override that can force technical maps such as normals, masks, roughness, height, and vectors through the generic visible-color PNG/upscale path when you intentionally want unsafe technical processing.
+
+### Changed
+- Texture policy is now planner-authoritative across preview, preflight, direct backend execution, DDS rebuild, `Compare`, and `Research`, so path/profile/backend/alpha decisions come from one shared per-texture plan instead of being re-inferred later in the run.
+- Automatic texture policy now routes source-match correction per texture instead of expecting the user to know which post-correction mode belongs to which asset class.
+- Built-in output behavior is now formalized through planner-selected processing profiles, explicit path kinds, centralized backend capability gating, and semantic/profile/intermediate overrides in texture rules.
+- `chaiNNer`, direct `NCNN`, and direct `ONNX` capability handling now follows the same central planner matrix used by policy preview and preflight reporting.
+- `Compare`, `Preview Policy`, and `Research` now surface richer planner metadata, including selected profile, processing path, backend compatibility, alpha policy, and preserve reasons.
+- `Safe Wizard` has been replaced by a read-only `Run Summary` dialog, so the editable backend and texture-policy controls live only in the main Workflow panel while the dialog is reserved for source and run-context review.
+
+### Fixed
+- Planner-driven preserve handling is now more reliable for technical DDS files because technical textures no longer silently fall back into the generic visible-color PNG path.
+- Scalar technical DDS files such as roughness, height/displacement, AO, metallic, specular, subsurface, emissive-intensity, and similar non-packed grayscale data can now rebuild through a safer high-precision path instead of always collapsing into preserve-only or generic color-path behavior.
+- High-precision technical rebuilds now validate their `16-bit` grayscale-style PNG intermediates before use, and missing or invalid inputs are called out in preflight and fall back per file to preserving the original DDS instead of rebuilding from a bad intermediate.
+- `Research` mip analysis and normal validation now include planner-path-aware warnings, making suspicious visible-color routing, suspicious high-precision routing, and scalar-format mismatches easier to catch during QA.
+- The app no longer fails on startup when refreshing `chaiNNer` chain info, because the UI chain-analysis path now passes the staging PNG root expected by the planner-aware `chaiNNer` validator.
+- Rebuild format precedence now respects manual `Match original DDS format` when automatic color/format rules are disabled, so visible color textures no longer get silently promoted to planner profile formats such as `BC7_UNORM_SRGB`.
+- Automatic texture safety rules no longer inject extra texconv sRGB conversion flags for visible textures, which reduces the darker output shifts some users were seeing when the safety checkbox was enabled.
+- `Source Match Balanced` and `Source Match Extended` no longer skip obviously color-like textures just because their semantic hint stayed `unknown`, as long as the planner already routed them through a visible-color profile.
+- Browsing rebuilt DDS files in `Compare` is more responsive because compare preview application now avoids eagerly materializing full preview pixmaps on the UI thread, and rapid compare-row changes are briefly debounced before preview startup.
+- Large DDS files in `Compare` now use a lighter display-preview cache capped for pane browsing, which reduces the lag from cold 4K preview generation/loading without changing the higher-detail preview path used by `Research` analysis.
+- Archive Browser DDS preview no longer fails with `Preview failed: 'NoneType' object is not iterable` after the recent compare-preview refactor, because the shared preview command builder now always returns a valid texconv command.
+- Archive Browser DDS preview now uses the lighter display-preview cache for pane browsing too, reducing freezes or long stalls when selecting larger DDS files.
+- DDS staging for direct backend runs now passes the source DDS path correctly to texconv again, fixing cases where staging appeared to run but the NCNN stage immediately failed with `Expected planner-selected PNG does not exist`.
+- Compare preview shutdown is now safer because queued preview work no longer respawns while the window is closing.
+- Settings persistence and `chaiNNer` chain inspection are now debounced in the UI, reducing stalls from keystroke-by-keystroke disk syncs and chain revalidation.
+- Preserve-only direct `NCNN` / `ONNX` runs now skip the backend stage cleanly instead of scanning unrelated stale PNGs in `PNG root`.
+- `Retry with smaller tile` now steps down correctly from a `tile size 0` full-frame attempt into real smaller tiles.
+- `Research -> Mip Analysis` now only reports DDS files that exist in both Original and Output roots, instead of turning unmatched files into broken comparison rows.
+- DDS preview cache invalidation now includes the active `texconv.exe`, so Compare and Research previews are refreshed when the texconv binary changes.
+
+### Docs
+- Updated README/help/release wording to reflect `Run Summary`, browser-only external setup/model pages, automatic `Source Match` correction, the high-precision technical path, the expert unsafe technical override, and the current direct-backend workflow.
+
 ## [0.4.1] - 2026-04-11
 
 ### Changed

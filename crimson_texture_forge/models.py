@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 from crimson_texture_forge.constants import (
     ALLOW_UNIQUE_BASENAME_FALLBACK,
@@ -33,6 +33,7 @@ from crimson_texture_forge.constants import (
     DRY_RUN,
     ENABLE_CHAINNER,
     ENABLE_AUTOMATIC_TEXTURE_RULES,
+    ENABLE_UNSAFE_TECHNICAL_OVERRIDE,
     ENABLE_DDS_STAGING,
     ENABLE_INCREMENTAL_RESUME,
     ENABLE_MOD_READY_LOOSE_EXPORT,
@@ -50,6 +51,7 @@ from crimson_texture_forge.constants import (
     REALESRGAN_NCNN_MODEL_NAME,
     REALESRGAN_NCNN_SCALE,
     REALESRGAN_NCNN_TILE_SIZE,
+    REALESRGAN_NCNN_EXTRA_ARGS,
     DEFAULT_UPSCALE_POST_CORRECTION,
     RETRY_SMALLER_TILE_ON_FAILURE,
     TEXCONV_PATH,
@@ -59,6 +61,27 @@ from crimson_texture_forge.constants import (
 
 class RunCancelled(Exception):
     pass
+
+
+IntermediateKind = Literal[
+    "visible_color_png_path",
+    "technical_preserve_path",
+    "technical_high_precision_path",
+]
+
+
+AlphaPolicy = Literal[
+    "none",
+    "straight",
+    "cutout_coverage",
+    "channel_data",
+    "premultiplied",
+]
+
+
+@dataclass(slots=True)
+class TextureSemanticEvidence:
+    items: Tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -73,6 +96,8 @@ class ChainnerChainAnalysis:
     model_files: List[Path] = field(default_factory=list)
     upscaler_nodes: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    blocking_warnings: List[str] = field(default_factory=list)
+    planner_compatible: bool = True
 
 
 @dataclass(slots=True)
@@ -82,6 +107,11 @@ class TextureRule:
     format_value: Optional[str] = None
     size_value: Optional[str] = None
     mip_value: Optional[str] = None
+    semantic_value: Optional[str] = None
+    profile_value: Optional[str] = None
+    colorspace_value: Optional[str] = None
+    alpha_policy_value: Optional[str] = None
+    intermediate_value: Optional[str] = None
     source_line: str = ""
 
 
@@ -118,11 +148,13 @@ class AppConfig:
     ncnn_model_name: str = REALESRGAN_NCNN_MODEL_NAME
     ncnn_scale: int = REALESRGAN_NCNN_SCALE
     ncnn_tile_size: int = REALESRGAN_NCNN_TILE_SIZE
+    ncnn_extra_args: str = REALESRGAN_NCNN_EXTRA_ARGS
     upscale_post_correction_mode: str = DEFAULT_UPSCALE_POST_CORRECTION
     onnx_model_dir: str = ONNX_MODEL_DIR
     onnx_model_name: str = ONNX_MODEL_NAME
     upscale_texture_preset: str = DEFAULT_UPSCALE_TEXTURE_PRESET
     enable_automatic_texture_rules: bool = ENABLE_AUTOMATIC_TEXTURE_RULES
+    enable_unsafe_technical_override: bool = ENABLE_UNSAFE_TECHNICAL_OVERRIDE
     retry_smaller_tile_on_failure: bool = RETRY_SMALLER_TILE_ON_FAILURE
     enable_mod_ready_loose_export: bool = ENABLE_MOD_READY_LOOSE_EXPORT
     mod_ready_export_root: str = MOD_READY_EXPORT_ROOT
@@ -172,11 +204,13 @@ class NormalizedConfig:
     ncnn_model_name: str
     ncnn_scale: int
     ncnn_tile_size: int
+    ncnn_extra_args: str
     upscale_post_correction_mode: str
     onnx_model_dir: Optional[Path]
     onnx_model_name: str
     upscale_texture_preset: str
     enable_automatic_texture_rules: bool
+    enable_unsafe_technical_override: bool
     retry_smaller_tile_on_failure: bool
     enable_mod_ready_loose_export: bool
     mod_ready_export_root: Optional[Path]
@@ -190,6 +224,10 @@ class DdsInfo:
     texconv_format: str
     source_path: Path
     has_alpha: bool = False
+    colorspace_intent: str = "unknown"
+    precision_sensitive: bool = False
+    packed_channel_risk: bool = False
+    preserve_only_source: bool = False
 
 
 @dataclass(slots=True)
@@ -202,6 +240,66 @@ class DdsOutputSettings:
     notes: List[str] = field(default_factory=list)
     texconv_color_args: List[str] = field(default_factory=list)
     texconv_extra_args: List[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class TextureProcessingProfile:
+    key: str
+    label: str
+    allowed_intermediate_kinds: Tuple[IntermediateKind, ...]
+    preferred_texconv_format: str
+    colorspace_policy: str
+    alpha_policy: AlphaPolicy
+    mip_policy_hint: str
+    preserve_only: bool = False
+
+
+@dataclass(slots=True)
+class BackendCapabilityDecision:
+    backend: str
+    path_kind: IntermediateKind | str
+    compatible: bool
+    execution_mode: str
+    reason: str
+
+
+@dataclass(slots=True)
+class BackendCapabilityMatrix:
+    backend: str
+    decisions_by_path_kind: Dict[str, BackendCapabilityDecision] = field(default_factory=dict)
+    planner_notes: Tuple[str, ...] = ()
+
+    def decision_for(self, path_kind: str) -> BackendCapabilityDecision:
+        return self.decisions_by_path_kind.get(
+            path_kind,
+            BackendCapabilityDecision(
+                backend=self.backend,
+                path_kind=path_kind,
+                compatible=False,
+                execution_mode="preserve_original",
+                reason=f"Unsupported planner path kind: {path_kind}",
+            ),
+        )
+
+
+@dataclass(slots=True)
+class TextureProcessingPlan:
+    dds_path: Path
+    relative_path: Path
+    dds_info: DdsInfo
+    decision: "TextureUpscaleDecision"
+    action: str
+    action_reason: str
+    path_kind: IntermediateKind | str
+    intermediate_kind: IntermediateKind | str
+    profile: TextureProcessingProfile
+    alpha_policy: AlphaPolicy | str
+    backend_capability: BackendCapabilityDecision
+    requires_png_processing: bool
+    preserve_reason: str = ""
+    lossy_intermediate_warning: str = ""
+    matched_rule: Optional[TextureRule] = None
+    semantic_evidence: TextureSemanticEvidence = field(default_factory=TextureSemanticEvidence)
 
 
 @dataclass(slots=True)

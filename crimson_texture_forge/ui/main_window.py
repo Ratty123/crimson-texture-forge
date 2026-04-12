@@ -379,12 +379,16 @@ def run_gui() -> int:
             texconv_path: Optional[Path],
             original_path: Optional[Path],
             output_path: Optional[Path],
+            original_planner_summary: str = "",
+            output_planner_summary: str = "",
         ):
             super().__init__()
             self.request_id = request_id
             self.texconv_path = texconv_path
             self.original_path = original_path
             self.output_path = output_path
+            self.original_planner_summary = original_planner_summary
+            self.output_planner_summary = output_planner_summary
 
         @Slot()
         def run(self) -> None:
@@ -394,11 +398,13 @@ def run_gui() -> int:
                         self.texconv_path,
                         self.original_path,
                         "Original DDS not found.",
+                        self.original_planner_summary,
                     ),
                     "output": build_compare_preview_pane_result(
                         self.texconv_path,
                         self.output_path,
                         "Output DDS not found.",
+                        self.output_planner_summary,
                     ),
                 }
                 self.completed.emit(self.request_id, payload)
@@ -463,6 +469,19 @@ def run_gui() -> int:
             self.compare_preview_worker: Optional[ComparePreviewWorker] = None
             self.compare_preview_request_id = 0
             self.pending_compare_preview_request: Optional[Tuple[int, Path]] = None
+            self.pending_compare_preview_selection: Optional[Path] = None
+            self._shutting_down = False
+            self._settings_save_timer = QTimer(self)
+            self._settings_save_timer.setSingleShot(True)
+            self._settings_save_timer.setInterval(250)
+            self._settings_save_timer.timeout.connect(self._save_settings)
+            self._chainner_analysis_timer = QTimer(self)
+            self._chainner_analysis_timer.setSingleShot(True)
+            self._chainner_analysis_timer.setInterval(250)
+            self._chainner_analysis_timer.timeout.connect(self._refresh_chainner_chain_info)
+            self._compare_preview_timer = QTimer(self)
+            self._compare_preview_timer.setSingleShot(True)
+            self._compare_preview_timer.setInterval(90)
             self.compare_syncing_scrollbars = False
             self.workflow_right_splitter_normal_sizes: Optional[List[int]] = None
             self.archive_preview_thread: Optional[QThread] = None
@@ -787,11 +806,18 @@ def run_gui() -> int:
             texture_rules_hint.setWordWrap(True)
             texture_rules_hint.setToolTip(
                 "One rule per line: pattern ; action=skip/process ; format=BC7_UNORM ; "
-                "size=original/png/2048x2048 ; mips=match_original/full/single/1"
+                "size=original/png/2048x2048 ; mips=match_original/full/single/1 ; "
+                "semantic=color:albedo ; profile=color_default ; colorspace=srgb/linear/match_source ; "
+                "alpha=cutout_coverage/straight/channel_data/premultiplied ; "
+                "intermediate=visible_color_png_path/technical_preserve_path/technical_high_precision_path"
             )
             self.texture_rules_edit = QPlainTextEdit()
             self.texture_rules_edit.setPlaceholderText(
-                "# examples\n*_n.dds; format=BC5_UNORM; size=original; mips=match_original\nui/**/*.dds; mips=single\n*_mask.dds; action=skip"
+                "# examples\n"
+                "*_n.dds; action=skip\n"
+                "ui/**/*.dds; mips=single; profile=ui_alpha\n"
+                "*_height.dds; profile=scalar_high_precision_bc4; intermediate=technical_high_precision_path\n"
+                "*_mask.dds; semantic=mask:opacity_mask; alpha=channel_data; intermediate=technical_preserve_path"
             )
             self.texture_rules_edit.setMinimumHeight(90)
             self.texture_rules_edit.setMaximumHeight(120)
@@ -822,10 +848,9 @@ def run_gui() -> int:
             self._add_combo_choice(self.upscale_backend_combo, "chaiNNer", UPSCALE_BACKEND_CHAINNER)
             self._add_combo_choice(self.upscale_backend_combo, "Real-ESRGAN NCNN", UPSCALE_BACKEND_REALESRGAN_NCNN)
             self._add_combo_choice(self.upscale_backend_combo, "ONNX Runtime", UPSCALE_BACKEND_ONNX_RUNTIME)
-            self.safe_upscale_wizard_button = QPushButton("Safe Wizard")
+            self.safe_upscale_wizard_button = QPushButton("Run Summary")
             self.safe_upscale_wizard_button.setToolTip(
-                "Optional helper. It does not need to be opened before Start. "
-                "Start always uses the current workflow settings shown here."
+                "Open a read-only summary of the current sources, backend, texture policy, and direct upscale settings before running."
             )
             upscale_backend_grid.addWidget(QLabel("Backend"), 0, 0)
             upscale_backend_grid.addWidget(self.upscale_backend_combo, 0, 1)
@@ -1025,8 +1050,9 @@ def run_gui() -> int:
             self.ncnn_tile_size_spin = QSpinBox()
             self.ncnn_tile_size_spin.setRange(0, 32768)
             self.ncnn_tile_size_spin.setSingleStep(32)
+            self.ncnn_extra_args_edit = QLineEdit()
             self.upscale_post_correction_combo = QComboBox()
-            self._add_combo_choice(self.upscale_post_correction_combo, "Off (recommended)", UPSCALE_POST_CORRECTION_NONE)
+            self._add_combo_choice(self.upscale_post_correction_combo, "Off", UPSCALE_POST_CORRECTION_NONE)
             self._add_combo_choice(
                 self.upscale_post_correction_combo,
                 "Match Mean Luma",
@@ -1042,12 +1068,30 @@ def run_gui() -> int:
                 "Match Histogram",
                 UPSCALE_POST_CORRECTION_MATCH_HISTOGRAM,
             )
+            self._add_combo_choice(
+                self.upscale_post_correction_combo,
+                "Source Match Balanced (recommended)",
+                UPSCALE_POST_CORRECTION_SOURCE_MATCH_BALANCED,
+            )
+            self._add_combo_choice(
+                self.upscale_post_correction_combo,
+                "Source Match Extended",
+                UPSCALE_POST_CORRECTION_SOURCE_MATCH_EXTENDED,
+            )
+            self._add_combo_choice(
+                self.upscale_post_correction_combo,
+                "Source Match Experimental",
+                UPSCALE_POST_CORRECTION_SOURCE_MATCH_EXPERIMENTAL,
+            )
             self.upscale_texture_preset_combo = QComboBox()
             self._add_combo_choice(self.upscale_texture_preset_combo, "Balanced mixed textures (recommended)", UPSCALE_TEXTURE_PRESET_BALANCED)
             self._add_combo_choice(self.upscale_texture_preset_combo, "Color + UI only (safer)", UPSCALE_TEXTURE_PRESET_COLOR_UI)
             self._add_combo_choice(self.upscale_texture_preset_combo, "Color + UI + emissive", UPSCALE_TEXTURE_PRESET_COLOR_UI_EMISSIVE)
             self._add_combo_choice(self.upscale_texture_preset_combo, "All textures (advanced)", UPSCALE_TEXTURE_PRESET_ALL)
-            self.enable_automatic_texture_rules_checkbox = QCheckBox("Use automatic color / format rules")
+            self.enable_automatic_texture_rules_checkbox = QCheckBox("Use automatic texture safety rules")
+            self.enable_unsafe_technical_override_checkbox = QCheckBox(
+                "Expert override: force technical maps through PNG/upscale path (unsafe)"
+            )
             self.retry_smaller_tile_checkbox = QCheckBox("Retry with smaller tile on failure")
             self.enable_mod_ready_loose_export_checkbox = QCheckBox("Create mod-ready loose export after rebuild")
             self.mod_ready_export_root_edit = QLineEdit()
@@ -1058,15 +1102,25 @@ def run_gui() -> int:
             self.ncnn_tile_size_spin.setToolTip(
                 "Tile size for direct backends. 0 means no manual tiling. Smaller values use less VRAM and can recover from failures, but run slower."
             )
+            self.ncnn_extra_args_edit.setToolTip(
+                "Optional extra command-line arguments appended to the Real-ESRGAN NCNN call. "
+                "Example: -dn 0.2. Use only flags supported by the selected NCNN build/model."
+            )
+            self.ncnn_extra_args_edit.setPlaceholderText('Example: -dn 0.2')
             self.upscale_post_correction_combo.setToolTip(
-                "Optional post-upscale color correction applied after a direct backend writes the final PNG and before DDS rebuild. "
-                "Only visible color, UI, emissive, and impostor textures are corrected automatically."
+                "Optional post-upscale correction applied after a direct backend writes the final PNG and before DDS rebuild. "
+                "Source Match modes automatically decide per texture whether to apply visible RGB correction, scalar grayscale correction, limited RGB-only correction, or a full skip."
             )
             self.upscale_texture_preset_combo.setToolTip(
                 "Controls which texture types are allowed into the PNG/upscale path and which ones are copied through unchanged."
             )
             self.enable_automatic_texture_rules_checkbox.setToolTip(
-                "Applies safer DDS rebuild recommendations such as color-space, compression, alpha, and technical-map preservation rules."
+                "Applies safer DDS rebuild recommendations for format flags, alpha handling, and technical-map preservation. "
+                "This is a safety/policy feature, not a brightness correction feature."
+            )
+            self.enable_unsafe_technical_override_checkbox.setToolTip(
+                "Expert-only override. Forces technical textures such as normals, masks, roughness, height, and vectors onto the generic visible-color PNG/upscale path "
+                "instead of preserving them. This can produce broken normals, bad masks, or incorrect shading."
             )
 
             self.texture_policy_group = QGroupBox("Texture Policy")
@@ -1079,19 +1133,20 @@ def run_gui() -> int:
             policy_layout.addWidget(QLabel("Preset"), 0, 0)
             policy_layout.addWidget(self.upscale_texture_preset_combo, 0, 1)
             policy_layout.addWidget(self.enable_automatic_texture_rules_checkbox, 1, 0, 1, 2)
-            policy_layout.addWidget(self.enable_mod_ready_loose_export_checkbox, 2, 0, 1, 2)
-            policy_layout.addWidget(QLabel("Loose export root"), 3, 0)
+            policy_layout.addWidget(self.enable_unsafe_technical_override_checkbox, 2, 0, 1, 2)
+            policy_layout.addWidget(self.enable_mod_ready_loose_export_checkbox, 3, 0, 1, 2)
+            policy_layout.addWidget(QLabel("Loose export root"), 4, 0)
             loose_export_row = QHBoxLayout()
             loose_export_row.setContentsMargins(0, 0, 0, 0)
             loose_export_row.setSpacing(8)
             loose_export_row.addWidget(self.mod_ready_export_root_edit, stretch=1)
             loose_export_row.addWidget(self.mod_ready_export_browse_button)
-            policy_layout.addLayout(loose_export_row, 3, 1)
+            policy_layout.addLayout(loose_export_row, 4, 1)
 
             self.texture_policy_hint_label = QLabel()
             self.texture_policy_hint_label.setObjectName("HintLabel")
             self.texture_policy_hint_label.setWordWrap(True)
-            policy_layout.addWidget(self.texture_policy_hint_label, 4, 0, 1, 2)
+            policy_layout.addWidget(self.texture_policy_hint_label, 5, 0, 1, 2)
             upscale_layout.addWidget(self.texture_policy_group)
 
             self.direct_backend_controls_group = QGroupBox("Direct Upscale Controls (NCNN / ONNX only)")
@@ -1105,19 +1160,21 @@ def run_gui() -> int:
             direct_layout.addWidget(self.ncnn_scale_spin, 0, 1)
             direct_layout.addWidget(QLabel("Tile size"), 1, 0)
             direct_layout.addWidget(self.ncnn_tile_size_spin, 1, 1)
-            direct_layout.addWidget(QLabel("Post correction"), 2, 0)
-            direct_layout.addWidget(self.upscale_post_correction_combo, 2, 1)
-            direct_layout.addWidget(self.retry_smaller_tile_checkbox, 3, 0, 1, 2)
+            direct_layout.addWidget(QLabel("NCNN extra args"), 2, 0)
+            direct_layout.addWidget(self.ncnn_extra_args_edit, 2, 1)
+            direct_layout.addWidget(QLabel("Post correction"), 3, 0)
+            direct_layout.addWidget(self.upscale_post_correction_combo, 3, 1)
+            direct_layout.addWidget(self.retry_smaller_tile_checkbox, 4, 0, 1, 2)
 
             self.direct_backend_hint_label = QLabel()
             self.direct_backend_hint_label.setObjectName("HintLabel")
             self.direct_backend_hint_label.setWordWrap(True)
-            direct_layout.addWidget(self.direct_backend_hint_label, 4, 0, 1, 2)
+            direct_layout.addWidget(self.direct_backend_hint_label, 5, 0, 1, 2)
             upscale_layout.addWidget(self.direct_backend_controls_group)
 
             self.safe_wizard_help_label = QLabel(
                 "Start always uses the current settings shown in Workflow. "
-                "Safe Wizard is optional and mirrors the same backend and policy settings shown here before you run."
+                "Run Summary is optional and shows the current sources, backend, and policy without duplicating those controls."
             )
             self.safe_wizard_help_label.setObjectName("HintLabel")
             self.safe_wizard_help_label.setWordWrap(True)
@@ -1712,6 +1769,7 @@ def run_gui() -> int:
                 get_original_root=lambda: self.original_dds_edit.text(),
                 get_output_root=lambda: self.output_root_edit.text(),
                 get_texconv_path=lambda: self.texconv_path_edit.text(),
+                get_app_config=self.collect_config,
                 get_current_archive_path=self.current_archive_path_for_research,
                 get_current_text_search_path=self.text_search_tab.current_result_path,
                 get_current_compare_path=self.current_compare_path_for_research,
@@ -1767,21 +1825,21 @@ def run_gui() -> int:
             self.archive_filter_edit.returnPressed.connect(self._apply_archive_filter)
             self.archive_exclude_filter_edit.returnPressed.connect(self._apply_archive_filter)
             self.archive_package_filter_edit.returnPressed.connect(self._apply_archive_filter)
-            self.archive_filter_edit.textChanged.connect(self._save_settings)
+            self.archive_filter_edit.textChanged.connect(self.schedule_settings_save)
             self.archive_filter_edit.textChanged.connect(self._mark_archive_filters_dirty)
-            self.archive_exclude_filter_edit.textChanged.connect(self._save_settings)
+            self.archive_exclude_filter_edit.textChanged.connect(self.schedule_settings_save)
             self.archive_exclude_filter_edit.textChanged.connect(self._mark_archive_filters_dirty)
-            self.archive_package_filter_edit.textChanged.connect(self._save_settings)
+            self.archive_package_filter_edit.textChanged.connect(self.schedule_settings_save)
             self.archive_package_filter_edit.textChanged.connect(self._mark_archive_filters_dirty)
-            self.archive_extension_filter_combo.currentIndexChanged.connect(self._save_settings)
+            self.archive_extension_filter_combo.currentIndexChanged.connect(self.schedule_settings_save)
             self.archive_extension_filter_combo.currentIndexChanged.connect(self._mark_archive_filters_dirty)
-            self.archive_role_filter_combo.currentIndexChanged.connect(self._save_settings)
+            self.archive_role_filter_combo.currentIndexChanged.connect(self.schedule_settings_save)
             self.archive_role_filter_combo.currentIndexChanged.connect(self._mark_archive_filters_dirty)
-            self.archive_exclude_common_technical_checkbox.toggled.connect(self._save_settings)
+            self.archive_exclude_common_technical_checkbox.toggled.connect(self.schedule_settings_save)
             self.archive_exclude_common_technical_checkbox.toggled.connect(self._mark_archive_filters_dirty)
-            self.archive_min_size_spin.valueChanged.connect(self._save_settings)
+            self.archive_min_size_spin.valueChanged.connect(self.schedule_settings_save)
             self.archive_min_size_spin.valueChanged.connect(self._mark_archive_filters_dirty)
-            self.archive_previewable_only_checkbox.toggled.connect(self._save_settings)
+            self.archive_previewable_only_checkbox.toggled.connect(self.schedule_settings_save)
             self.archive_previewable_only_checkbox.toggled.connect(self._mark_archive_filters_dirty)
             self.archive_tree.currentItemChanged.connect(self._handle_archive_current_item_change)
             self.archive_tree.itemSelectionChanged.connect(self._update_archive_selection_state)
@@ -1804,6 +1862,7 @@ def run_gui() -> int:
             self.output_compare_zoom_out_button.clicked.connect(lambda: self._adjust_compare_zoom("output", -1))
             self.output_compare_zoom_in_button.clicked.connect(lambda: self._adjust_compare_zoom("output", 1))
             self.compare_list.currentItemChanged.connect(self._handle_compare_selection_change)
+            self._compare_preview_timer.timeout.connect(self._flush_pending_compare_preview_selection)
             self.original_preview_scroll.horizontalScrollBar().valueChanged.connect(
                 lambda value: self._sync_compare_scrollbar(
                     self.original_preview_scroll.horizontalScrollBar(),
@@ -1900,7 +1959,7 @@ def run_gui() -> int:
               <li>If DDS-to-PNG conversion is enabled, make sure the chain reads PNG input from the correct folder.</li>
               <li><b>Real-ESRGAN NCNN</b> runs directly from the app after you point it at a local executable and model folder. <b>Setup</b> now opens the official download page instead of downloading the package inside the app, and it can still import NCNN <code>.param</code> / <code>.bin</code> model pairs that you downloaded yourself.</li>
               <li><b>ONNX Runtime</b> runs directly inside the app when <b>onnxruntime</b> is installed and a valid <code>.onnx</code> model folder is configured. The app currently opens the official setup guide rather than installing ONNX Runtime for you.</li>
-              <li><b>Safe Wizard</b> can apply backend choice, texture presets, automatic rules, retry behavior, and mod-ready loose export in one guided step.</li>
+              <li><b>Run Summary</b> shows the current sources, backend, and policy before you start, without duplicating the workflow controls.</li>
             </ul>
             <h3>Dependencies</h3>
             <ul>
@@ -1966,13 +2025,16 @@ def run_gui() -> int:
                 return None, f"Chain file not found: {chain_path}"
 
             original_root_text = self.original_dds_edit.text().strip()
+            staging_root_text = self.dds_staging_root_edit.text().strip()
             png_root_text = self.png_root_edit.text().strip()
             original_root = Path(original_root_text).expanduser().resolve() if original_root_text else None
+            staging_root = Path(staging_root_text).expanduser().resolve() if staging_root_text else None
             png_root = Path(png_root_text).expanduser().resolve() if png_root_text else None
 
             analysis = analyze_chainner_chain_paths(
                 chain_path,
                 original_dds_root=original_root,
+                staging_png_root=staging_root,
                 png_root=png_root,
                 chainner_override_json=self.chainner_override_edit.toPlainText(),
             )
@@ -1985,7 +2047,7 @@ def run_gui() -> int:
                 )
             if original_root is None or png_root is None:
                 notes.append(
-                    "Path-mismatch validation is limited until both Original DDS root and PNG root are configured."
+                    "Path-mismatch validation is limited until Original DDS root and PNG root are configured. DDS staging validation is also limited until DDS staging root is configured when staging is enabled."
                 )
             if notes:
                 text += "\n\nNotes:\n" + "\n".join(f"- {note}" for note in notes)
@@ -2030,6 +2092,7 @@ def run_gui() -> int:
                 self.chainner_override_edit.setPlainText(config.chainner_override_json)
                 self.ncnn_exe_path_edit.setText(getattr(config, "ncnn_exe_path", ""))
                 self.ncnn_model_dir_edit.setText(getattr(config, "ncnn_model_dir", ""))
+                self.ncnn_extra_args_edit.setText(getattr(config, "ncnn_extra_args", ""))
                 self.onnx_model_dir_edit.setText(getattr(config, "onnx_model_dir", ""))
                 self.ncnn_scale_spin.setValue(int(getattr(config, "ncnn_scale", REALESRGAN_NCNN_SCALE)))
                 self.ncnn_tile_size_spin.setValue(int(getattr(config, "ncnn_tile_size", REALESRGAN_NCNN_TILE_SIZE)))
@@ -2043,6 +2106,9 @@ def run_gui() -> int:
                 )
                 self.enable_automatic_texture_rules_checkbox.setChecked(
                     bool(getattr(config, "enable_automatic_texture_rules", ENABLE_AUTOMATIC_TEXTURE_RULES))
+                )
+                self.enable_unsafe_technical_override_checkbox.setChecked(
+                    bool(getattr(config, "enable_unsafe_technical_override", ENABLE_UNSAFE_TECHNICAL_OVERRIDE))
                 )
                 self.retry_smaller_tile_checkbox.setChecked(
                     bool(getattr(config, "retry_smaller_tile_on_failure", RETRY_SMALLER_TILE_ON_FAILURE))
@@ -2077,7 +2143,7 @@ def run_gui() -> int:
             self._refresh_chainner_chain_info()
             if theme_key and theme_key in UI_THEME_SCHEMES:
                 self._handle_theme_changed(theme_key)
-            self._save_settings()
+            self.flush_settings_save()
 
         def export_profile(self) -> None:
             try:
@@ -2281,7 +2347,7 @@ def run_gui() -> int:
             self.text_search_tab.set_theme(self.current_theme_key)
             self.research_tab.set_theme(self.current_theme_key)
             self.settings_tab.set_theme_selection(self.current_theme_key)
-            self._save_settings()
+            self.schedule_settings_save()
 
         def _preference_bool(self, key: str, default: bool) -> bool:
             return self._read_bool(f"preferences/{key}", default)
@@ -2429,13 +2495,14 @@ def run_gui() -> int:
                 self.chainner_chain_path_edit,
                 self.ncnn_exe_path_edit,
                 self.ncnn_model_dir_edit,
+                self.ncnn_extra_args_edit,
                 self.onnx_model_dir_edit,
                 self.mod_ready_export_root_edit,
                 self.archive_package_root_edit,
                 self.archive_extract_root_edit,
             ]
             for line_edit in line_edits:
-                line_edit.textChanged.connect(self._save_settings)
+                line_edit.textChanged.connect(self.schedule_settings_save)
 
             checkboxes = [
                 self.dry_run_checkbox,
@@ -2445,11 +2512,12 @@ def run_gui() -> int:
                 self.unique_basename_checkbox,
                 self.overwrite_existing_checkbox,
                 self.enable_automatic_texture_rules_checkbox,
+                self.enable_unsafe_technical_override_checkbox,
                 self.retry_smaller_tile_checkbox,
                 self.enable_mod_ready_loose_export_checkbox,
             ]
             for checkbox in checkboxes:
-                checkbox.toggled.connect(self._save_settings)
+                checkbox.toggled.connect(self.schedule_settings_save)
 
             combos = [
                 self.dds_format_mode_combo,
@@ -2464,7 +2532,7 @@ def run_gui() -> int:
                 self.compare_preview_size_combo,
             ]
             for combo in combos:
-                combo.currentIndexChanged.connect(self._save_settings)
+                combo.currentIndexChanged.connect(self.schedule_settings_save)
 
             spins = [
                 self.dds_custom_width_spin,
@@ -2474,7 +2542,7 @@ def run_gui() -> int:
                 self.ncnn_tile_size_spin,
             ]
             for spin in spins:
-                spin.valueChanged.connect(self._save_settings)
+                spin.valueChanged.connect(self.schedule_settings_save)
 
             self.csv_log_enabled_checkbox.toggled.connect(self._apply_csv_log_enabled_state)
             self.upscale_backend_combo.currentIndexChanged.connect(self._apply_upscale_backend_state)
@@ -2486,7 +2554,8 @@ def run_gui() -> int:
             self.dds_size_mode_combo.currentIndexChanged.connect(self._apply_dds_output_state)
             self.dds_mip_mode_combo.currentIndexChanged.connect(self._apply_dds_output_state)
             self.upscale_texture_preset_combo.currentIndexChanged.connect(self._update_ncnn_preset_hint)
-            self.safe_upscale_wizard_button.clicked.connect(self.open_safe_upscale_wizard)
+            self.enable_unsafe_technical_override_checkbox.toggled.connect(self._update_ncnn_preset_hint)
+            self.safe_upscale_wizard_button.clicked.connect(self.open_run_summary)
             self.ncnn_model_refresh_button.clicked.connect(self._refresh_ncnn_model_picker)
             self.ncnn_model_catalog_button.clicked.connect(self.open_ncnn_model_catalog)
             self.ncnn_exe_path_edit.textChanged.connect(self._refresh_ncnn_model_picker)
@@ -2495,26 +2564,26 @@ def run_gui() -> int:
             self.onnx_model_dir_edit.textChanged.connect(self._refresh_onnx_model_picker)
             self.mod_ready_export_browse_button.clicked.connect(self._browse_mod_ready_export_root)
             self.enable_mod_ready_loose_export_checkbox.toggled.connect(self._apply_mod_ready_export_state)
-            self.compare_sync_pan_checkbox.toggled.connect(self._save_settings)
+            self.compare_sync_pan_checkbox.toggled.connect(self.schedule_settings_save)
             self.compare_preview_size_combo.currentIndexChanged.connect(self._apply_compare_preview_size_mode)
             self.main_tabs.currentChanged.connect(self._handle_main_tab_changed)
             self.content_tabs.currentChanged.connect(self._handle_workflow_content_tab_changed)
-            self.workflow_splitter.splitterMoved.connect(lambda *_args: self._save_settings())
-            self.workflow_right_splitter.splitterMoved.connect(lambda *_args: self._save_settings())
-            self.compare_splitter.splitterMoved.connect(lambda *_args: self._save_settings())
-            self.archive_splitter.splitterMoved.connect(lambda *_args: self._save_settings())
-            self.text_search_tab.main_splitter.splitterMoved.connect(lambda *_args: self._save_settings())
-            self.setup_section.toggled.connect(self._save_settings)
-            self.paths_section.toggled.connect(self._save_settings)
-            self.settings_section.toggled.connect(self._save_settings)
-            self.dds_output_section.toggled.connect(self._save_settings)
-            self.filters_section.toggled.connect(self._save_settings)
-            self.chainner_section.toggled.connect(self._save_settings)
-            self.filters_edit.textChanged.connect(self._save_settings)
-            self.texture_rules_edit.textChanged.connect(self._save_settings)
-            self.chainner_override_edit.textChanged.connect(self._save_settings)
-            self.chainner_chain_path_edit.textChanged.connect(self._refresh_chainner_chain_info)
-            self.chainner_override_edit.textChanged.connect(self._refresh_chainner_chain_info)
+            self.workflow_splitter.splitterMoved.connect(lambda *_args: self.schedule_settings_save())
+            self.workflow_right_splitter.splitterMoved.connect(lambda *_args: self.schedule_settings_save())
+            self.compare_splitter.splitterMoved.connect(lambda *_args: self.schedule_settings_save())
+            self.archive_splitter.splitterMoved.connect(lambda *_args: self.schedule_settings_save())
+            self.text_search_tab.main_splitter.splitterMoved.connect(lambda *_args: self.schedule_settings_save())
+            self.setup_section.toggled.connect(self.schedule_settings_save)
+            self.paths_section.toggled.connect(self.schedule_settings_save)
+            self.settings_section.toggled.connect(self.schedule_settings_save)
+            self.dds_output_section.toggled.connect(self.schedule_settings_save)
+            self.filters_section.toggled.connect(self.schedule_settings_save)
+            self.chainner_section.toggled.connect(self.schedule_settings_save)
+            self.filters_edit.textChanged.connect(self.schedule_settings_save)
+            self.texture_rules_edit.textChanged.connect(self.schedule_settings_save)
+            self.chainner_override_edit.textChanged.connect(self.schedule_settings_save)
+            self.chainner_chain_path_edit.textChanged.connect(self._schedule_chainner_chain_info_refresh)
+            self.chainner_override_edit.textChanged.connect(self._schedule_chainner_chain_info_refresh)
 
         def _handle_main_tab_changed(self, index: int) -> None:
             if 0 <= index < self.main_tabs.count() and self.main_tabs.widget(index) is self.workflow_tab:
@@ -2610,11 +2679,13 @@ def run_gui() -> int:
             self.settings.setValue("ncnn/model_name", self._combo_value(self.ncnn_model_combo))
             self.settings.setValue("ncnn/scale", self.ncnn_scale_spin.value())
             self.settings.setValue("ncnn/tile_size", self.ncnn_tile_size_spin.value())
+            self.settings.setValue("ncnn/extra_args", self.ncnn_extra_args_edit.text())
             self.settings.setValue("upscale/post_correction_mode", self._combo_value(self.upscale_post_correction_combo))
             self.settings.setValue("ncnn/texture_preset", self._combo_value(self.upscale_texture_preset_combo))
             self.settings.setValue("onnx/model_dir", self.onnx_model_dir_edit.text())
             self.settings.setValue("onnx/model_name", self._combo_value(self.onnx_model_combo))
             self.settings.setValue("upscale/automatic_texture_rules", self.enable_automatic_texture_rules_checkbox.isChecked())
+            self.settings.setValue("upscale/unsafe_technical_override", self.enable_unsafe_technical_override_checkbox.isChecked())
             self.settings.setValue("upscale/retry_smaller_tile", self.retry_smaller_tile_checkbox.isChecked())
             self.settings.setValue("upscale/mod_ready_loose_export", self.enable_mod_ready_loose_export_checkbox.isChecked())
             self.settings.setValue("upscale/mod_ready_export_root", self.mod_ready_export_root_edit.text())
@@ -2645,6 +2716,16 @@ def run_gui() -> int:
             self.settings.setValue("sections/filters_expanded", self.filters_section.toggle_button.isChecked())
             self.settings.setValue("sections/chainner_expanded", self.chainner_section.toggle_button.isChecked())
             self.settings.sync()
+
+        def schedule_settings_save(self, *_args) -> None:
+            if not self._settings_ready or self._shutting_down:
+                return
+            self._settings_save_timer.start()
+
+        def flush_settings_save(self) -> None:
+            if self._settings_save_timer.isActive():
+                self._settings_save_timer.stop()
+            self._save_settings()
 
         def _load_settings(self) -> None:
             defaults = default_config()
@@ -2771,6 +2852,9 @@ def run_gui() -> int:
             self.ncnn_model_dir_edit.setText(
                 self.settings.value("ncnn/model_dir", getattr(defaults, "ncnn_model_dir", REALESRGAN_NCNN_MODEL_DIR))
             )
+            self.ncnn_extra_args_edit.setText(
+                str(self.settings.value("ncnn/extra_args", getattr(defaults, "ncnn_extra_args", REALESRGAN_NCNN_EXTRA_ARGS)))
+            )
             self.onnx_model_dir_edit.setText(
                 self.settings.value("onnx/model_dir", getattr(defaults, "onnx_model_dir", ONNX_MODEL_DIR))
             )
@@ -2818,6 +2902,12 @@ def run_gui() -> int:
                 self._read_bool(
                     "upscale/automatic_texture_rules",
                     getattr(defaults, "enable_automatic_texture_rules", ENABLE_AUTOMATIC_TEXTURE_RULES),
+                )
+            )
+            self.enable_unsafe_technical_override_checkbox.setChecked(
+                self._read_bool(
+                    "upscale/unsafe_technical_override",
+                    getattr(defaults, "enable_unsafe_technical_override", ENABLE_UNSAFE_TECHNICAL_OVERRIDE),
                 )
             )
             self.retry_smaller_tile_checkbox.setChecked(
@@ -2908,6 +2998,7 @@ def run_gui() -> int:
             self.ncnn_model_dir_browse_button.setEnabled(ncnn_enabled)
             self.ncnn_model_combo.setEnabled(ncnn_enabled and self.ncnn_model_combo.count() > 0 and bool(self._combo_value(self.ncnn_model_combo)))
             self.ncnn_model_refresh_button.setEnabled(ncnn_enabled)
+            self.ncnn_extra_args_edit.setEnabled(ncnn_enabled)
             direct_backend_enabled = backend in {UPSCALE_BACKEND_REALESRGAN_NCNN, UPSCALE_BACKEND_ONNX_RUNTIME}
             self.texture_policy_group.setVisible(True)
             self.direct_backend_controls_group.setVisible(direct_backend_enabled)
@@ -2931,8 +3022,15 @@ def run_gui() -> int:
             self._sync_upscale_backend_stack_height()
 
         def _refresh_chainner_chain_info(self) -> None:
+            if self._shutting_down:
+                return
             _analysis, text = self._resolve_chainner_analysis()
             self.chainner_chain_info_view.setPlainText(text)
+
+        def _schedule_chainner_chain_info_refresh(self, *_args) -> None:
+            if self._shutting_down or not self._settings_ready:
+                return
+            self._chainner_analysis_timer.start()
 
         def _apply_dds_staging_enabled_state(self) -> None:
             enabled = self.enable_dds_staging_checkbox.isChecked()
@@ -3085,6 +3183,10 @@ def run_gui() -> int:
                 "This policy applies before DDS rebuild for every backend. Files kept out of the PNG path are copied through as original DDS when the current rules say they are safer untouched.",
                 "Automatic rules still control final color space, compression, alpha-aware hints, and technical-map preservation after that policy is applied.",
             ]
+            if self.enable_unsafe_technical_override_checkbox.isChecked():
+                policy_lines.append(
+                    "Expert override is enabled: technical textures can be forced through the generic visible-color PNG/upscale path even when the planner would normally preserve them."
+                )
             if preset_definition.warning:
                 policy_lines.append(preset_definition.warning)
             self.texture_policy_hint_label.setText(" ".join(policy_lines))
@@ -3099,12 +3201,12 @@ def run_gui() -> int:
                 direct_text = (
                     "These controls only affect the direct Real-ESRGAN NCNN PNG upscale pass. "
                     "Scale should stay close to the selected model's intended native scale, smaller tile sizes trade speed for lower VRAM use, "
-                    "and post correction can optionally pull visible color textures closer to the source luma or tonal range before DDS rebuild."
+                    "and post correction can automatically decide per texture how aggressively to pull safe outputs back toward the source before DDS rebuild."
                 )
             elif backend == UPSCALE_BACKEND_ONNX_RUNTIME:
                 direct_text = (
                     "These controls only affect the direct ONNX PNG upscale pass. "
-                    "Scale and tile settings shape how the direct backend runs, optional post correction can match the source more closely for visible color textures, "
+                    "Scale and tile settings shape how the direct backend runs, optional post correction can automatically route safe textures toward source matching, "
                     "and DDS Output below still controls final DDS format, size, and mip behavior."
                 )
             else:
@@ -3114,7 +3216,7 @@ def run_gui() -> int:
                 )
             self.direct_backend_hint_label.setText(direct_text)
 
-        def open_safe_upscale_wizard(self) -> None:
+        def open_run_summary(self) -> None:
             dialog = SafeUpscaleWizard(theme_key=self.current_theme_key, parent=self)
             config = self.collect_config()
             dialog.populate_from_config(
@@ -3123,8 +3225,10 @@ def run_gui() -> int:
                     "preset": config.upscale_texture_preset,
                     "scale": config.ncnn_scale,
                     "tile_size": config.ncnn_tile_size,
+                    "ncnn_extra_args": config.ncnn_extra_args,
                     "post_correction_mode": config.upscale_post_correction_mode,
                     "use_automatic_rules": config.enable_automatic_texture_rules,
+                    "unsafe_technical_override": config.enable_unsafe_technical_override,
                     "retry_smaller_tile": config.retry_smaller_tile_on_failure,
                     "loose_export": config.enable_mod_ready_loose_export,
                     "source_root": config.archive_package_root or config.original_dds_root,
@@ -3133,31 +3237,10 @@ def run_gui() -> int:
                     "png_root": config.png_root,
                     "output_root": config.output_root,
                     "staging_png_root": config.dds_staging_root,
-                    "notes": "Model paths remain in the workflow panel. The same backend and Texture Policy settings are also available directly in Workflow if you do not want to use the wizard.",
+                    "notes": "This dialog is read-only. Model paths and all editable backend or texture-policy controls remain in the main Workflow panel.",
                 }
             )
-            if dialog.exec() != QDialog.Accepted:
-                return
-            state = dialog.accepted_configuration()
-            if state is None:
-                return
-            backend_map = {
-                "disabled": UPSCALE_BACKEND_NONE,
-                UPSCALE_BACKEND_CHAINNER: UPSCALE_BACKEND_CHAINNER,
-                UPSCALE_BACKEND_REALESRGAN_NCNN: UPSCALE_BACKEND_REALESRGAN_NCNN,
-                UPSCALE_BACKEND_ONNX_RUNTIME: UPSCALE_BACKEND_ONNX_RUNTIME,
-            }
-            self._set_combo_by_value(self.upscale_backend_combo, backend_map.get(state.backend, UPSCALE_BACKEND_NONE))
-            self._set_combo_by_value(self.upscale_texture_preset_combo, state.preset)
-            self.ncnn_scale_spin.setValue(max(self.ncnn_scale_spin.minimum(), min(self.ncnn_scale_spin.maximum(), int(round(state.scale)))))
-            self.ncnn_tile_size_spin.setValue(max(self.ncnn_tile_size_spin.minimum(), min(self.ncnn_tile_size_spin.maximum(), int(state.tile_size))))
-            self._set_combo_by_value(self.upscale_post_correction_combo, state.post_correction_mode)
-            self.enable_automatic_texture_rules_checkbox.setChecked(state.use_automatic_rules)
-            self.retry_smaller_tile_checkbox.setChecked(state.retry_smaller_tile)
-            self.enable_mod_ready_loose_export_checkbox.setChecked(state.loose_export)
-            self._apply_upscale_backend_state()
-            self._apply_mod_ready_export_state()
-            self._save_settings()
+            dialog.exec()
 
         def _open_external_urls(self, urls: Sequence[str], *, label: str) -> None:
             unique_urls: List[str] = []
@@ -5141,11 +5224,13 @@ def run_gui() -> int:
                 ncnn_model_name=self._combo_value(self.ncnn_model_combo),
                 ncnn_scale=self.ncnn_scale_spin.value(),
                 ncnn_tile_size=self.ncnn_tile_size_spin.value(),
+                ncnn_extra_args=self.ncnn_extra_args_edit.text().strip(),
                 upscale_post_correction_mode=self._combo_value(self.upscale_post_correction_combo),
                 onnx_model_dir=self.onnx_model_dir_edit.text().strip(),
                 onnx_model_name=self._combo_value(self.onnx_model_combo),
                 upscale_texture_preset=self._combo_value(self.upscale_texture_preset_combo),
                 enable_automatic_texture_rules=self.enable_automatic_texture_rules_checkbox.isChecked(),
+                enable_unsafe_technical_override=self.enable_unsafe_technical_override_checkbox.isChecked(),
                 retry_smaller_tile_on_failure=self.retry_smaller_tile_checkbox.isChecked(),
                 enable_mod_ready_loose_export=self.enable_mod_ready_loose_export_checkbox.isChecked(),
                 mod_ready_export_root=self.mod_ready_export_root_edit.text().strip(),
@@ -5762,6 +5847,8 @@ def run_gui() -> int:
             del previous
             self._update_compare_navigation_state()
             if current is None:
+                self._compare_preview_timer.stop()
+                self.pending_compare_preview_selection = None
                 self.compare_preview_request_id += 1
                 self.original_preview_meta_label.setText("")
                 self.output_preview_meta_label.setText("")
@@ -5770,6 +5857,17 @@ def run_gui() -> int:
                 return
 
             relative_path = Path(current.data(Qt.UserRole))
+            self.pending_compare_preview_selection = relative_path
+            self._compare_preview_timer.start()
+
+        def _flush_pending_compare_preview_selection(self) -> None:
+            if self._shutting_down:
+                self.pending_compare_preview_selection = None
+                return
+            relative_path = self.pending_compare_preview_selection
+            self.pending_compare_preview_selection = None
+            if relative_path is None:
+                return
             self._render_compare_preview(relative_path)
 
         def current_compare_path_for_research(self) -> str:
@@ -5779,7 +5877,40 @@ def run_gui() -> int:
             raw = current_item.data(Qt.UserRole)
             return str(raw) if raw else ""
 
+        def _summarize_compare_planner(self, relative_path: Path) -> Tuple[str, str]:
+            try:
+                normalized = normalize_config_for_planning(self.collect_config())
+            except Exception:
+                return "", ""
+            original_root_text = self.original_dds_edit.text().strip()
+            output_root_text = self.output_root_edit.text().strip()
+            original_path = Path(original_root_text).expanduser() / relative_path if original_root_text else None
+            output_path = Path(output_root_text).expanduser() / relative_path if output_root_text else None
+
+            summaries: List[str] = []
+            details: List[str] = []
+            for label, path in (("Original", original_path), ("Output", output_path)):
+                if path is None or not path.exists():
+                    continue
+                try:
+                    entry = build_single_texture_processing_plan(
+                        normalized,
+                        path,
+                        relative_path=relative_path,
+                    )
+                except Exception:
+                    continue
+                summary = f"{label}: {entry.action} | {entry.profile.key} | {entry.path_kind}"
+                if entry.preserve_reason:
+                    summary += f" | {entry.preserve_reason}"
+                summaries.append(summary)
+                details.append(summary)
+
+            return " ; ".join(summaries), "\n".join(details)
+
         def _render_compare_preview(self, relative_path: Path) -> None:
+            if self._shutting_down:
+                return
             texconv_text = self.texconv_path_edit.text().strip()
             original_root_text = self.original_dds_edit.text().strip()
             output_root_text = self.output_root_edit.text().strip()
@@ -5787,6 +5918,7 @@ def run_gui() -> int:
             texconv_path = Path(texconv_text).expanduser() if texconv_text else None
             original_path = Path(original_root_text).expanduser() / relative_path if original_root_text else None
             output_path = Path(output_root_text).expanduser() / relative_path if output_root_text else None
+            original_planner_summary, output_planner_summary = self._summarize_compare_planner(relative_path)
             request_id = self.compare_preview_request_id + 1
             self.compare_preview_request_id = request_id
 
@@ -5799,7 +5931,14 @@ def run_gui() -> int:
                 self.pending_compare_preview_request = (request_id, relative_path)
                 return
 
-            self._start_compare_preview_worker(request_id, texconv_path, original_path, output_path)
+            self._start_compare_preview_worker(
+                request_id,
+                texconv_path,
+                original_path,
+                output_path,
+                original_planner_summary,
+                output_planner_summary or original_planner_summary,
+            )
 
         def _start_compare_preview_worker(
             self,
@@ -5807,8 +5946,19 @@ def run_gui() -> int:
             texconv_path: Optional[Path],
             original_path: Optional[Path],
             output_path: Optional[Path],
+            original_planner_summary: str = "",
+            output_planner_summary: str = "",
         ) -> None:
-            worker = ComparePreviewWorker(request_id, texconv_path, original_path, output_path)
+            if self._shutting_down:
+                return
+            worker = ComparePreviewWorker(
+                request_id,
+                texconv_path,
+                original_path,
+                output_path,
+                original_planner_summary,
+                output_planner_summary,
+            )
             thread = QThread(self)
             worker.moveToThread(thread)
 
@@ -5825,7 +5975,7 @@ def run_gui() -> int:
             thread.start()
 
         def _handle_compare_preview_ready(self, request_id: int, payload: object) -> None:
-            if request_id != self.compare_preview_request_id:
+            if self._shutting_down or request_id != self.compare_preview_request_id:
                 return
             if not isinstance(payload, dict):
                 return
@@ -5846,7 +5996,7 @@ def run_gui() -> int:
                 )
 
         def _handle_compare_preview_error(self, request_id: int, message: str) -> None:
-            if request_id != self.compare_preview_request_id:
+            if self._shutting_down or request_id != self.compare_preview_request_id:
                 return
             self.original_preview_meta_label.setText("")
             self.output_preview_meta_label.setText("")
@@ -5864,17 +6014,20 @@ def run_gui() -> int:
                 label.clear_preview(result.message)
                 return
 
-            pixmap = QPixmap(result.preview_png_path)
-            if pixmap.isNull():
+            preview_image_path = str(result.preview_png_path)
+            if not preview_image_path:
                 meta_label.setText("")
                 label.clear_preview("Qt could not load the generated PNG preview.")
                 return
             meta_label.setText(result.metadata_summary)
-            label.set_preview_pixmap(pixmap, result.title)
+            label.set_preview_image_path(preview_image_path, result.title)
 
         def _cleanup_compare_preview_refs(self) -> None:
             self.compare_preview_thread = None
             self.compare_preview_worker = None
+            if self._shutting_down:
+                self.pending_compare_preview_request = None
+                return
             if self.pending_compare_preview_request is None:
                 return
 
@@ -5886,7 +6039,15 @@ def run_gui() -> int:
             texconv_path = Path(texconv_text).expanduser() if texconv_text else None
             original_path = Path(original_root_text).expanduser() / relative_path if original_root_text else None
             output_path = Path(output_root_text).expanduser() / relative_path if output_root_text else None
-            self._start_compare_preview_worker(request_id, texconv_path, original_path, output_path)
+            original_planner_summary, output_planner_summary = self._summarize_compare_planner(relative_path)
+            self._start_compare_preview_worker(
+                request_id,
+                texconv_path,
+                original_path,
+                output_path,
+                original_planner_summary,
+                output_planner_summary or original_planner_summary,
+            )
 
         def _cleanup_worker_refs(self) -> None:
             self.worker_thread = None
@@ -5899,8 +6060,15 @@ def run_gui() -> int:
             self.set_busy(False, build_mode=False)
 
         def closeEvent(self, event) -> None:  # type: ignore[override]
+            self._shutting_down = True
+            self._settings_save_timer.stop()
+            self._chainner_analysis_timer.stop()
+            self._compare_preview_timer.stop()
+            self.pending_compare_preview_selection = None
+            self.pending_compare_preview_request = None
+            self.compare_preview_request_id += 1
             self.settings.setValue("window/geometry", self.saveGeometry())
-            self._save_settings()
+            self.flush_settings_save()
             if self.scan_worker is not None:
                 self.scan_worker.stop()
             if self.archive_scan_worker is not None:
@@ -5919,6 +6087,7 @@ def run_gui() -> int:
             if self.archive_preview_thread is not None:
                 self.archive_preview_thread.quit()
                 self.archive_preview_thread.wait(3000)
+            self.settings_tab.flush_settings_save()
             self.text_search_tab.shutdown()
             self.research_tab.shutdown()
             super().closeEvent(event)

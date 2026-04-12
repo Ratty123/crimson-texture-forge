@@ -38,6 +38,7 @@ from crimson_texture_forge.core.research import (
     TextureSetGroup,
     TextureUsageHeatRow,
     analyze_mip_behavior,
+    build_processing_plan_lookup,
     build_archive_research_snapshot,
     build_texture_usage_heatmap,
     build_mip_analysis_detail,
@@ -53,7 +54,8 @@ from crimson_texture_forge.core.research import (
     upsert_research_note,
     validate_normal_maps,
 )
-from crimson_texture_forge.models import ArchiveEntry
+from crimson_texture_forge.core.pipeline import describe_processing_path_kind
+from crimson_texture_forge.models import AppConfig, ArchiveEntry
 
 
 class ResearchRefreshWorker(QObject):
@@ -70,6 +72,7 @@ class ResearchRefreshWorker(QObject):
         original_root: Optional[Path],
         output_root: Optional[Path],
         texconv_path: Optional[Path],
+        app_config: Optional[AppConfig] = None,
         archive_snapshot_payload: Optional[Dict[str, object]] = None,
     ) -> None:
         super().__init__()
@@ -78,6 +81,7 @@ class ResearchRefreshWorker(QObject):
         self.original_root = original_root
         self.output_root = output_root
         self.texconv_path = texconv_path
+        self.app_config = app_config
         self.archive_snapshot_payload = dict(archive_snapshot_payload or {})
         self.stop_event = threading.Event()
 
@@ -101,12 +105,23 @@ class ResearchRefreshWorker(QObject):
                 raise RuntimeError("Research refresh cancelled.")
             self.progress_changed.emit(1, steps, "Comparing original vs rebuilt mip behavior...")
             mip_rows: List[MipAnalysisRow] = []
+            processing_plan_lookup: Dict[str, object] = {}
+            if self.app_config is not None and self.original_root is not None and self.original_root.exists():
+                try:
+                    processing_plan_lookup = build_processing_plan_lookup(
+                        self.app_config,
+                        original_root_override=self.original_root,
+                        stop_event=self.stop_event,
+                    )
+                except Exception:
+                    processing_plan_lookup = {}
             if self.original_root is not None and self.output_root is not None:
                 if self.original_root.exists() and self.output_root.exists():
                     mip_rows = analyze_mip_behavior(
                         self.original_root,
                         self.output_root,
                         texconv_path=self.texconv_path,
+                        processing_plan_lookup=processing_plan_lookup,
                         stop_event=self.stop_event,
                     )
             payload["mip_rows"] = mip_rows
@@ -119,7 +134,9 @@ class ResearchRefreshWorker(QObject):
                 normal_rows.extend(
                     validate_normal_maps(
                         self.original_root,
+                        root_label="Original DDS root",
                         texconv_path=self.texconv_path,
+                        processing_plan_lookup=processing_plan_lookup,
                         stop_event=self.stop_event,
                     )
                 )
@@ -127,7 +144,9 @@ class ResearchRefreshWorker(QObject):
                 normal_rows.extend(
                     validate_normal_maps(
                         self.output_root,
+                        root_label="Output root",
                         texconv_path=self.texconv_path,
+                        processing_plan_lookup=processing_plan_lookup,
                         stop_event=self.stop_event,
                     )
                 )
@@ -218,6 +237,7 @@ class ResearchTab(QWidget):
         get_original_root: Callable[[], str],
         get_output_root: Callable[[], str],
         get_texconv_path: Callable[[], str],
+        get_app_config: Callable[[], AppConfig],
         get_current_archive_path: Callable[[], str],
         get_current_text_search_path: Callable[[], str],
         get_current_compare_path: Callable[[], str],
@@ -231,6 +251,7 @@ class ResearchTab(QWidget):
         self.get_original_root = get_original_root
         self.get_output_root = get_output_root
         self.get_texconv_path = get_texconv_path
+        self.get_app_config = get_app_config
         self.get_current_archive_path = get_current_archive_path
         self.get_current_text_search_path = get_current_text_search_path
         self.get_current_compare_path = get_current_compare_path
@@ -971,6 +992,7 @@ class ResearchTab(QWidget):
             original_root=original_root,
             output_root=output_root,
             texconv_path=texconv_path,
+            app_config=self.get_app_config(),
             archive_snapshot_payload=cached_archive_snapshot,
         )
         thread = QThread(self)
@@ -1296,7 +1318,21 @@ class ResearchTab(QWidget):
                 ]
             )
             item.setData(0, Qt.UserRole, row)
-            item.setToolTip(4, "\n".join(row.warnings))
+            tooltip_lines = [*row.warnings]
+            if row.planner_profile or row.planner_path_kind:
+                tooltip_lines.extend(
+                    [
+                        "",
+                        f"Planner profile: {row.planner_profile or 'unavailable'}",
+                        f"Planner path: {row.planner_path_kind or 'unavailable'}",
+                        f"Planner path detail: {describe_processing_path_kind(row.planner_path_kind) if row.planner_path_kind else 'unavailable'}",
+                        f"Planner backend mode: {row.planner_backend_mode or 'unavailable'}",
+                        f"Planner alpha policy: {row.planner_alpha_policy or 'unavailable'}",
+                    ]
+                )
+                if row.planner_preserve_reason:
+                    tooltip_lines.append(f"Planner preserve reason: {row.planner_preserve_reason}")
+            item.setToolTip(4, "\n".join(line for line in tooltip_lines if line))
             self.mip_tree.addTopLevelItem(item)
         if self.mip_tree.topLevelItemCount() > 0:
             first = self.mip_tree.topLevelItem(0)
@@ -1310,7 +1346,21 @@ class ResearchTab(QWidget):
                 continue
             item = QTreeWidgetItem([row.path, row.root_label, row.texconv_format, row.size_text, "; ".join(row.issues[:2])])
             item.setData(0, Qt.UserRole, row)
-            item.setToolTip(4, "\n".join(row.issues))
+            tooltip_lines = [*row.issues]
+            if row.planner_profile or row.planner_path_kind:
+                tooltip_lines.extend(
+                    [
+                        "",
+                        f"Planner profile: {row.planner_profile or 'unavailable'}",
+                        f"Planner path: {row.planner_path_kind or 'unavailable'}",
+                        f"Planner path detail: {describe_processing_path_kind(row.planner_path_kind) if row.planner_path_kind else 'unavailable'}",
+                        f"Planner backend mode: {row.planner_backend_mode or 'unavailable'}",
+                        f"Planner alpha policy: {row.planner_alpha_policy or 'unavailable'}",
+                    ]
+                )
+                if row.planner_preserve_reason:
+                    tooltip_lines.append(f"Planner preserve reason: {row.planner_preserve_reason}")
+            item.setToolTip(4, "\n".join(line for line in tooltip_lines if line))
             self.normal_tree.addTopLevelItem(item)
         if self.normal_tree.topLevelItemCount() > 0 and self.mip_tree.topLevelItemCount() == 0:
             first = self.normal_tree.topLevelItem(0)
@@ -1381,6 +1431,15 @@ class ResearchTab(QWidget):
         normal_rows = self.research_payload.get("normal_rows", [])
         mip_count = len(mip_rows) if isinstance(mip_rows, list) else 0
         normal_count = len(normal_rows) if isinstance(normal_rows, list) else 0
+        planner_path_counts: Dict[str, int] = {}
+        planner_profile_counts: Dict[str, int] = {}
+        if isinstance(mip_rows, list):
+            for row in mip_rows:
+                if isinstance(row, MipAnalysisRow):
+                    if row.planner_path_kind:
+                        planner_path_counts[row.planner_path_kind] = planner_path_counts.get(row.planner_path_kind, 0) + 1
+                    if row.planner_profile:
+                        planner_profile_counts[row.planner_profile] = planner_profile_counts.get(row.planner_profile, 0) + 1
         normal_roots: Dict[str, int] = {}
         if isinstance(normal_rows, list):
             for row in normal_rows:
@@ -1389,6 +1448,12 @@ class ResearchTab(QWidget):
         normal_root_summary = ", ".join(
             f"{label}: {count:,}" for label, count in sorted(normal_roots.items())
         ) if normal_roots else "none"
+        planner_path_summary = ", ".join(
+            f"{label}: {count:,}" for label, count in sorted(planner_path_counts.items())
+        ) if planner_path_counts else "unavailable"
+        planner_profile_summary = ", ".join(
+            f"{label}: {count:,}" for label, count in sorted(planner_profile_counts.items())
+        ) if planner_profile_counts else "unavailable"
         self.analysis_context_label.setText(
             "Texture Analysis context:\n"
             f"- Original DDS root: {original_root if original_root_text else '(not set)'}"
@@ -1398,6 +1463,8 @@ class ResearchTab(QWidget):
             + (" (available)" if output_exists else " (missing or not set)")
             + "\n"
             f"- Mip Analysis rows: {mip_count:,} matching DDS file pair(s). Requires the same relative DDS path to exist in both roots. Uses texconv previews when available for alpha, brightness, range, and channel-drift checks.\n"
+            f"- Planner path summary: {planner_path_summary}.\n"
+            f"- Planner profile summary: {planner_profile_summary}.\n"
             f"- Bulk Normal Validator rows: {normal_count:,} normal-like DDS file(s). Current roots represented: {normal_root_summary}."
         )
 
@@ -1446,16 +1513,9 @@ class ResearchTab(QWidget):
         self.analysis_detail_edit.setPlainText(detail_text)
 
     def _show_normal_row_details(self, row: NormalValidationRow) -> None:
-        original_root_text = self.get_original_root().strip()
-        output_root_text = self.get_output_root().strip()
-        source_root = ""
-        if original_root_text and row.root_label == (Path(original_root_text).name or original_root_text):
-            source_root = str(Path(original_root_text).expanduser())
-        elif output_root_text and row.root_label == (Path(output_root_text).name or output_root_text):
-            source_root = str(Path(output_root_text).expanduser())
         self.analysis_detail_label.setText("Bulk Normal Validator details")
         texconv_path = Path(self.get_texconv_path()).expanduser() if self.get_texconv_path().strip() else None
-        root_path = Path(source_root).expanduser() if source_root else Path(original_root_text).expanduser() if original_root_text else Path(".")
+        root_path = Path(row.root_path).expanduser() if row.root_path else Path(".")
         detail_text = build_normal_validation_detail(root_path, row, texconv_path=texconv_path)
         self.analysis_detail_edit.setPlainText(detail_text)
 
