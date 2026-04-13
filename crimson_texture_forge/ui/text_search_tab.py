@@ -161,6 +161,7 @@ class TextSearchPreviewWorker(QObject):
                 self.query,
                 regex=self.regex_enabled,
                 case_sensitive=self.case_sensitive,
+                stop_event=self.stop_event,
             )
             if self.stop_event.is_set():
                 return
@@ -934,6 +935,7 @@ class TextSearchTab(QWidget):
         self._schedule_preview(result)
 
     def _schedule_preview(self, result: TextSearchResult) -> None:
+        self.preview_request_id += 1
         self.preview_title_label.setText(result.relative_path)
         self.preview_meta_label.setText("Loading preview...")
         self.preview_detail_label.setText("Preparing preview...")
@@ -944,6 +946,8 @@ class TextSearchTab(QWidget):
         self.preview_find_active_index = -1
         self.preview_text_cache = ""
         self.preview_find_status_label.setText("Loading preview...")
+        if self.preview_worker is not None:
+            self.preview_worker.stop()
         self.scheduled_preview_result = result
         self._preview_debounce_timer.start()
 
@@ -986,11 +990,10 @@ class TextSearchTab(QWidget):
         if request_id != self.preview_request_id or not isinstance(payload, TextSearchPreview):
             return
         preview = payload
-        result = self.current_preview_result
         self.preview_title_label.setText(preview.title)
         self.preview_meta_label.setText(preview.metadata)
         preview_detail_text = preview.detail_text
-        syntax_extension = result.extension if result is not None else Path(preview.title).suffix
+        syntax_extension = Path(preview.title).suffix.lower()
         if len(preview.preview_text) > self.SYNTAX_HIGHLIGHT_CHAR_LIMIT:
             syntax_extension = ""
             preview_detail_text = "\n".join(

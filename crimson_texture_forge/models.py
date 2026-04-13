@@ -39,7 +39,13 @@ from crimson_texture_forge.constants import (
     ENABLE_MOD_READY_LOOSE_EXPORT,
     INCLUDE_FILTERS,
     LOG_CSV,
+    MOD_READY_CREATE_NO_ENCRYPT,
     MOD_READY_EXPORT_ROOT,
+    MOD_READY_PACKAGE_AUTHOR,
+    MOD_READY_PACKAGE_DESCRIPTION,
+    MOD_READY_PACKAGE_NEXUS_URL,
+    MOD_READY_PACKAGE_TITLE,
+    MOD_READY_PACKAGE_VERSION,
     ORIGINAL_DDS_ROOT,
     OUTPUT_ROOT,
     OVERWRITE_EXISTING_DDS,
@@ -154,6 +160,12 @@ class AppConfig:
     retry_smaller_tile_on_failure: bool = RETRY_SMALLER_TILE_ON_FAILURE
     enable_mod_ready_loose_export: bool = ENABLE_MOD_READY_LOOSE_EXPORT
     mod_ready_export_root: str = MOD_READY_EXPORT_ROOT
+    mod_ready_create_no_encrypt_file: bool = MOD_READY_CREATE_NO_ENCRYPT
+    mod_ready_package_title: str = MOD_READY_PACKAGE_TITLE
+    mod_ready_package_version: str = MOD_READY_PACKAGE_VERSION
+    mod_ready_package_author: str = MOD_READY_PACKAGE_AUTHOR
+    mod_ready_package_description: str = MOD_READY_PACKAGE_DESCRIPTION
+    mod_ready_package_nexus_url: str = MOD_READY_PACKAGE_NEXUS_URL
     archive_package_root: str = ARCHIVE_PACKAGE_ROOT
     archive_extract_root: str = ARCHIVE_EXTRACT_ROOT
     archive_filter_text: str = ARCHIVE_FILTER_TEXT
@@ -208,6 +220,8 @@ class NormalizedConfig:
     retry_smaller_tile_on_failure: bool
     enable_mod_ready_loose_export: bool
     mod_ready_export_root: Optional[Path]
+    mod_ready_create_no_encrypt_file: bool
+    mod_ready_package_info: ModPackageInfo
 
 
 @dataclass(slots=True)
@@ -391,6 +405,81 @@ class RunSummary:
     cancelled: bool = False
     log_csv_path: Optional[Path] = None
     results: List[JobResult] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class MatchedOriginalTexture:
+    package_root: str
+    archive_relative_path: str
+    loose_relative_path: Path
+    original_dds_path: Optional[Path] = None
+    archive_entry: Optional["ArchiveEntry"] = None
+    match_reason: str = ""
+
+
+@dataclass(slots=True)
+class ReplaceAssistantItem:
+    source_path: Path
+    source_kind: str
+    detected_relative_path: str = ""
+    detected_package_root: str = ""
+    matched_original: Optional[MatchedOriginalTexture] = None
+    warning: str = ""
+    status: str = "pending"
+    status_detail: str = ""
+
+
+@dataclass(slots=True)
+class ModPackageInfo:
+    title: str = MOD_READY_PACKAGE_TITLE
+    version: str = MOD_READY_PACKAGE_VERSION
+    author: str = MOD_READY_PACKAGE_AUTHOR
+    description: str = MOD_READY_PACKAGE_DESCRIPTION
+    nexus_url: str = MOD_READY_PACKAGE_NEXUS_URL
+
+
+@dataclass(slots=True)
+class ReplaceAssistantBuildOptions:
+    package_output_root: Path
+    overwrite_existing_package_files: bool
+    create_no_encrypt_file: bool
+    build_mode: str
+    size_mode: str
+    texconv_path: Path
+    ncnn_exe_path: Optional[Path]
+    ncnn_model_dir: Optional[Path]
+    ncnn_model_name: str
+    ncnn_scale: int
+    ncnn_tile_size: int
+    ncnn_extra_args: str
+    retry_smaller_tile_on_failure: bool
+    upscale_post_correction_mode: str
+    upscale_texture_preset: str
+    enable_automatic_texture_rules: bool
+    enable_unsafe_technical_override: bool
+    package_info: ModPackageInfo
+
+
+@dataclass(slots=True)
+class ReplaceAssistantReviewItem:
+    source_path: Path
+    relative_path: Path
+    output_dds_path: Path
+    original_dds_path: Optional[Path] = None
+    build_mode: str = ""
+    size_mode: str = ""
+
+
+@dataclass(slots=True)
+class ReplaceAssistantBuildSummary:
+    total_items: int
+    built_items: int
+    skipped_items: int
+    unresolved_items: int
+    failed_items: int
+    cancelled: bool = False
+    output_root: Optional[Path] = None
+    review_items: Tuple[ReplaceAssistantReviewItem, ...] = ()
 
 
 @dataclass(slots=True)

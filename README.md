@@ -10,6 +10,8 @@ Crimson Texture Forge is built for modders who want one place to:
 - scan loose DDS files and rebuild controlled DDS output with `texconv`
 - optionally convert DDS to PNG before processing
 - optionally upscale through `chaiNNer` or direct `Real-ESRGAN NCNN`
+- optionally export rebuilt workflow output as a ready mod package with `info.json`, optional `.no_encrypt`, and preserved loose DDS paths
+- import manually edited `PNG` or `DDS` textures and export a mod-ready loose replacement package with `Replace Assistant`
 - review results in a side-by-side compare view with zoom, pan, and preview-size controls
 - inspect texture sets, references, classification, DDS QA results, and notes in `Research`
 - search archive or loose text-like files such as `.xml`, `.json`, `.cfg`, and `.lua`
@@ -20,7 +22,9 @@ The app is intentionally focused on **read-only archive access** and **loose-fil
 
 ### Main tabs
 
-- `Workflow`: loose DDS scanning, optional DDS-to-PNG staging, optional upscaling, DDS rebuild, and compare review
+- `Texture Workflow`: loose DDS scanning, optional DDS-to-PNG staging, optional upscaling, DDS rebuild, and compare review
+- `Texture Workflow` can also emit an additional ready mod package after rebuild without changing the normal `dds_final` output
+- `Replace Assistant`: import edited `PNG` / `DDS`, match them to the original game texture, optionally upscale with direct `NCNN`, rebuild corrected DDS output, and write a mod-ready loose package
 - `Archive Browser`: scan archives, filter entries, preview supported assets, and extract files to normal folders
 - `Research`: group related textures, resolve references, inspect DDS QA results, export analysis reports, and store notes
 - `Text Search`: search archive or loose text-like files, preview results with syntax colors, and export matched files
@@ -43,16 +47,17 @@ The app is intentionally focused on **read-only archive access** and **loose-fil
 - compare view with shared preview-size presets, per-side zoom, mouse-wheel zoom, drag pan, `Sync Pan`, and focused compare layout
 - `Research` tools for shared classifier output, grouped texture sets, sidecar/reference discovery, `Classification Review` preview/review/approval, texture analysis, heatmap views, and local notes
 - text search with archive/loose search, regex, local find, wrap toggle, line numbers, and export
+- `Replace Assistant` for edited-texture replacement workflows that use the original DDS as authority for rebuild metadata and mod package paths
 
 ## Recommended First Run
 
 If you want the safest starting point, use this path first:
 
 1. Run `CrimsonTextureForge-<version>-windows-portable.exe`.
-2. In `Workflow > Setup`, click `Init Workspace`.
+2. In `Texture Workflow > Setup`, click `Init Workspace`.
 3. Configure `texconv.exe` or open its official download page from `Setup`.
 4. Set `Original DDS root`, `PNG root`, and `Output root`.
-5. In `Workflow > Upscaling`, either:
+5. In `Texture Workflow > Upscaling`, either:
    - keep the backend disabled if you only want DDS rebuild/testing
    - pick direct `Real-ESRGAN NCNN`
    - use `chaiNNer` only if you already have a tested `.chn` chain
@@ -61,6 +66,13 @@ If you want the safest starting point, use this path first:
 8. Click `Scan`.
 9. Run a small subset first.
 10. Review the results in `Compare` before doing a larger batch.
+
+If you already edited a texture in Photoshop or another tool, you can use `Replace Assistant` instead of the batch workflow:
+
+1. Import the edited `PNG` or `DDS`.
+2. Let the app match it to the original game DDS, or choose the original manually if needed.
+3. Optionally mirror the current `Texture Workflow` NCNN settings.
+4. Build a mod-ready loose package with `.no_encrypt`, `info.json`, and the correct package-prefixed DDS tree.
 
 ## Choosing An Upscaling Mode
 
@@ -231,7 +243,7 @@ The archive browser is read-only. Use it to:
 - use exclude filters and common technical-suffix hiding to isolate likely base/color DDS files more quickly
 - preview supported assets
 - extract selected files or filtered sets to normal folders
-- send DDS files directly into the workflow with `DDS To Workflow`
+- send DDS files directly into the `Texture Workflow` with `DDS To Texture Workflow`
 
 The app does **not** repack archives.
 
@@ -350,15 +362,15 @@ It only opens external pages in your browser when you explicitly trigger actions
 
 ![Archive Browser](docs/screenshots/archive_browser.png)
 
-### Workflow: DDS To PNG / DDS Rebuild
+### Texture Workflow: DDS To PNG / DDS Rebuild
 
 ![Workflow PNG to DDS](docs/screenshots/workflow_png_to_dds.png)
 
-### Workflow: Upscaling Running
+### Texture Workflow: Upscaling Running
 
 ![Workflow Upscaling Running](docs/screenshots/workflow_upscalingrunning.png)
 
-### Workflow: NCNN Model Catalog
+### Texture Workflow: NCNN Model Catalog
 
 ![Workflow Catalog](docs/screenshots/workflow_catalog.png)
 

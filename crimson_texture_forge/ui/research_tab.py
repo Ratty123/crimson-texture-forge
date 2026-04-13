@@ -364,6 +364,8 @@ class ResearchTab(QWidget):
         self.archive_picker_direct_files: Dict[tuple[str, ...], List[int]] = {}
         self.archive_picker_folder_entry_indexes: Dict[tuple[str, ...], List[int]] = {}
         self.archive_picker_items_by_folder_key: Dict[tuple[str, ...], QTreeWidgetItem] = {}
+        self.archive_picker_refresh_pending = False
+        self.defer_archive_picker_refresh = True
         self.classification_registry_path = texture_classification_registry_path()
         self.pending_classification_review_focus_keys: set[str] = set()
         self._populating_unknown_resolver_controls = False
@@ -455,9 +457,10 @@ class ResearchTab(QWidget):
         self.notes_delete_button.clicked.connect(self._delete_note)
         self.notes_tree.currentItemChanged.connect(self._load_selected_note)
         self._populate_notes_tree()
-        self.refresh_archive_picker()
         self._handle_research_subtab_changed(self.tab_widget.currentIndex())
         self._clear_unknown_preview("Select an unknown DDS file to preview it here.")
+        self.archive_picker_refresh_pending = True
+        self.defer_archive_picker_refresh = False
 
     def set_theme(self, _theme_key: str) -> None:
         return
@@ -502,6 +505,14 @@ class ResearchTab(QWidget):
             if self.archive_picker_entries
             else "No archive files are available yet. Scan archives or broaden the current Archive Browser filter."
         )
+        self.archive_picker_refresh_pending = False
+
+    def mark_archive_picker_dirty(self) -> None:
+        self.archive_picker_refresh_pending = True
+
+    def refresh_archive_picker_if_pending(self) -> None:
+        if self.archive_picker_refresh_pending:
+            self.refresh_archive_picker()
 
     def _rebuild_archive_picker_index(self) -> None:
         (
@@ -602,6 +613,7 @@ class ResearchTab(QWidget):
         return current_item
 
     def _focus_archive_picker_path(self, path_value: str) -> bool:
+        self._ensure_archive_picker_ready()
         normalized = self._normalize_archive_path(path_value)
         if not normalized:
             return False
@@ -668,6 +680,7 @@ class ResearchTab(QWidget):
             self.archive_picker_status_label.setText(f"Folder: {folder_text} ({count:,} file(s))")
 
     def use_selected_archive_picker_for_reference(self) -> None:
+        self._ensure_archive_picker_ready()
         entry = self._current_archive_picker_entry()
         if entry is None:
             self.status_message_requested.emit("Select a file in Research -> Archive Files first.", True)
@@ -675,6 +688,7 @@ class ResearchTab(QWidget):
         self._populate_reference_target(entry.path)
 
     def use_selected_archive_picker_for_note(self) -> None:
+        self._ensure_archive_picker_ready()
         entry = self._current_archive_picker_entry()
         if entry is None:
             self.status_message_requested.emit("Select a file in Research -> Archive Files first.", True)
@@ -1291,7 +1305,7 @@ class ResearchTab(QWidget):
     def refresh_research(self) -> None:
         if self.refresh_thread is not None:
             return
-        self.refresh_archive_picker()
+        self.mark_archive_picker_dirty()
         archive_entries = list(self.get_archive_entries())
         filtered_entries = list(self.get_filtered_archive_entries())
         working_entries = [entry for entry in (filtered_entries or archive_entries) if isinstance(entry, ArchiveEntry)]
@@ -1833,6 +1847,7 @@ class ResearchTab(QWidget):
         current: Optional[QTreeWidgetItem],
         _previous: Optional[QTreeWidgetItem],
     ) -> None:
+        self._ensure_archive_picker_ready()
         group = current.data(0, Qt.UserRole) if current is not None else None
         if not isinstance(group, UnknownResolverGroup):
             self.unknown_member_tree.clear()
@@ -1892,6 +1907,7 @@ class ResearchTab(QWidget):
         current: Optional[QTreeWidgetItem],
         _previous: Optional[QTreeWidgetItem],
     ) -> None:
+        self._ensure_archive_picker_ready()
         member = current.data(0, Qt.UserRole) if current is not None else None
         group = self._current_unknown_group()
         if not isinstance(member, UnknownResolverMember) or group is None:
@@ -2096,6 +2112,7 @@ class ResearchTab(QWidget):
         self._set_unknown_preview_image_controls_enabled(False)
 
     def _render_unknown_preview_for_member(self, member: Optional[UnknownResolverMember]) -> None:
+        self._ensure_archive_picker_ready()
         entry = (
             self.archive_picker_entry_by_path.get(self._normalize_archive_path(member.path))
             if member is not None
@@ -2403,8 +2420,15 @@ class ResearchTab(QWidget):
         if current_archive_tab is getattr(self, "classification_review_tab", None):
             self.right_panel_stack.setVisible(False)
             return
+        if not self.defer_archive_picker_refresh:
+            self.refresh_archive_picker_if_pending()
         self.right_panel_stack.setVisible(True)
         self.right_panel_stack.setCurrentWidget(self.archive_picker_group)
+
+    def _ensure_archive_picker_ready(self) -> None:
+        if self.defer_archive_picker_refresh:
+            return
+        self.refresh_archive_picker_if_pending()
 
     def _handle_mip_selection_changed(
         self,

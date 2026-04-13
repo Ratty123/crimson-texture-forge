@@ -46,9 +46,12 @@ class PreviewLabel(QLabel):
         self._source_image: Optional[QImage] = None
         self._source_image_path: str = ""
         self._source_image_size = QSize()
+        self._source_image_loaded_size = QSize()
         self._source_image_load_failed = False
         self._source_revision = 0
         self._scaled_pixmap_cache: Dict[Tuple[int, int, int], QPixmap] = {}
+        self._current_render_key: Optional[Tuple[int, int, int]] = None
+        self._current_render_size = QSize()
         self._zoom_factor = 1.0
         self._fit_to_view = True
         self._fit_scale = 1.0
@@ -64,9 +67,12 @@ class PreviewLabel(QLabel):
         self._source_image = None
         self._source_image_path = ""
         self._source_image_size = QSize()
+        self._source_image_loaded_size = QSize()
         self._source_image_load_failed = False
         self._source_revision += 1
         self._scaled_pixmap_cache.clear()
+        self._current_render_key = None
+        self._current_render_size = QSize()
         self._drag_active = False
         self.setPixmap(QPixmap())
         self.setText(message)
@@ -102,9 +108,12 @@ class PreviewLabel(QLabel):
         self._source_image = None
         self._source_image_path = ""
         self._source_image_size = pixmap.size()
+        self._source_image_loaded_size = pixmap.size()
         self._source_image_load_failed = False
         self._source_revision += 1
         self._scaled_pixmap_cache.clear()
+        self._current_render_key = None
+        self._current_render_size = QSize()
         self._apply_scaled_pixmap(fallback_text)
 
     def set_preview_image(self, image: QImage, fallback_text: str) -> None:
@@ -112,9 +121,12 @@ class PreviewLabel(QLabel):
         self._source_image = image
         self._source_image_path = ""
         self._source_image_size = image.size() if not image.isNull() else QSize()
+        self._source_image_loaded_size = self._source_image_size
         self._source_image_load_failed = False
         self._source_revision += 1
         self._scaled_pixmap_cache.clear()
+        self._current_render_key = None
+        self._current_render_size = QSize()
         self._apply_scaled_pixmap(fallback_text)
 
     def set_preview_image_path(self, image_path: str, fallback_text: str) -> None:
@@ -125,8 +137,11 @@ class PreviewLabel(QLabel):
         reader = QImageReader(image_path)
         size = reader.size()
         self._source_image_size = size if size.isValid() else QSize()
+        self._source_image_loaded_size = QSize()
         self._source_revision += 1
         self._scaled_pixmap_cache.clear()
+        self._current_render_key = None
+        self._current_render_size = QSize()
         self._apply_scaled_pixmap(fallback_text)
 
     def current_display_scale(self) -> float:
@@ -240,6 +255,11 @@ class PreviewLabel(QLabel):
             height = max(1, int(round(source_size.height() * self._zoom_factor)))
 
         cache_key = (self._source_revision, width, height)
+        if self._current_render_key == cache_key:
+            current_pixmap = self.pixmap()
+            if current_pixmap is not None and not current_pixmap.isNull() and current_pixmap.size() == self._current_render_size:
+                self._update_cursor()
+                return
         cached = self._scaled_pixmap_cache.get(cache_key)
         if cached is not None and not cached.isNull():
             scaled = cached
@@ -253,17 +273,11 @@ class PreviewLabel(QLabel):
             self._cache_scaled_pixmap(cache_key, scaled)
         else:
             if not has_source_image:
-                reader = QImageReader(self._source_image_path)
-                image = reader.read()
-                if image.isNull():
-                    self._source_image_load_failed = True
+                if not self._load_source_image_for_render(width, height):
                     self.setPixmap(QPixmap())
                     self.setText(fallback_text)
                     self._update_cursor()
                     return
-                self._source_image = image
-                if not self._source_image_size.isValid():
-                    self._source_image_size = image.size()
             target_size = self._source_image.size().scaled(width, height, Qt.KeepAspectRatio)
             if not target_size.isValid():
                 self.setPixmap(QPixmap())
@@ -284,6 +298,8 @@ class PreviewLabel(QLabel):
         self.resize(scaled.size())
         self.setFixedSize(scaled.size())
         self.setPixmap(scaled)
+        self._current_render_key = cache_key
+        self._current_render_size = scaled.size()
         self._update_cursor()
 
     def _cache_scaled_pixmap(self, cache_key: Tuple[int, int, int], pixmap: QPixmap) -> None:
@@ -293,6 +309,48 @@ class PreviewLabel(QLabel):
         if len(self._scaled_pixmap_cache) > 12:
             oldest_key = next(iter(self._scaled_pixmap_cache))
             self._scaled_pixmap_cache.pop(oldest_key, None)
+
+    def _load_source_image_for_render(self, target_width: int, target_height: int) -> bool:
+        if self._source_image_load_failed or not self._source_image_path:
+            return False
+        target_size = QSize(max(1, target_width), max(1, target_height))
+        reader = QImageReader(self._source_image_path)
+        reader.setAutoTransform(True)
+        if not self._source_image_size.isValid():
+            size = reader.size()
+            if size.isValid():
+                self._source_image_size = size
+        if self._source_image is not None and not self._source_image.isNull():
+            loaded_size = self._source_image.size()
+            if loaded_size.isValid() and (
+                loaded_size.width() >= target_size.width()
+                and loaded_size.height() >= target_size.height()
+            ):
+                self._source_image_loaded_size = loaded_size
+                return True
+        source_size = self._source_image_size if self._source_image_size.isValid() else reader.size()
+        use_scaled_decode = (
+            source_size.isValid()
+            and source_size.width() > target_size.width() * 2
+            and source_size.height() > target_size.height() * 2
+        )
+        if use_scaled_decode:
+            reader.setScaledSize(target_size)
+        image = reader.read()
+        if image.isNull() and use_scaled_decode:
+            reader = QImageReader(self._source_image_path)
+            reader.setAutoTransform(True)
+            image = reader.read()
+        if image.isNull():
+            self._source_image_load_failed = True
+            self._source_image = None
+            self._source_image_loaded_size = QSize()
+            return False
+        self._source_image = image
+        self._source_image_loaded_size = image.size()
+        if not self._source_image_size.isValid():
+            self._source_image_size = image.size()
+        return True
 
 
 class PreviewScrollArea(QScrollArea):
@@ -865,7 +923,7 @@ class QuickStartDialog(QDialog):
             <p><b>Crimson Texture Forge</b> is a read-only archive and loose-file workflow tool for Crimson Desert. Its main jobs are archive extraction, DDS-to-PNG conversion, optional upscaling, DDS rebuild, compare review, texture research, and text search.</p>
             <ul>
               <li><b>Archive Browser</b>: scan <b>.pamt/.paz</b>, preview supported assets, filter, and extract to normal folders.</li>
-              <li><b>Workflow</b>: scan loose DDS files, optionally convert DDS to PNG with <b>texconv</b>, optionally upscale with <b>chaiNNer</b> or <b>Real-ESRGAN NCNN</b>, rebuild DDS, and compare results.</li>
+              <li><b>Texture Workflow</b>: scan loose DDS files, optionally convert DDS to PNG with <b>texconv</b>, optionally upscale with <b>chaiNNer</b> or <b>Real-ESRGAN NCNN</b>, rebuild DDS, and compare results.</li>
               <li><b>Research</b>: inspect grouped texture sets, classification, unknown-family review, references, DDS QA results, exported reports, and local notes.</li>
               <li><b>Text Search</b>: search archive or loose text-like files such as <b>.xml</b>, preview matches with syntax colors, and export results while preserving folder structure.</li>
               <li><b>Settings</b>: store persistent global preferences such as theme, startup cache behavior, remembered layouts, and cleanup confirmations.</li>
@@ -878,7 +936,7 @@ class QuickStartDialog(QDialog):
               <li>Choose an upscaling mode in <b>Upscaling</b>: disabled, direct <b>Real-ESRGAN NCNN</b>, or <b>chaiNNer</b>.</li>
               <li>Keep a safer <b>Texture Policy</b> preset first and leave automatic rules enabled so risky technical DDS files are preserved instead of pushed through the PNG path.</li>
               <li>Use <b>Preview Policy</b> before <b>Start</b> if you want to inspect the planned per-texture action.</li>
-              <li>Click <b>Scan</b> in the Workflow tab.</li>
+              <li>Click <b>Scan</b> in the Texture Workflow tab.</li>
               <li>Run a small subset first, then review the output in <b>Compare</b> before trying a larger batch.</li>
             </ol>
             <h3>Backend chooser</h3>

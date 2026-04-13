@@ -137,8 +137,7 @@ def _iter_loose_text_files(
     path_filter: str,
     *,
     stop_event: Optional[threading.Event] = None,
-) -> List[Path]:
-    files: List[Path] = []
+):
     for path in root.rglob("*"):
         raise_if_cancelled(stop_event, "Text search stopped by user.")
         if not path.is_file():
@@ -148,8 +147,23 @@ def _iter_loose_text_files(
         relative_path = path.relative_to(root).as_posix()
         if not _path_matches_filter(relative_path, path_filter):
             continue
-        files.append(path)
-    return files
+        yield path
+
+
+def _iter_archive_text_candidates(
+    entries: Sequence[ArchiveEntry],
+    extension_filters: Sequence[str],
+    path_filter: str,
+    *,
+    stop_event: Optional[threading.Event] = None,
+):
+    for entry in entries:
+        raise_if_cancelled(stop_event, "Text search stopped by user.")
+        if entry.extension not in extension_filters:
+            continue
+        if not _path_matches_filter(entry.path, path_filter):
+            continue
+        yield entry
 
 
 def search_archive_text_entries(
@@ -165,27 +179,31 @@ def search_archive_text_entries(
     stop_event: Optional[threading.Event] = None,
 ) -> Tuple[List[TextSearchResult], TextSearchRunStats]:
     pattern = _compile_search_pattern(query, regex=regex, case_sensitive=case_sensitive)
-    candidates = [
-        entry
-        for entry in entries
-        if entry.extension in extension_filters and _path_matches_filter(entry.path, path_filter)
-    ]
     results: List[TextSearchResult] = []
     searched_count = 0
     decrypted_count = 0
     skipped_read_error_count = 0
-    total = len(candidates)
-    encrypted_candidate_count = sum(1 for entry in candidates if entry.encrypted)
+    candidate_count = 0
+    encrypted_candidate_count = 0
+    total_entries = len(entries)
     if on_log:
-        on_log(f"Searching {total:,} archive text-like file(s).")
-        if encrypted_candidate_count:
-            on_log(
-                f"Found {encrypted_candidate_count:,} encrypted candidate file(s). They will be decrypted when supported."
-            )
-    for index, entry in enumerate(candidates, start=1):
+        on_log(f"Scanning {total_entries:,} archive entries for text-like files.")
+    progress_step = max(250, total_entries // 200) if total_entries > 0 else 250
+    for index, entry in enumerate(entries, start=1):
         raise_if_cancelled(stop_event, "Text search stopped by user.")
-        if on_progress:
-            on_progress(index - 1, total, f"Searching archive text files... {entry.path}")
+        is_candidate = entry.extension in extension_filters and _path_matches_filter(entry.path, path_filter)
+        if on_progress and (index == 1 or index == total_entries or index % progress_step == 0 or is_candidate):
+            detail = (
+                f"Searching archive text files... {entry.path}"
+                if is_candidate
+                else f"Scanning archive entries... {entry.path}"
+            )
+            on_progress(index - 1, total_entries, detail)
+        if not is_candidate:
+            continue
+        candidate_count += 1
+        if entry.encrypted:
+            encrypted_candidate_count += 1
         try:
             data, _decompressed, note = read_archive_entry_data(entry)
         except Exception as exc:
@@ -219,11 +237,15 @@ def search_archive_text_entries(
                 archive_entry=entry,
             )
         )
+    if on_log and encrypted_candidate_count:
+        on_log(
+            f"Found {encrypted_candidate_count:,} encrypted candidate file(s). They will be decrypted when supported."
+        )
     if on_progress:
-        on_progress(total, total, f"Archive text search complete. Found {len(results):,} matching file(s).")
+        on_progress(total_entries, total_entries, f"Archive text search complete. Found {len(results):,} matching file(s).")
     return results, TextSearchRunStats(
         source_kind="archive",
-        candidate_count=total,
+        candidate_count=candidate_count,
         searched_count=searched_count,
         decrypted_count=decrypted_count,
         skipped_read_error_count=skipped_read_error_count,
@@ -243,22 +265,25 @@ def search_loose_text_files(
     stop_event: Optional[threading.Event] = None,
 ) -> Tuple[List[TextSearchResult], TextSearchRunStats]:
     pattern = _compile_search_pattern(query, regex=regex, case_sensitive=case_sensitive)
-    candidates = _iter_loose_text_files(
-        root,
-        extension_filters,
-        path_filter,
-        stop_event=stop_event,
-    )
     results: List[TextSearchResult] = []
+    candidate_count = 0
     skipped_read_error_count = 0
-    total = len(candidates)
     if on_log:
-        on_log(f"Searching {total:,} loose text-like file(s) under {root}.")
-    for index, path in enumerate(candidates, start=1):
+        on_log(f"Scanning loose text files under {root}.")
+    for index, path in enumerate(
+        _iter_loose_text_files(
+            root,
+            extension_filters,
+            path_filter,
+            stop_event=stop_event,
+        ),
+        start=1,
+    ):
         raise_if_cancelled(stop_event, "Text search stopped by user.")
+        candidate_count += 1
         relative_path = path.relative_to(root).as_posix()
         if on_progress:
-            on_progress(index - 1, total, f"Searching loose text files... {relative_path}")
+            on_progress(index - 1, 0, f"Searching loose text files... {relative_path}")
         try:
             data = path.read_bytes()
         except OSError as exc:
@@ -286,11 +311,11 @@ def search_loose_text_files(
             )
         )
     if on_progress:
-        on_progress(total, total, f"Loose text search complete. Found {len(results):,} matching file(s).")
+        on_progress(candidate_count, 0, f"Loose text search complete. Found {len(results):,} matching file(s).")
     return results, TextSearchRunStats(
         source_kind="loose",
-        candidate_count=total,
-        searched_count=total - skipped_read_error_count,
+        candidate_count=candidate_count,
+        searched_count=candidate_count - skipped_read_error_count,
         skipped_read_error_count=skipped_read_error_count,
     )
 
@@ -318,7 +343,9 @@ def load_text_search_preview(
     *,
     regex: bool = False,
     case_sensitive: bool = False,
+    stop_event: Optional[threading.Event] = None,
 ) -> TextSearchPreview:
+    raise_if_cancelled(stop_event, "Text preview stopped by user.")
     pattern = _compile_search_pattern(query, regex=regex, case_sensitive=case_sensitive)
     if result.source_kind == "archive":
         if result.archive_entry is None:
@@ -348,6 +375,7 @@ def load_text_search_preview(
             f"Path: {result.loose_path}",
         ]
 
+    raise_if_cancelled(stop_event, "Text preview stopped by user.")
     spans = _find_match_spans(text, pattern, limit=TEXT_SEARCH_HIGHLIGHT_LIMIT)
     preview_text, preview_spans, truncated = _build_preview_window(text, spans)
     if result.match_count > len(preview_spans):

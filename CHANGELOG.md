@@ -9,6 +9,36 @@ The format is intentionally simple:
 - `Fixed` for bug fixes
 - `Docs` for README, guide, or release-note changes
 
+## [0.6.0-beta.1] - 2026-04-13
+
+### Added
+- A new top-level `Replace Assistant` tab for edited-texture replacement workflows, so you can import manually edited `PNG` or `DDS` files, match them to their original in-game DDS, preview them, and build a mod-ready loose package without manually juggling the main batch workflow roots.
+- `Replace Assistant` can optionally run the same direct `Real-ESRGAN NCNN` feature set exposed in `Texture Workflow`, including model selection, scale, tile size, `NCNN extra args`, retry-with-smaller-tile, texture preset, automatic texture rules, the expert unsafe override, and post-correction modes such as `Source Match`.
+- `Replace Assistant` now writes `example_mod`-style package output with `.no_encrypt`, generated `info.json`, and package-prefixed loose DDS paths that follow the matched original texture.
+- Successful `Replace Assistant` builds now open a post-build review window that compares the edited input against the rebuilt DDS preview, so you can quickly inspect whether the repackaged result shifted before shipping the mod.
+
+### Changed
+- The main `Workflow` tab is now labeled `Texture Workflow`, which better distinguishes the advanced batch pipeline from the new guided `Replace Assistant` flow.
+- `Replace Assistant` now sits as its own top-level tab and receives archive-entry refreshes and shared status messages from the main window like the other major tools.
+- `Replace Assistant` now hides `Direct Upscale Controls (NCNN only)` unless the build mode is set to upscale, which frees space for the rebuild-only package flow.
+- `Replace Assistant` package output now treats the chosen root as the parent mods folder and writes the actual package into a child folder named after the mod title, which better matches `example_mod`-style mod manager layouts.
+- `Texture Workflow` can now optionally emit the same ready mod package shape after rebuild, including a child folder named after the mod title plus generated `info.json` and optional `.no_encrypt`, while still keeping the normal `dds_final` output untouched.
+
+### Fixed
+- The unfinished `Replace Assistant` implementation is now wired up far enough to be usable, including manual local-original selection, manual archive-original selection, output-folder opening, and better status/build callback handling.
+- `Replace Assistant` NCNN model discovery now uses the correct executable/model-dir signature and populates the model picker correctly instead of calling the discovery helper with the wrong argument shape.
+- `Replace Assistant` preview follow-up requests now advance their request id correctly when a new selection arrives while an older preview worker is still finishing, which avoids stale preview handoff glitches.
+- `Replace Assistant` package builds now honor the `.no_encrypt` toggle instead of always writing the marker file even when the package should stay unmarked.
+- Archive scan completion no longer eagerly rebuilds the heaviest `Replace Assistant` and `Research` archive indices on the UI thread every time the cache loads, which reduces the short freeze that could happen right after startup archive hydration.
+- Startup archive auto-load no longer forces the Archive Browser tab to render immediately if you are working elsewhere, which reduces the visible startup hitch when the cache finishes loading in the background.
+- `Settings` now includes an opt-in crash-detail capture toggle that writes local traceback reports for unhandled exceptions and background-worker/archive-preview errors, and the latest crash report is included in the diagnostic bundle when available.
+- Archive DDS preview now supports legacy luminance (`DDPF_LUMINANCE`) files, and partial luminance DDS reconstruction now handles raw uncompressed surface sizing correctly, which fixes previously unsupported worldmap `*_sdf_*` previews such as `cd_worldmap_image_compass_sdf_1024x1024.dds` and `cd_worldmap_image_mountain_10026_sdf_2048x2048.dds`.
+- Loose DDS preview fallback no longer cascades into a second failure when DDS metadata parsing is unsupported, and archive preview workers now avoid eagerly decoding both archive and loose preview images when only the default archive preview is needed.
+- `Research` now passes cancellation all the way through classification-review group assembly, so a cancelled refresh stops more promptly instead of continuing through the final unknown/classified review grouping work.
+
+### Docs
+- Updated README and release notes for the `0.6.0-beta.1` beta feature set, including `Replace Assistant`, the `Texture Workflow` tab rename, ready mod package export, and the latest preview/stability fixes.
+
 ## [0.5.5] - 2026-04-12
 
 ### Added

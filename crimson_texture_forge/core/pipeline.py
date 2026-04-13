@@ -26,6 +26,7 @@ from crimson_texture_forge.constants import *
 from crimson_texture_forge.models import *
 from crimson_texture_forge.core.common import *
 from crimson_texture_forge.core.chainner import *
+from crimson_texture_forge.core.mod_package import resolve_mod_package_root, write_mod_package_info
 from crimson_texture_forge.core.realesrgan_ncnn import *
 from crimson_texture_forge.core.upscale_postprocess import (
     build_source_match_plan_for_decision,
@@ -253,6 +254,46 @@ def _dds_colorspace_intent_from_format(texconv_format: str) -> str:
         return "linear"
     return "unknown"
 
+
+def _legacy_luminance_texconv_format(
+    rgb_bit_count: int,
+    r_mask: int,
+    g_mask: int,
+    b_mask: int,
+    a_mask: int,
+) -> Optional[str]:
+    mask_tuple = (r_mask, g_mask, b_mask, a_mask)
+    if rgb_bit_count == 8 and mask_tuple == (
+        0x000000FF,
+        0x00000000,
+        0x00000000,
+        0x00000000,
+    ):
+        return "R8_UNORM"
+    if rgb_bit_count == 16 and mask_tuple == (
+        0x0000FFFF,
+        0x00000000,
+        0x00000000,
+        0x00000000,
+    ):
+        return "R16_UNORM"
+    if rgb_bit_count == 16 and mask_tuple in {
+        (
+            0x000000FF,
+            0x00000000,
+            0x00000000,
+            0x0000FF00,
+        ),
+        (
+            0x0000FF00,
+            0x00000000,
+            0x00000000,
+            0x000000FF,
+        ),
+    }:
+        return "R8G8_UNORM"
+    return None
+
 def parse_dds(dds_path: Path) -> DdsInfo:
     with dds_path.open("rb") as handle:
         blob = handle.read(148)
@@ -337,6 +378,13 @@ def parse_dds(dds_path: Path) -> DdsInfo:
                 )
         else:
             raise ValueError(f"Unsupported uncompressed RGB bit depth: {rgb_bit_count}")
+    elif pf_flags & DDPF_LUMINANCE:
+        texconv_format = _legacy_luminance_texconv_format(rgb_bit_count, r_mask, g_mask, b_mask, a_mask)
+        if not texconv_format:
+            raise ValueError(
+                "Unsupported luminance mask combination: "
+                f"bits={rgb_bit_count} R={r_mask:#010x} G={g_mask:#010x} B={b_mask:#010x} A={a_mask:#010x}"
+            )
     else:
         raise ValueError(f"Unsupported DDS pixel format flags: {pf_flags:#x}")
 
@@ -2337,10 +2385,14 @@ def build_preflight_report_lines(
             "- Safe preset behavior: files excluded by the selected preset are copied through as original DDS files instead of being rebuilt from PNG."
         )
     lines.append(
-        f"- Mod-ready loose export: {'enabled' if normalized.enable_mod_ready_loose_export else 'disabled'}"
+        f"- Ready mod package export: {'enabled' if normalized.enable_mod_ready_loose_export else 'disabled'}"
     )
     if normalized.enable_mod_ready_loose_export and normalized.mod_ready_export_root is not None:
-        lines.append(f"- Mod-ready export root: {normalized.mod_ready_export_root}")
+        package_root = resolve_mod_package_root(normalized.mod_ready_export_root, normalized.mod_ready_package_info)
+        lines.append(f"- Mod package parent root: {normalized.mod_ready_export_root}")
+        lines.append(f"- Mod package folder: {package_root.name}")
+        lines.append(f"- Mod package output: {package_root}")
+        lines.append(f"- .no_encrypt file: {'enabled' if normalized.mod_ready_create_no_encrypt_file else 'disabled'}")
     if chain_analysis and chain_analysis.warnings:
         lines.append("- chaiNNer preflight warnings:")
         for warning in chain_analysis.warnings[:5]:
@@ -2526,7 +2578,12 @@ def ensure_dds_display_preview_png(
     max_dimension: int = _COMPARE_DISPLAY_PREVIEW_MAX_DIMENSION,
     stop_event: Optional[threading.Event] = None,
 ) -> Path:
-    resolved_info = dds_info or parse_dds(dds_path)
+    try:
+        resolved_info = dds_info or parse_dds(dds_path)
+    except Exception as exc:
+        if dds_info is not None:
+            raise
+        raise ValueError(f"Could not parse DDS header for preview: {exc}") from exc
     resize_dims = _preview_resize_dimensions(
         resolved_info.width,
         resolved_info.height,
@@ -2728,6 +2785,13 @@ def normalize_config_for_planning(config: AppConfig) -> NormalizedConfig:
     explicit_model_dir = normalize_optional_path(config.ncnn_model_dir)
     ncnn_model_dir = resolve_ncnn_model_dir(ncnn_exe_path, explicit_model_dir) or explicit_model_dir
     mod_ready_export_root = normalize_optional_path(config.mod_ready_export_root)
+    mod_ready_package_info = ModPackageInfo(
+        title=str(getattr(config, "mod_ready_package_title", MOD_READY_PACKAGE_TITLE) or "").strip() or MOD_READY_PACKAGE_TITLE,
+        version=str(getattr(config, "mod_ready_package_version", MOD_READY_PACKAGE_VERSION) or "").strip() or MOD_READY_PACKAGE_VERSION,
+        author=str(getattr(config, "mod_ready_package_author", MOD_READY_PACKAGE_AUTHOR) or "").strip(),
+        description=str(getattr(config, "mod_ready_package_description", MOD_READY_PACKAGE_DESCRIPTION) or "").strip(),
+        nexus_url=str(getattr(config, "mod_ready_package_nexus_url", MOD_READY_PACKAGE_NEXUS_URL) or "").strip(),
+    )
 
     return NormalizedConfig(
         original_dds_root=original_dds_root,
@@ -2769,6 +2833,8 @@ def normalize_config_for_planning(config: AppConfig) -> NormalizedConfig:
         retry_smaller_tile_on_failure=bool(getattr(config, "retry_smaller_tile_on_failure", RETRY_SMALLER_TILE_ON_FAILURE)),
         enable_mod_ready_loose_export=bool(getattr(config, "enable_mod_ready_loose_export", ENABLE_MOD_READY_LOOSE_EXPORT)),
         mod_ready_export_root=mod_ready_export_root,
+        mod_ready_create_no_encrypt_file=bool(getattr(config, "mod_ready_create_no_encrypt_file", MOD_READY_CREATE_NO_ENCRYPT)),
+        mod_ready_package_info=mod_ready_package_info,
     )
 
 
@@ -2892,6 +2958,13 @@ def normalize_config(config: AppConfig, *, validate_backend_runtime: bool = True
         mod_ready_export_root = explicit_mod_ready_export_root or resolve_default_mod_ready_export_root(output_root)
         if mod_ready_export_root.resolve() == output_root.resolve():
             raise ValueError("Mod-ready export root must be different from the main output root.")
+    mod_ready_package_info = ModPackageInfo(
+        title=str(getattr(config, "mod_ready_package_title", MOD_READY_PACKAGE_TITLE) or "").strip() or MOD_READY_PACKAGE_TITLE,
+        version=str(getattr(config, "mod_ready_package_version", MOD_READY_PACKAGE_VERSION) or "").strip() or MOD_READY_PACKAGE_VERSION,
+        author=str(getattr(config, "mod_ready_package_author", MOD_READY_PACKAGE_AUTHOR) or "").strip(),
+        description=str(getattr(config, "mod_ready_package_description", MOD_READY_PACKAGE_DESCRIPTION) or "").strip(),
+        nexus_url=str(getattr(config, "mod_ready_package_nexus_url", MOD_READY_PACKAGE_NEXUS_URL) or "").strip(),
+    )
 
     dds_staging_root: Optional[Path] = None
     if config.enable_dds_staging:
@@ -2972,6 +3045,8 @@ def normalize_config(config: AppConfig, *, validate_backend_runtime: bool = True
         retry_smaller_tile_on_failure=retry_smaller_tile_on_failure,
         enable_mod_ready_loose_export=enable_mod_ready_loose_export,
         mod_ready_export_root=mod_ready_export_root,
+        mod_ready_create_no_encrypt_file=bool(getattr(config, "mod_ready_create_no_encrypt_file", MOD_READY_CREATE_NO_ENCRYPT)),
+        mod_ready_package_info=mod_ready_package_info,
         texture_rules=parsed_texture_rules,  # type: ignore[call-arg]
     )
 
@@ -3308,8 +3383,13 @@ def rebuild_dds_files(
     emit_log(
         f"Automatic texture rules={'enabled' if normalized.enable_automatic_texture_rules else 'disabled'}, "
         f"retry_smaller_tile={'enabled' if normalized.retry_smaller_tile_on_failure else 'disabled'}, "
-        f"mod_ready_export={'enabled' if normalized.enable_mod_ready_loose_export else 'disabled'}."
+        f"ready_mod_package={'enabled' if normalized.enable_mod_ready_loose_export else 'disabled'}."
     )
+    if normalized.enable_mod_ready_loose_export and normalized.mod_ready_export_root is not None:
+        package_root = resolve_mod_package_root(normalized.mod_ready_export_root, normalized.mod_ready_package_info)
+        emit_log(f"Mod package parent root: {normalized.mod_ready_export_root}")
+        emit_log(f"Mod package folder: {package_root.name}")
+        emit_log(f"Create .no_encrypt file: {'yes' if normalized.mod_ready_create_no_encrypt_file else 'no'}")
     if normalized.enable_dds_staging:
         if normalized.upscale_backend == UPSCALE_BACKEND_CHAINNER:
             emit_log(
@@ -3912,17 +3992,24 @@ def rebuild_dds_files(
         and not cancelled
         and failed == 0
     ):
-        emit_phase("Loose Export", "Copying final DDS output to mod-ready loose export...", False)
-        emit_log(f"Copying final DDS output to mod-ready loose export: {normalized.mod_ready_export_root}")
+        final_package_root = resolve_mod_package_root(normalized.mod_ready_export_root, normalized.mod_ready_package_info)
+        emit_phase("Mod Package", "Writing ready mod package from final DDS output...", False)
+        emit_log(f"Creating ready mod package under: {final_package_root}")
+        if not normalized.dry_run:
+            write_mod_package_info(
+                final_package_root,
+                normalized.mod_ready_package_info,
+                create_no_encrypt_file=normalized.mod_ready_create_no_encrypt_file,
+            )
         export_result = copy_mod_ready_loose_tree(
             normalized.output_root,
-            normalized.mod_ready_export_root,
+            final_package_root,
             overwrite=True,
             dry_run=normalized.dry_run,
             on_log=None,
         )
         emit_log(
-            "Mod-ready loose export complete: "
+            "Ready mod package export complete: "
             f"copied={export_result.copied_files}, skipped={export_result.skipped_files}, failed={export_result.failed_files}"
         )
 

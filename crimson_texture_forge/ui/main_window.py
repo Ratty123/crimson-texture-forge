@@ -9,6 +9,7 @@ import shutil
 import sys
 import threading
 import time
+import traceback
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -88,6 +89,7 @@ def run_gui() -> int:
     from crimson_texture_forge.ui.settings_tab import SettingsTab
     from crimson_texture_forge.ui.policy_preview_dialog import TexturePolicyPreviewDialog
     from crimson_texture_forge.ui.safe_upscale_wizard import SafeUpscaleWizard
+    from crimson_texture_forge.ui.replace_assistant_tab import ReplaceAssistantTab
     from crimson_texture_forge.ui.text_search_tab import TextSearchTab
 
     def resolve_settings_file_path() -> Path:
@@ -98,6 +100,109 @@ def run_gui() -> int:
         return base_dir / f"{APP_NAME}.cfg"
 
     settings_file_path = resolve_settings_file_path()
+    crash_reports_dir = settings_file_path.parent / "crash_reports"
+    _default_sys_excepthook = sys.excepthook
+    _default_threading_excepthook = getattr(threading, "excepthook", None)
+    _default_unraisablehook = getattr(sys, "unraisablehook", None)
+    _active_main_window: Optional["MainWindow"] = None
+    _capture_crash_details_enabled = False
+
+    def _set_crash_capture_enabled(enabled: bool) -> None:
+        nonlocal _capture_crash_details_enabled
+        _capture_crash_details_enabled = bool(enabled)
+
+    def _collect_crash_context() -> Dict[str, object]:
+        window = _active_main_window
+        context: Dict[str, object] = {}
+        if window is None:
+            return context
+        try:
+            current_tab_index = window.main_tabs.currentIndex()
+            if current_tab_index >= 0:
+                context["current_tab"] = window.main_tabs.tabText(current_tab_index)
+        except Exception:
+            pass
+        try:
+            entry = window._current_archive_entry()
+            if entry is not None:
+                context["selected_archive_path"] = entry.path
+                context["selected_archive_package"] = str(entry.pamt_path)
+        except Exception:
+            pass
+        try:
+            context["texconv_path"] = window.texconv_path_edit.text().strip()
+        except Exception:
+            pass
+        try:
+            context["archive_package_root"] = window.archive_package_root_edit.text().strip()
+        except Exception:
+            pass
+        try:
+            log_lines = window.log_view.toPlainText().splitlines()
+            context["recent_log_tail"] = log_lines[-80:]
+        except Exception:
+            pass
+        return context
+
+    def _write_crash_report(
+        kind: str,
+        title: str,
+        body: str,
+        *,
+        context: Optional[Dict[str, object]] = None,
+    ) -> None:
+        if not _capture_crash_details_enabled:
+            return
+        try:
+            crash_reports_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            report_path = crash_reports_dir / f"{kind}_{timestamp}.log"
+            lines = [
+                f"{APP_TITLE} crash/details report",
+                f"Kind: {kind}",
+                f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                f"Version: {APP_VERSION}",
+                f"Python: {sys.version}",
+                f"Platform: {platform.platform()}",
+                "",
+                title.strip(),
+                "",
+                body.rstrip(),
+            ]
+            report_context = context if context is not None else _collect_crash_context()
+            if report_context:
+                lines.extend(["", "Context:", json.dumps(report_context, indent=2, ensure_ascii=False)])
+            report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+
+    def _handle_uncaught_exception(exc_type, exc_value, exc_traceback) -> None:
+        formatted = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        _write_crash_report("unhandled_exception", "Unhandled exception", formatted)
+        _default_sys_excepthook(exc_type, exc_value, exc_traceback)
+
+    def _handle_thread_exception(args) -> None:
+        formatted = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+        thread_name = getattr(getattr(args, "thread", None), "name", "unknown thread")
+        _write_crash_report("thread_exception", f"Unhandled thread exception in {thread_name}", formatted)
+        if _default_threading_excepthook is not None:
+            _default_threading_excepthook(args)
+
+    def _handle_unraisable_exception(args) -> None:
+        formatted = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+        _write_crash_report(
+            "unraisable_exception",
+            f"Unraisable exception from {getattr(args, 'object', None)!r}",
+            formatted,
+        )
+        if _default_unraisablehook is not None:
+            _default_unraisablehook(args)
+
+    sys.excepthook = _handle_uncaught_exception
+    if _default_threading_excepthook is not None:
+        threading.excepthook = _handle_thread_exception
+    if _default_unraisablehook is not None:
+        sys.unraisablehook = _handle_unraisable_exception
 
     def create_settings() -> QSettings:
         settings_file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -484,7 +589,9 @@ def run_gui() -> int:
 
         def _attach_loaded_images(self, result: ArchivePreviewResult) -> ArchivePreviewResult:
             preview_image = self._load_image(result.preview_image_path)
-            loose_preview_image = self._load_image(result.loose_preview_image_path)
+            loose_preview_image = None
+            if preview_image is None and result.loose_preview_image_path:
+                loose_preview_image = self._load_image(result.loose_preview_image_path)
             if preview_image is None and loose_preview_image is None:
                 return result
             return dataclasses.replace(
@@ -505,8 +612,11 @@ def run_gui() -> int:
     class MainWindow(QMainWindow):
         def __init__(self) -> None:
             super().__init__()
+            nonlocal _active_main_window
+            _active_main_window = self
             self.setWindowTitle(APP_TITLE)
             self.settings = create_settings()
+            _set_crash_capture_enabled(self._preference_bool("capture_crash_details", False))
             self.settings_file_path = settings_file_path
             self.archive_cache_root = self.settings_file_path.parent / ARCHIVE_SCAN_CACHE_DIRNAME
             self._settings_ready = False
@@ -552,6 +662,8 @@ def run_gui() -> int:
             self.archive_filtered_entries: List[ArchiveEntry] = []
             self.archive_filtered_dds_count = 0
             self.archive_filters_dirty = False
+            self.archive_browser_refresh_pending = False
+            self._activate_archive_browser_on_scan_complete = True
             self.archive_tree_child_folders: Dict[Tuple[str, ...], List[Tuple[str, Tuple[str, ...]]]] = {}
             self.archive_tree_direct_files: Dict[Tuple[str, ...], List[int]] = {}
             self.archive_tree_folder_entry_indexes: Dict[Tuple[str, ...], List[int]] = {}
@@ -601,7 +713,7 @@ def run_gui() -> int:
             workflow_layout = QVBoxLayout(self.workflow_tab)
             workflow_layout.setContentsMargins(0, 0, 0, 0)
             workflow_layout.setSpacing(10)
-            self.main_tabs.addTab(self.workflow_tab, "Workflow")
+            self.main_tabs.addTab(self.workflow_tab, "Texture Workflow")
 
             self.workflow_splitter = QSplitter(Qt.Horizontal)
             self.workflow_splitter.setChildrenCollapsible(False)
@@ -1100,9 +1212,19 @@ def run_gui() -> int:
                 "Expert override: force technical maps through PNG/upscale path (unsafe)"
             )
             self.retry_smaller_tile_checkbox = QCheckBox("Retry with smaller tile on failure")
-            self.enable_mod_ready_loose_export_checkbox = QCheckBox("Create mod-ready loose export after rebuild")
+            self.enable_mod_ready_loose_export_checkbox = QCheckBox("Create ready mod package after rebuild")
             self.mod_ready_export_root_edit = QLineEdit()
             self.mod_ready_export_browse_button = QPushButton("Browse")
+            self.mod_ready_create_no_encrypt_checkbox = QCheckBox("Create .no_encrypt file")
+            self.mod_ready_create_no_encrypt_checkbox.setChecked(MOD_READY_CREATE_NO_ENCRYPT)
+            self.mod_ready_package_title_edit = QLineEdit()
+            self.mod_ready_package_version_edit = QLineEdit()
+            self.mod_ready_package_author_edit = QLineEdit()
+            self.mod_ready_package_description_edit = QLineEdit()
+            self.mod_ready_package_nexus_url_edit = QLineEdit()
+            self.mod_ready_package_title_edit.setPlaceholderText(MOD_READY_PACKAGE_TITLE)
+            self.mod_ready_package_version_edit.setPlaceholderText(MOD_READY_PACKAGE_VERSION)
+            self.mod_ready_package_nexus_url_edit.setPlaceholderText("https://www.nexusmods.com/...")
             self.ncnn_scale_spin.setToolTip(
                 "Final PNG scale for direct backends. For predictable results, keep this close to the selected model's intended scale."
             )
@@ -1142,18 +1264,37 @@ def run_gui() -> int:
             policy_layout.addWidget(self.enable_automatic_texture_rules_checkbox, 1, 0, 1, 2)
             policy_layout.addWidget(self.enable_unsafe_technical_override_checkbox, 2, 0, 1, 2)
             policy_layout.addWidget(self.enable_mod_ready_loose_export_checkbox, 3, 0, 1, 2)
-            policy_layout.addWidget(QLabel("Loose export root"), 4, 0)
+            policy_layout.addWidget(QLabel("Mod package parent root"), 4, 0)
             loose_export_row = QHBoxLayout()
             loose_export_row.setContentsMargins(0, 0, 0, 0)
             loose_export_row.setSpacing(8)
             loose_export_row.addWidget(self.mod_ready_export_root_edit, stretch=1)
             loose_export_row.addWidget(self.mod_ready_export_browse_button)
             policy_layout.addLayout(loose_export_row, 4, 1)
+            self.mod_ready_package_group = QGroupBox("Mod Package Metadata")
+            mod_package_layout = QGridLayout(self.mod_ready_package_group)
+            mod_package_layout.setHorizontalSpacing(10)
+            mod_package_layout.setVerticalSpacing(8)
+            mod_package_layout.setColumnMinimumWidth(0, 136)
+            mod_package_layout.setColumnStretch(1, 1)
+            mod_package_layout.addWidget(QLabel("Title"), 0, 0)
+            mod_package_layout.addWidget(self.mod_ready_package_title_edit, 0, 1)
+            mod_package_layout.addWidget(QLabel("Version"), 1, 0)
+            mod_package_layout.addWidget(self.mod_ready_package_version_edit, 1, 1)
+            mod_package_layout.addWidget(QLabel("Author"), 2, 0)
+            mod_package_layout.addWidget(self.mod_ready_package_author_edit, 2, 1)
+            mod_package_layout.addWidget(QLabel("Description"), 3, 0)
+            mod_package_layout.addWidget(self.mod_ready_package_description_edit, 3, 1)
+            mod_package_layout.addWidget(QLabel("Nexus URL"), 4, 0)
+            mod_package_layout.addWidget(self.mod_ready_package_nexus_url_edit, 4, 1)
+            mod_package_layout.addWidget(self.mod_ready_create_no_encrypt_checkbox, 5, 0, 1, 2)
+            self.mod_ready_package_group.setVisible(False)
+            policy_layout.addWidget(self.mod_ready_package_group, 5, 0, 1, 2)
 
             self.texture_policy_hint_label = QLabel()
             self.texture_policy_hint_label.setObjectName("HintLabel")
             self.texture_policy_hint_label.setWordWrap(True)
-            policy_layout.addWidget(self.texture_policy_hint_label, 5, 0, 1, 2)
+            policy_layout.addWidget(self.texture_policy_hint_label, 6, 0, 1, 2)
             upscale_layout.addWidget(self.texture_policy_group)
 
             self.direct_backend_controls_group = QGroupBox("Direct Upscale Controls (NCNN only)")
@@ -1180,7 +1321,7 @@ def run_gui() -> int:
             upscale_layout.addWidget(self.direct_backend_controls_group)
 
             self.safe_wizard_help_label = QLabel(
-                "Start always uses the current settings shown in Workflow. "
+                "Start always uses the current settings shown in Texture Workflow. "
                 "Run Summary is optional and shows the current sources, backend, and policy without duplicating those controls."
             )
             self.safe_wizard_help_label.setObjectName("HintLabel")
@@ -1583,7 +1724,7 @@ def run_gui() -> int:
             archive_actions_row.setSpacing(8)
             self.archive_extract_selected_button = QPushButton("Extract Selected")
             self.archive_extract_filtered_button = QPushButton("Extract Filtered")
-            self.archive_extract_to_workflow_button = QPushButton("DDS To Workflow")
+            self.archive_extract_to_workflow_button = QPushButton("DDS To Texture Workflow")
             self.archive_extract_to_workflow_button.setToolTip(
                 "If one or more archive files/folders are selected, only selected DDS files are extracted to the workflow root. "
                 "If nothing is selected, all DDS files from the current filtered view are used."
@@ -1798,7 +1939,20 @@ def run_gui() -> int:
                 theme_key=self.current_theme_key,
             )
             self.settings_tab.theme_changed.connect(self._handle_theme_changed)
+            self.settings_tab.crash_capture_changed.connect(_set_crash_capture_enabled)
             self.main_tabs.addTab(self.settings_tab, "Settings")
+            self.replace_assistant_tab = ReplaceAssistantTab(
+                settings=self.settings,
+                base_dir=self.settings_file_path.parent,
+                get_archive_entries=lambda: self.archive_entries,
+                get_original_root=lambda: self.original_dds_edit.text(),
+                get_texconv_path=lambda: self.texconv_path_edit.text(),
+                get_current_config=self.collect_config,
+            )
+            self.replace_assistant_tab.status_message_requested.connect(
+                lambda message, is_error: self.set_status_message(message, error=is_error)
+            )
+            self.main_tabs.insertTab(1, self.replace_assistant_tab, "Replace Assistant")
             self.setCentralWidget(central)
 
             self.export_profile_action.triggered.connect(self.export_profile)
@@ -2121,6 +2275,18 @@ def run_gui() -> int:
                     bool(getattr(config, "enable_mod_ready_loose_export", ENABLE_MOD_READY_LOOSE_EXPORT))
                 )
                 self.mod_ready_export_root_edit.setText(getattr(config, "mod_ready_export_root", ""))
+                self.mod_ready_create_no_encrypt_checkbox.setChecked(
+                    bool(getattr(config, "mod_ready_create_no_encrypt_file", MOD_READY_CREATE_NO_ENCRYPT))
+                )
+                self.mod_ready_package_title_edit.setText(getattr(config, "mod_ready_package_title", MOD_READY_PACKAGE_TITLE))
+                self.mod_ready_package_version_edit.setText(getattr(config, "mod_ready_package_version", MOD_READY_PACKAGE_VERSION))
+                self.mod_ready_package_author_edit.setText(getattr(config, "mod_ready_package_author", MOD_READY_PACKAGE_AUTHOR))
+                self.mod_ready_package_description_edit.setText(
+                    getattr(config, "mod_ready_package_description", MOD_READY_PACKAGE_DESCRIPTION)
+                )
+                self.mod_ready_package_nexus_url_edit.setText(
+                    getattr(config, "mod_ready_package_nexus_url", MOD_READY_PACKAGE_NEXUS_URL)
+                )
                 self._refresh_ncnn_model_picker(preferred_name=getattr(config, "ncnn_model_name", ""))
                 self.archive_package_root_edit.setText(config.archive_package_root)
                 self.archive_extract_root_edit.setText(config.archive_extract_root)
@@ -2284,6 +2450,17 @@ def run_gui() -> int:
                         archive.writestr(notices_path.name, notices_path.read_text(encoding="utf-8"))
                     if license_path.exists():
                         archive.writestr(license_path.name, license_path.read_text(encoding="utf-8"))
+                    if crash_reports_dir.exists():
+                        latest_crash_report = max(
+                            (path for path in crash_reports_dir.glob("*.log") if path.is_file()),
+                            default=None,
+                            key=lambda path: path.stat().st_mtime,
+                        )
+                        if latest_crash_report is not None:
+                            archive.writestr(
+                                f"crash_reports/{latest_crash_report.name}",
+                                latest_crash_report.read_text(encoding="utf-8"),
+                            )
                     for archive_name, archive_text in self.text_search_tab.diagnostic_entries().items():
                         archive.writestr(archive_name, archive_text)
 
@@ -2450,7 +2627,10 @@ def run_gui() -> int:
                 return
 
             self.append_archive_log("Startup archive auto-load is enabled.")
-            self.scan_archives(force_refresh=not self._preference_bool("prefer_archive_cache_on_startup", True))
+            self.scan_archives(
+                force_refresh=not self._preference_bool("prefer_archive_cache_on_startup", True),
+                activate_archive_tab=False,
+            )
 
         def _apply_responsive_window_defaults(self) -> None:
             screen = self.screen() or QApplication.primaryScreen()
@@ -2500,6 +2680,11 @@ def run_gui() -> int:
                 self.ncnn_model_dir_edit,
                 self.ncnn_extra_args_edit,
                 self.mod_ready_export_root_edit,
+                self.mod_ready_package_title_edit,
+                self.mod_ready_package_version_edit,
+                self.mod_ready_package_author_edit,
+                self.mod_ready_package_description_edit,
+                self.mod_ready_package_nexus_url_edit,
                 self.archive_package_root_edit,
                 self.archive_extract_root_edit,
             ]
@@ -2517,6 +2702,7 @@ def run_gui() -> int:
                 self.enable_unsafe_technical_override_checkbox,
                 self.retry_smaller_tile_checkbox,
                 self.enable_mod_ready_loose_export_checkbox,
+                self.mod_ready_create_no_encrypt_checkbox,
             ]
             for checkbox in checkboxes:
                 checkbox.toggled.connect(self.schedule_settings_save)
@@ -2587,7 +2773,34 @@ def run_gui() -> int:
         def _handle_main_tab_changed(self, index: int) -> None:
             if 0 <= index < self.main_tabs.count() and self.main_tabs.widget(index) is self.workflow_tab:
                 self._apply_workflow_content_tab_layout()
+            if 0 <= index < self.main_tabs.count() and self.main_tabs.widget(index) is self.archive_browser_tab:
+                self._refresh_archive_browser_if_pending()
+            if 0 <= index < self.main_tabs.count() and self.main_tabs.widget(index) is self.research_tab:
+                self.research_tab.refresh_archive_picker_if_pending()
             self._save_settings()
+
+        def _refresh_archive_browser_view(self) -> None:
+            self._rebuild_archive_structure_filter_controls()
+            self._populate_archive_tree(rebuild_index=False)
+            self.archive_browser_refresh_pending = False
+
+        def _refresh_archive_browser_if_pending(self) -> None:
+            if self.archive_browser_refresh_pending:
+                self._refresh_archive_browser_view()
+
+        def _refresh_or_defer_archive_browser_view(self, *, activate_tab: bool) -> None:
+            if activate_tab:
+                self.main_tabs.setCurrentWidget(self.archive_browser_tab)
+            if self.main_tabs.currentWidget() is self.archive_browser_tab:
+                self._refresh_archive_browser_view()
+            else:
+                self.archive_browser_refresh_pending = True
+
+        def _refresh_or_defer_research_archive_picker(self) -> None:
+            if self.main_tabs.currentWidget() is self.research_tab:
+                self.research_tab.refresh_archive_picker()
+            else:
+                self.research_tab.mark_archive_picker_dirty()
 
         def _default_workflow_right_splitter_sizes(self) -> List[int]:
             available_right_height = max(420, self.height() - 260)
@@ -2686,6 +2899,12 @@ def run_gui() -> int:
             self.settings.setValue("upscale/retry_smaller_tile", self.retry_smaller_tile_checkbox.isChecked())
             self.settings.setValue("upscale/mod_ready_loose_export", self.enable_mod_ready_loose_export_checkbox.isChecked())
             self.settings.setValue("upscale/mod_ready_export_root", self.mod_ready_export_root_edit.text())
+            self.settings.setValue("upscale/mod_ready_create_no_encrypt", self.mod_ready_create_no_encrypt_checkbox.isChecked())
+            self.settings.setValue("upscale/mod_ready_package_title", self.mod_ready_package_title_edit.text())
+            self.settings.setValue("upscale/mod_ready_package_version", self.mod_ready_package_version_edit.text())
+            self.settings.setValue("upscale/mod_ready_package_author", self.mod_ready_package_author_edit.text())
+            self.settings.setValue("upscale/mod_ready_package_description", self.mod_ready_package_description_edit.text())
+            self.settings.setValue("upscale/mod_ready_package_nexus_url", self.mod_ready_package_nexus_url_edit.text())
             self.settings.setValue("ui/main_tab_index", self.main_tabs.currentIndex())
             self.settings.setValue("ui/compare_sync_pan", self.compare_sync_pan_checkbox.isChecked())
             self.settings.setValue("ui/compare_preview_size_mode", self._combo_value(self.compare_preview_size_combo))
@@ -2913,6 +3132,52 @@ def run_gui() -> int:
                     getattr(defaults, "mod_ready_export_root", MOD_READY_EXPORT_ROOT),
                 )
             )
+            self.mod_ready_create_no_encrypt_checkbox.setChecked(
+                self._read_bool(
+                    "upscale/mod_ready_create_no_encrypt",
+                    getattr(defaults, "mod_ready_create_no_encrypt_file", MOD_READY_CREATE_NO_ENCRYPT),
+                )
+            )
+            self.mod_ready_package_title_edit.setText(
+                str(
+                    self.settings.value(
+                        "upscale/mod_ready_package_title",
+                        getattr(defaults, "mod_ready_package_title", MOD_READY_PACKAGE_TITLE),
+                    )
+                )
+            )
+            self.mod_ready_package_version_edit.setText(
+                str(
+                    self.settings.value(
+                        "upscale/mod_ready_package_version",
+                        getattr(defaults, "mod_ready_package_version", MOD_READY_PACKAGE_VERSION),
+                    )
+                )
+            )
+            self.mod_ready_package_author_edit.setText(
+                str(
+                    self.settings.value(
+                        "upscale/mod_ready_package_author",
+                        getattr(defaults, "mod_ready_package_author", MOD_READY_PACKAGE_AUTHOR),
+                    )
+                )
+            )
+            self.mod_ready_package_description_edit.setText(
+                str(
+                    self.settings.value(
+                        "upscale/mod_ready_package_description",
+                        getattr(defaults, "mod_ready_package_description", MOD_READY_PACKAGE_DESCRIPTION),
+                    )
+                )
+            )
+            self.mod_ready_package_nexus_url_edit.setText(
+                str(
+                    self.settings.value(
+                        "upscale/mod_ready_package_nexus_url",
+                        getattr(defaults, "mod_ready_package_nexus_url", MOD_READY_PACKAGE_NEXUS_URL),
+                    )
+                )
+            )
             if self._preference_bool("restore_last_active_tab", True):
                 saved_main_tab = int(self.settings.value("ui/main_tab_index", 0))
             else:
@@ -2994,6 +3259,7 @@ def run_gui() -> int:
             self.enable_mod_ready_loose_export_checkbox.setEnabled(True)
             self.mod_ready_export_root_edit.setEnabled(self.enable_mod_ready_loose_export_checkbox.isChecked())
             self.mod_ready_export_browse_button.setEnabled(self.enable_mod_ready_loose_export_checkbox.isChecked())
+            self.mod_ready_package_group.setVisible(self.enable_mod_ready_loose_export_checkbox.isChecked())
             self._update_ncnn_preset_hint()
             self._refresh_dds_output_hints()
             self._sync_upscale_backend_stack_height()
@@ -3183,7 +3449,7 @@ def run_gui() -> int:
                     "png_root": config.png_root,
                     "output_root": config.output_root,
                     "staging_png_root": config.dds_staging_root,
-                    "notes": "This dialog is read-only. Model paths and all editable backend or texture-policy controls remain in the main Workflow panel.",
+                    "notes": "This dialog is read-only. Model paths and all editable backend or texture-policy controls remain in the main Texture Workflow panel.",
                 }
             )
             dialog.exec()
@@ -3526,11 +3792,22 @@ def run_gui() -> int:
             enabled = self.enable_mod_ready_loose_export_checkbox.isChecked()
             self.mod_ready_export_root_edit.setEnabled(enabled)
             self.mod_ready_export_browse_button.setEnabled(enabled)
+            self.mod_ready_package_group.setVisible(enabled)
+            self.mod_ready_create_no_encrypt_checkbox.setEnabled(enabled)
+            self.mod_ready_package_title_edit.setEnabled(enabled)
+            self.mod_ready_package_version_edit.setEnabled(enabled)
+            self.mod_ready_package_author_edit.setEnabled(enabled)
+            self.mod_ready_package_description_edit.setEnabled(enabled)
+            self.mod_ready_package_nexus_url_edit.setEnabled(enabled)
             if enabled and not self.mod_ready_export_root_edit.text().strip():
                 output_text = self.output_root_edit.text().strip()
                 if output_text:
                     default_root = resolve_default_mod_ready_export_root(Path(output_text).expanduser())
                     self.mod_ready_export_root_edit.setText(str(default_root))
+            if enabled and not self.mod_ready_package_title_edit.text().strip():
+                self.mod_ready_package_title_edit.setText(MOD_READY_PACKAGE_TITLE)
+            if enabled and not self.mod_ready_package_version_edit.text().strip():
+                self.mod_ready_package_version_edit.setText(MOD_READY_PACKAGE_VERSION)
             self._save_settings()
 
         def _browse_directory(self, line_edit: QLineEdit, title: str) -> None:
@@ -3609,7 +3886,7 @@ def run_gui() -> int:
             self._browse_directory(self.ncnn_model_dir_edit, "Select Real-ESRGAN NCNN model folder")
 
         def _browse_mod_ready_export_root(self) -> None:
-            self._browse_directory(self.mod_ready_export_root_edit, "Select Mod-Ready Loose Export Root")
+            self._browse_directory(self.mod_ready_export_root_edit, "Select Ready Mod Package Parent Root")
 
         def _browse_archive_package_root(self) -> None:
             self._browse_directory(self.archive_package_root_edit, "Select Archive Package Root")
@@ -3755,7 +4032,15 @@ def run_gui() -> int:
             if getattr(config, "enable_mod_ready_loose_export", False):
                 export_root_text = str(getattr(config, "mod_ready_export_root", "") or "").strip()
                 if export_root_text:
-                    targets.append(("Mod-ready loose export root", Path(export_root_text).expanduser()))
+                    package_info = ModPackageInfo(
+                        title=str(getattr(config, "mod_ready_package_title", MOD_READY_PACKAGE_TITLE) or "").strip() or MOD_READY_PACKAGE_TITLE,
+                        version=str(getattr(config, "mod_ready_package_version", MOD_READY_PACKAGE_VERSION) or "").strip() or MOD_READY_PACKAGE_VERSION,
+                        author=str(getattr(config, "mod_ready_package_author", MOD_READY_PACKAGE_AUTHOR) or "").strip(),
+                        description=str(getattr(config, "mod_ready_package_description", MOD_READY_PACKAGE_DESCRIPTION) or "").strip(),
+                        nexus_url=str(getattr(config, "mod_ready_package_nexus_url", MOD_READY_PACKAGE_NEXUS_URL) or "").strip(),
+                    )
+                    package_root = resolve_mod_package_root(Path(export_root_text).expanduser(), package_info)
+                    targets.append(("Ready mod package output", package_root))
 
             seen_paths: set[str] = set()
             unique_targets: List[Tuple[str, Path]] = []
@@ -3965,7 +4250,7 @@ def run_gui() -> int:
                 return suggested_workspace_paths(common).get("archive_extract_root", common / "archive_extract")
             return Path.cwd() / "archive_extract"
 
-        def scan_archives(self, force_refresh: bool = False) -> None:
+        def scan_archives(self, force_refresh: bool = False, *, activate_archive_tab: bool = True) -> None:
             if self._background_task_active():
                 return
             package_root_text = self.archive_package_root_edit.text().strip()
@@ -3974,7 +4259,9 @@ def run_gui() -> int:
                 return
 
             package_root = Path(package_root_text).expanduser()
-            self.main_tabs.setCurrentWidget(self.archive_browser_tab)
+            self._activate_archive_browser_on_scan_complete = activate_archive_tab
+            if activate_archive_tab:
+                self.main_tabs.setCurrentWidget(self.archive_browser_tab)
             self.archive_scan_progress_label.setText("Preparing archive refresh..." if force_refresh else "Preparing archive scan / cache load...")
             self.archive_scan_progress_bar.setRange(0, 0)
             self.archive_scan_progress_bar.setFormat("Working...")
@@ -4065,14 +4352,23 @@ def run_gui() -> int:
             self.archive_filtered_dds_count = int(browser_state.get("dds_count", 0))
             self.archive_filters_dirty = False
             self._update_archive_filter_button_state()
+            self.replace_assistant_tab.set_archive_entries(
+                self.archive_entries,
+                self.archive_package_root_edit.text().strip(),
+            )
             source = str(payload.get("source", "scan"))
             cache_path_text = str(payload.get("cache_path", "")).strip()
-            self.archive_scan_progress_label.setText("Rendering archive browser view...")
-            self.main_tabs.setCurrentWidget(self.archive_browser_tab)
+            rendering_archive_view = (
+                self._activate_archive_browser_on_scan_complete
+                or self.main_tabs.currentWidget() is self.archive_browser_tab
+            )
+            self.archive_scan_progress_label.setText(
+                "Rendering archive browser view..." if rendering_archive_view else "Finalizing archive load..."
+            )
             self.archive_scan_progress_bar.setRange(0, 0)
-            self.archive_scan_progress_bar.setFormat("Rendering...")
-            self.set_status_message("Rendering archive browser view...")
-            self.append_archive_log("Rendering archive browser view...")
+            self.archive_scan_progress_bar.setFormat("Rendering..." if rendering_archive_view else "Finalizing...")
+            self.set_status_message("Rendering archive browser view..." if rendering_archive_view else "Finalizing archive load...")
+            self.append_archive_log("Rendering archive browser view..." if rendering_archive_view else "Finalizing archive load...")
             QTimer.singleShot(
                 0,
                 lambda source=source, cache_path_text=cache_path_text: self._finalize_archive_scan_complete(
@@ -4082,9 +4378,11 @@ def run_gui() -> int:
             )
 
         def _finalize_archive_scan_complete(self, source: str, cache_path_text: str) -> None:
-            self._rebuild_archive_structure_filter_controls()
-            self._populate_archive_tree(rebuild_index=False)
-            self.research_tab.refresh_archive_picker()
+            self._refresh_or_defer_archive_browser_view(
+                activate_tab=self._activate_archive_browser_on_scan_complete,
+            )
+            self._activate_archive_browser_on_scan_complete = False
+            self._refresh_or_defer_research_archive_picker()
             completion_text = (
                 f"Loaded {len(self.archive_entries):,} archive entries from cache."
                 if source == "cache"
@@ -4256,7 +4554,7 @@ def run_gui() -> int:
             self.archive_filters_dirty = False
             self._update_archive_filter_button_state()
             self._populate_archive_tree(current_entry_path)
-            self.research_tab.refresh_archive_picker()
+            self._refresh_or_defer_research_archive_picker()
 
         def _archive_tree_item_kind(self, item: Optional[QTreeWidgetItem]) -> str:
             if item is None:
@@ -4635,6 +4933,12 @@ def run_gui() -> int:
         def _handle_archive_preview_error(self, request_id: int, message: str) -> None:
             if self._shutting_down or request_id != self.archive_preview_request_id:
                 return
+            _write_crash_report(
+                "archive_preview_error",
+                "Archive preview error",
+                str(message),
+                context=_collect_crash_context(),
+            )
             self._clear_archive_preview(f"Preview failed: {message}")
 
         def _collect_archive_preview_loose_roots(self) -> List[Path]:
@@ -5096,6 +5400,12 @@ def run_gui() -> int:
                 retry_smaller_tile_on_failure=self.retry_smaller_tile_checkbox.isChecked(),
                 enable_mod_ready_loose_export=self.enable_mod_ready_loose_export_checkbox.isChecked(),
                 mod_ready_export_root=self.mod_ready_export_root_edit.text().strip(),
+                mod_ready_create_no_encrypt_file=self.mod_ready_create_no_encrypt_checkbox.isChecked(),
+                mod_ready_package_title=self.mod_ready_package_title_edit.text().strip(),
+                mod_ready_package_version=self.mod_ready_package_version_edit.text().strip(),
+                mod_ready_package_author=self.mod_ready_package_author_edit.text().strip(),
+                mod_ready_package_description=self.mod_ready_package_description_edit.text().strip(),
+                mod_ready_package_nexus_url=self.mod_ready_package_nexus_url_edit.text().strip(),
                 archive_package_root=self.archive_package_root_edit.text().strip(),
                 archive_extract_root=self.archive_extract_root_edit.text().strip(),
                 archive_filter_text=self.archive_filter_edit.text().strip(),
@@ -5193,6 +5503,7 @@ def run_gui() -> int:
             self.archive_preview_info_edit.setEnabled(not busy)
             self.text_search_tab.set_external_busy(busy)
             self.research_tab.setEnabled(not busy)
+            self.replace_assistant_tab.set_external_busy(busy)
             self.settings_tab.setEnabled(not busy)
             self.archive_preview_loose_toggle_button.setEnabled(
                 not busy and self.archive_preview_loose_toggle_button.isVisible()
@@ -5730,6 +6041,12 @@ def run_gui() -> int:
                 self._utility_completion_handler(result)
 
         def _handle_worker_error(self, message: str) -> None:
+            _write_crash_report(
+                "worker_error",
+                "Background worker error",
+                str(message),
+                context=_collect_crash_context(),
+            )
             self.set_status_message(message, error=True)
             self.append_log(f"ERROR: {message}")
             if self.archive_scan_worker is not None:
@@ -6141,6 +6458,8 @@ def run_gui() -> int:
 
         def closeEvent(self, event) -> None:  # type: ignore[override]
             self._shutting_down = True
+            nonlocal _active_main_window
+            _active_main_window = None
             self._settings_save_timer.stop()
             self._chainner_analysis_timer.stop()
             self._compare_preview_timer.stop()
@@ -6176,8 +6495,10 @@ def run_gui() -> int:
                 self.archive_preview_thread.quit()
                 self.archive_preview_thread.wait(3000)
             self.settings_tab.flush_settings_save()
+            self.replace_assistant_tab.flush_settings_save()
             self.text_search_tab.shutdown()
             self.research_tab.shutdown()
+            self.replace_assistant_tab.shutdown()
             super().closeEvent(event)
 
     apply_windows_app_user_model_id()

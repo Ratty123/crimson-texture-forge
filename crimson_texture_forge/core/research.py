@@ -589,11 +589,12 @@ def build_archive_research_snapshot(
         "classification_rows": classification_rows[:classification_limit],
         "texture_groups": texture_groups[:group_limit],
         "heatmap_rows": flattened_heatmap_rows,
-        "unknown_resolver_groups": build_unknown_resolver_groups(entries, classification_rows),
+        "unknown_resolver_groups": build_unknown_resolver_groups(entries, classification_rows, stop_event=stop_event),
         "classification_review_groups": build_unknown_resolver_groups(
             entries,
             classification_rows,
             include_classified=True,
+            stop_event=stop_event,
         ),
     }
 
@@ -690,7 +691,9 @@ def _build_unknown_resolver_suggestions(
     *,
     members: Sequence[UnknownResolverMember],
     sidecar_paths: Sequence[str],
+    stop_event: Optional[object] = None,
 ) -> List[UnknownResolverSuggestion]:
+    raise_if_cancelled(stop_event, "Research refresh cancelled.")
     suggestions: List[UnknownResolverSuggestion] = []
     seen: set[str] = set()
     known_counter = Counter(
@@ -739,6 +742,7 @@ def _build_unknown_resolver_suggestions(
         add_suggestion("mask", "opacity_mask", 72, "Member names contain alpha/opacity mask hints.")
 
     if not suggestions:
+        raise_if_cancelled(stop_event, "Research refresh cancelled.")
         variant_like_count = sum(1 for member in members if re.search(r"(?<=\d)[a-z]\.dds$", member.path, re.IGNORECASE))
         if variant_like_count >= 1 or sidecar_paths:
             add_suggestion(
@@ -770,21 +774,29 @@ def build_unknown_resolver_groups(
     classification_rows: Sequence[TextureClassificationRow],
     *,
     include_classified: bool = False,
+    stop_event: Optional[object] = None,
 ) -> List[UnknownResolverGroup]:
     rows_by_path = {row.path.replace("\\", "/"): row for row in classification_rows}
     entries_by_group: Dict[str, List[ArchiveEntry]] = defaultdict(list)
     for entry in entries:
+        raise_if_cancelled(stop_event, "Research refresh cancelled.")
         normalized_path = entry.path.replace("\\", "/")
         if entry.extension in TEXTURE_IMAGE_EXTENSIONS or entry.extension in TEXTURE_SIDECAR_EXTENSIONS:
             entries_by_group[derive_texture_group_key(normalized_path)].append(entry)
 
     groups: List[UnknownResolverGroup] = []
     for group_key, group_entries in entries_by_group.items():
-        texture_rows = [
-            rows_by_path[entry.path.replace("\\", "/")]
-            for entry in group_entries
-            if entry.extension in TEXTURE_IMAGE_EXTENSIONS and entry.path.replace("\\", "/") in rows_by_path
-        ]
+        raise_if_cancelled(stop_event, "Research refresh cancelled.")
+        texture_rows: List[TextureClassificationRow] = []
+        for entry in group_entries:
+            raise_if_cancelled(stop_event, "Research refresh cancelled.")
+            if entry.extension not in TEXTURE_IMAGE_EXTENSIONS:
+                continue
+            normalized_path = entry.path.replace("\\", "/")
+            row = rows_by_path.get(normalized_path)
+            if row is None:
+                continue
+            texture_rows.append(row)
         if not texture_rows:
             continue
         unknown_rows = [row for row in texture_rows if row.texture_type == "unknown"]
@@ -794,6 +806,7 @@ def build_unknown_resolver_groups(
         members: List[UnknownResolverMember] = []
         sidecar_paths: List[str] = []
         for entry in sorted(group_entries, key=lambda member: member.path):
+            raise_if_cancelled(stop_event, "Research refresh cancelled.")
             normalized_path = entry.path.replace("\\", "/")
             row = rows_by_path.get(normalized_path)
             if entry.extension in TEXTURE_SIDECAR_EXTENSIONS:
@@ -816,7 +829,12 @@ def build_unknown_resolver_groups(
 
         package_labels = sorted({member.package_label for member in members})
         known_kinds = sorted({member.current_kind for member in members if member.current_kind not in {"unknown", "sidecar"}})
-        suggestions = _build_unknown_resolver_suggestions(group_key, members=members, sidecar_paths=sidecar_paths)
+        suggestions = _build_unknown_resolver_suggestions(
+            group_key,
+            members=members,
+            sidecar_paths=sidecar_paths,
+            stop_event=stop_event,
+        )
         top_suggestion = suggestions[0] if suggestions else None
         suggestion_label = (
             f"{unknown_resolver_choice_label(top_suggestion.choice_key)} ({top_suggestion.confidence}%)"
@@ -839,6 +857,7 @@ def build_unknown_resolver_groups(
         )
 
     groups.sort(key=lambda group: (-group.unknown_count, group.display_name.casefold()))
+    raise_if_cancelled(stop_event, "Research refresh cancelled.")
     return groups
 
 

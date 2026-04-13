@@ -277,11 +277,11 @@ class SafeUpscaleWizard(QDialog):
         export_layout = QVBoxLayout(self.export_group)
         export_layout.setContentsMargins(12, 14, 12, 12)
         export_layout.setSpacing(8)
-        self.loose_export_checkbox = QCheckBox("Create loose export output")
+        self.loose_export_checkbox = QCheckBox("Create ready mod package output")
         self.loose_export_checkbox.setChecked(True)
         export_layout.addWidget(self.loose_export_checkbox)
         self.export_summary_label = QLabel(
-            "When enabled, the wizard is intended to produce a loose folder tree that is easy to inspect, archive, or use as a mod-ready handoff."
+            "When enabled, the workflow is intended to produce an additional ready mod package with preserved paths for easier handoff."
         )
         self.export_summary_label.setWordWrap(True)
         self.export_summary_label.setObjectName("HintLabel")
@@ -580,7 +580,7 @@ class SafeUpscaleWizard(QDialog):
         self.safety_summary_label.setText(" ".join(safety_lines))
 
         export_text = (
-            "Loose export is enabled. The workflow should end in a mod-ready loose folder tree with preserved paths."
+            "Ready mod package export is enabled. The workflow should also emit a mod package folder with preserved paths."
             if self.loose_export_checkbox.isChecked()
             else "Loose export is disabled. Only the configured output roots and rebuild/preserve behavior will apply."
         )

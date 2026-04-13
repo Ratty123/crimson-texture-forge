@@ -19,6 +19,7 @@ from crimson_texture_forge.ui.themes import UI_THEME_SCHEMES
 
 class SettingsTab(QWidget):
     theme_changed = Signal(str)
+    crash_capture_changed = Signal(bool)
 
     def __init__(self, *, settings, theme_key: str, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -80,8 +81,12 @@ class SettingsTab(QWidget):
         safety_layout.setSpacing(8)
         self.confirm_workflow_cleanup_checkbox = QCheckBox("Confirm clearing PNG / DDS output folders before Start")
         self.confirm_archive_cleanup_checkbox = QCheckBox("Confirm clearing archive extraction target")
+        self.capture_crash_details_checkbox = QCheckBox(
+            "Capture crash details to local report files on unhandled exceptions"
+        )
         safety_layout.addWidget(self.confirm_workflow_cleanup_checkbox)
         safety_layout.addWidget(self.confirm_archive_cleanup_checkbox)
+        safety_layout.addWidget(self.capture_crash_details_checkbox)
         root_layout.addWidget(safety_group)
 
         notes = QLabel(
@@ -100,6 +105,7 @@ class SettingsTab(QWidget):
             self.remember_splitters_checkbox,
             self.confirm_workflow_cleanup_checkbox,
             self.confirm_archive_cleanup_checkbox,
+            self.capture_crash_details_checkbox,
         ):
             checkbox.toggled.connect(self.schedule_settings_save)
 
@@ -133,6 +139,9 @@ class SettingsTab(QWidget):
         self.confirm_archive_cleanup_checkbox.setChecked(
             self._read_bool("preferences/confirm_archive_extract_cleanup", True)
         )
+        self.capture_crash_details_checkbox.setChecked(
+            self._read_bool("preferences/capture_crash_details", False)
+        )
         self._apply_checkbox_states()
 
     def _save_settings(self) -> None:
@@ -159,8 +168,13 @@ class SettingsTab(QWidget):
             "preferences/confirm_archive_extract_cleanup",
             self.confirm_archive_cleanup_checkbox.isChecked(),
         )
+        previous_capture_value = self._read_bool("preferences/capture_crash_details", False)
+        current_capture_value = self.capture_crash_details_checkbox.isChecked()
+        self.settings.setValue("preferences/capture_crash_details", current_capture_value)
         self.settings.sync()
         self._apply_checkbox_states()
+        if previous_capture_value != current_capture_value:
+            self.crash_capture_changed.emit(current_capture_value)
 
     def schedule_settings_save(self, *_args) -> None:
         if not self._settings_ready:
