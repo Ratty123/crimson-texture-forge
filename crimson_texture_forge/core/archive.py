@@ -1640,17 +1640,23 @@ def _dds_bytes_per_block(dxgi_format: int, four_cc: bytes) -> Optional[int]:
     return None
 
 
-def _dds_uncompressed_surface_size(width: int, height: int, pf_flags: int, rgb_bit_count: int) -> Optional[int]:
+def _dds_uncompressed_surface_size(
+    width: int,
+    height: int,
+    pf_flags: int,
+    rgb_bit_count: int,
+    *,
+    pitch_or_linear_size: int = 0,
+    mip_level: int = 0,
+) -> Optional[int]:
     if width <= 0 or height <= 0:
         return None
-    if pf_flags & DDPF_LUMINANCE:
-        if rgb_bit_count in {8, 16}:
+    if pf_flags & (DDPF_LUMINANCE | DDPF_RGB | DDPF_ALPHAPIXELS | DDPF_ALPHA):
+        if rgb_bit_count > 0 and rgb_bit_count % 8 == 0:
             return width * height * max(1, rgb_bit_count // 8)
-        return None
-    if pf_flags & DDPF_RGB:
-        if rgb_bit_count in {16, 24, 32}:
-            return width * height * max(1, rgb_bit_count // 8)
-        return None
+    if pitch_or_linear_size > 0:
+        row_pitch = max(1, pitch_or_linear_size >> max(0, mip_level))
+        return row_pitch * max(1, height)
     return None
 
 
@@ -1662,13 +1668,22 @@ def _dds_surface_size(
     *,
     pf_flags: int = 0,
     rgb_bit_count: int = 0,
+    pitch_or_linear_size: int = 0,
+    mip_level: int = 0,
 ) -> int:
     bytes_per_block = _dds_bytes_per_block(dxgi_format, four_cc)
     if bytes_per_block is not None:
         block_w = max(1, (max(1, width) + 3) // 4)
         block_h = max(1, (max(1, height) + 3) // 4)
         return block_w * block_h * bytes_per_block
-    raw_surface_size = _dds_uncompressed_surface_size(width, height, pf_flags, rgb_bit_count)
+    raw_surface_size = _dds_uncompressed_surface_size(
+        width,
+        height,
+        pf_flags,
+        rgb_bit_count,
+        pitch_or_linear_size=pitch_or_linear_size,
+        mip_level=mip_level,
+    )
     if raw_surface_size is not None:
         return raw_surface_size
     raise ValueError(
@@ -1721,6 +1736,8 @@ def reconstruct_partial_dds(entry: ArchiveEntry, data: bytes) -> bytes:
                     ddspf_four_cc,
                     pf_flags=pf_flags,
                     rgb_bit_count=rgb_bit_count,
+                    pitch_or_linear_size=_pitch_or_linear_size,
+                    mip_level=len(decompressed_block_sizes),
                 )
             )
             current_width = max(1, current_width >> 1)
@@ -2115,14 +2132,12 @@ def build_loose_archive_preview_assets(
         except Exception as exc:
             parse_error = exc
             metadata_summary = f"Loose DDS | {resolved_path.name}"
-        if parse_error is not None:
-            return "", metadata_summary, (
-                detail
-                + f"\nDDS preview unavailable: {parse_error}"
-            )
         if texconv_path is None:
-            return "", metadata_summary, detail + "\nSet texconv.exe to enable DDS loose-file previews."
+            extra = f"\nDDS metadata unavailable: {parse_error}" if parse_error is not None else ""
+            return "", metadata_summary, detail + extra + "\nSet texconv.exe to enable DDS loose-file previews."
         preview_png = ensure_dds_display_preview_png(texconv_path.resolve(), resolved_path, dds_info=dds_info)
+        if parse_error is not None:
+            detail += f"\nDDS metadata unavailable: {parse_error}"
         return str(preview_png), metadata_summary, detail
 
     if suffix in ARCHIVE_IMAGE_EXTENSIONS:
@@ -2218,40 +2233,11 @@ def build_archive_preview_result(
             warning_badge = ""
             warning_text = ""
             extra_detail_parts: List[str] = []
+            dds_info: Optional[DdsInfo] = None
             try:
                 dds_info = parse_dds(source_path)
             except Exception as exc:
-                unsupported_detail = f"DDS preview unavailable: {exc}"
-                extra_detail_parts.append(unsupported_detail)
-                if "PartialDDS" in note_flags:
-                    extra_detail_parts.append(
-                        "Type 1 DDS reconstructed successfully using meta/0.pathc partial-header metadata."
-                    )
-                elif "SparseDDS" in note_flags:
-                    warning_badge = "Type 1 DDS: Unsupported Preview"
-                    warning_text = (
-                        "This archive DDS is stored as truncated type 1 data. "
-                        "The image shown here is a padded best-effort preview and may be corrupted, noisy, or incomplete."
-                    )
-                    extra_detail_parts.append(warning_text)
-                    if loose_file_path:
-                        extra_detail_parts.append(f"Loose file candidate found: {loose_file_path}")
-                if "ChaCha20" in note_flags:
-                    extra_detail_parts.append("Archive payload decrypted via deterministic ChaCha20 filename derivation.")
-                return ArchivePreviewResult(
-                    status="unsupported",
-                    title=entry.basename,
-                    metadata_summary=metadata_summary,
-                    detail_text=build_archive_entry_detail_text(entry, "\n\n".join(extra_detail_parts)),
-                    preferred_view="info",
-                    warning_badge=warning_badge,
-                    warning_text=warning_text or unsupported_detail,
-                    loose_file_path=loose_file_path,
-                    loose_preview_image_path=loose_preview_image_path,
-                    loose_preview_title=loose_preview_title,
-                    loose_preview_metadata_summary=loose_preview_metadata_summary,
-                    loose_preview_detail_text=loose_preview_detail_text,
-                )
+                extra_detail_parts.append(f"DDS metadata unavailable: {exc}")
             if "PartialDDS" in note_flags:
                 extra_detail_parts.append(
                     "Type 1 DDS reconstructed successfully using meta/0.pathc partial-header metadata."

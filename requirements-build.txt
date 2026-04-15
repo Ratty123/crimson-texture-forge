@@ -2,3 +2,6 @@ PyInstaller>=6.0
 PySide6>=6.7
 cryptography>=46.0
 lz4>=4.3
+Pillow>=11.0
+numpy>=2.0
+opencv-python-headless>=4.10

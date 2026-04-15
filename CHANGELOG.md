@@ -9,6 +9,23 @@ The format is intentionally simple:
 - `Fixed` for bug fixes
 - `Docs` for README, guide, or release-note changes
 
+## [0.6.0-beta.3] - 2026-04-15
+
+### Added
+- `Texture Editor` grew into a much more complete texture-editing workspace with multi-document tabs, stronger layered editing, floating selections, masks, adjustment layers, richer channel/alpha workflows, and tighter handoff into `Replace Assistant`, `Texture Workflow`, `Compare`, and `Archive Browser`.
+- The in-app editor now includes a broader set of real editing tools for visible texture work, including `Paint`, `Erase`, `Fill`, `Gradient`, `Smudge`, `Dodge/Burn`, `Patch`, `Clone/Heal`, `Sharpen`, `Soften`, brush presets, brush tips/patterns, custom saved presets, and finer brush control for detail cleanup.
+
+### Changed
+- `Texture Editor` now uses a more canvas-first editing layout with compact document tabs above the canvas, lighter side chrome, better zoom/pan behavior, contextual tool settings, richer shortcut coverage, and more status feedback so it feels closer to a real texture-editing workspace.
+- The editor’s selection, move, and transform workflows now behave much more like a real compositor, with better floating selection handling, stronger copy/paste between documents, layered move workflows, and more practical selection refinement behavior.
+
+### Fixed
+- Fixed a large number of editor/workflow issues across `Texture Editor`, `Replace Assistant`, archive preview, and `Text Search`, including stronger DDS preview fallback behavior, better unusual DDS compatibility, improved archive-load responsiveness, safer preview cancellation/shutdown, and steadier editor adjustment/selection behavior.
+- Fixed additional editor-specific issues around zoom anchoring, floating-selection persistence, project save/load, channel-aware editing, and preview/update stability so the current beta is much closer to a usable real editing workflow than the original `0.6.0-beta.1` prerelease.
+
+### Docs
+- Updated the README and release notes for `0.6.0-beta.3` to reflect the newer editor, preview, packaging, and workflow capabilities now present in the current beta.
+
 ## [0.6.0-beta.1] - 2026-04-13
 
 ### Added
@@ -16,6 +33,11 @@ The format is intentionally simple:
 - `Replace Assistant` can optionally run the same direct `Real-ESRGAN NCNN` feature set exposed in `Texture Workflow`, including model selection, scale, tile size, `NCNN extra args`, retry-with-smaller-tile, texture preset, automatic texture rules, the expert unsafe override, and post-correction modes such as `Source Match`.
 - `Replace Assistant` now writes `example_mod`-style package output with `.no_encrypt`, generated `info.json`, and package-prefixed loose DDS paths that follow the matched original texture.
 - Successful `Replace Assistant` builds now open a post-build review window that compares the edited input against the rebuilt DDS preview, so you can quickly inspect whether the repackaged result shifted before shipping the mod.
+- A new top-level `Texture Editor` tab for visible-texture work, with layered projects, paint/erase, sharpen/soften, rectangular and lasso selections, clone/heal tools, in-editor recolor, and flattened export back into `Replace Assistant` or `Texture Workflow`.
+- `Texture Editor` can open loose images and DDS files directly, and it now has handoff entry points from `Replace Assistant`, `Archive Browser`, `Compare`, and the main `Texture Workflow` setup area.
+- `Texture Editor` now includes source-aware preview modes for `Edited`, `Original`, `Split`, and per-channel `R/G/B/A` inspection, plus optional atlas/grid guides so UI and packed textures are easier to review without leaving the editor.
+- `Texture Editor` now adds deeper paint/retouch coverage with `Gradient`, `Smudge`, `Dodge/Burn`, and `Patch` tools, plus channel-lock editing so visible texture cleanup can stay inside the app for more real workflows.
+- `Texture Editor` brush controls now include roundness, angle, smoothing, primary/secondary color handling, size-step modes, and user-saved brush presets on top of the existing preset/tip/pattern system.
 
 ### Changed
 - The main `Workflow` tab is now labeled `Texture Workflow`, which better distinguishes the advanced batch pipeline from the new guided `Replace Assistant` flow.
@@ -23,12 +45,48 @@ The format is intentionally simple:
 - `Replace Assistant` now hides `Direct Upscale Controls (NCNN only)` unless the build mode is set to upscale, which frees space for the rebuild-only package flow.
 - `Replace Assistant` package output now treats the chosen root as the parent mods folder and writes the actual package into a child folder named after the mod title, which better matches `example_mod`-style mod manager layouts.
 - `Texture Workflow` can now optionally emit the same ready mod package shape after rebuild, including a child folder named after the mod title plus generated `info.json` and optional `.no_encrypt`, while still keeping the normal `dds_final` output untouched.
+- The experimental recolor controls were removed from `Replace Assistant`, because visible-texture editing now lives in the dedicated `Texture Editor` instead of the packaging/rebuild tab.
+- `Texture Editor` paint/sharpen/soften/clone/heal tools now expose a more practical first pass of advanced options, including paint blend modes, selectable sharpen/soften modes, visible-layer sampling for filter/clone tools, and a more accurate brush-footprint preview while dragging.
+- `Texture Editor` selection tools now have a real companion workflow, including a dedicated `Selection` panel, feathering, invert, `Select All`, `Copy To New Layer`, optional edge-snapped lasso, and a basic `Move` tool for repositioning active-layer or selected content.
+- `Texture Editor` now uses a cleaner split layout with a lighter inspector, an icon-first tool rail, narrower default side panels, and a more compact action bar so the canvas keeps more space for actual editing.
+- `Texture Editor` now supports multiple open documents in editor tabs, shares copy/paste clipboard content between those tabs, and has been pushed further toward a real texture-compositor workflow with non-destructive layer offsets, richer layer state, stronger selection operations, and cropped pasted layers that move and hide correctly.
+- `Texture Editor` now keeps the canvas state more like a real workspace, with per-document view state, a live status strip, contextual docks, async document/open save-export work, and a stronger floating-selection path for copy/cut/paste and transform-style edits.
+- `Texture Editor` now supports document-top adjustment layers (`Hue / Saturation`, `Levels`, `Curves`) plus raster layer masks, so visible-texture edits can stay non-destructive longer instead of forcing immediate pixel commits for every tonal change.
+- `Texture Editor` now includes `Open In Compare`, which hands the current source binding back to the existing Compare tab instead of duplicating compare preview logic inside the editor.
+- `Texture Editor` now adds a real `Fill` tool, quick-mask overlay toggle, custom selection grow/shrink amount, and a `Float Active Layer Copy` transform entry so selection cleanup and isolated transform-style edits are easier without leaving the editor.
+- `Texture Editor` now gives the adjustment stack a more professional editing flow with reset/duplicate/reorder/solo controls, direct active-layer mask assignment for adjustments, a richer status strip, and smaller/finer minimum brush footprints for detail work.
+- `Texture Editor` brush tools now add presets, selectable brush tips, and pattern-based brush footprints, so paint/erase/clone/heal work can move beyond a single round brush toward more texture-oriented editing.
+- `Texture Editor` clone/heal now supports aligned or fixed-source sampling plus a direct source-clear action, which makes retouch work behave more like a real editor tool instead of a one-state helper.
+- `Texture Editor` now exposes a dedicated `Channels` panel, gradient secondary color, richer shortcut coverage for tool switching and brush sizing/hardness, and an on-canvas brush HUD so fine paint work is easier to read while you edit.
+- Removed the stale hidden in-editor AI-enhance plumbing that was still lingering behind the scenes after the visible editor-side upscale controls were dropped.
 
 ### Fixed
 - The unfinished `Replace Assistant` implementation is now wired up far enough to be usable, including manual local-original selection, manual archive-original selection, output-folder opening, and better status/build callback handling.
 - `Replace Assistant` NCNN model discovery now uses the correct executable/model-dir signature and populates the model picker correctly instead of calling the discovery helper with the wrong argument shape.
 - `Replace Assistant` preview follow-up requests now advance their request id correctly when a new selection arrives while an older preview worker is still finishing, which avoids stale preview handoff glitches.
 - `Replace Assistant` package builds now honor the `.no_encrypt` toggle instead of always writing the marker file even when the package should stay unmarked.
+- `Texture Editor` recolor now applies explicitly to the active layer instead of reprocessing image changes on every setting edit, so tolerance/strength adjustments can be made before committing the recolor action.
+- `Texture Editor` history restore is now explicit instead of reloading full snapshots on every list selection change, undo/redo now properly covers layer visibility/opacity edits, and the tool rail now uses icon-backed buttons so the editor feels less rough overall.
+- `Texture Editor` now supports wheel zoom directly over the texture, uses collapsible right-side inspector sections so the canvas gets more space by default, and enriches direct file-open document metadata from the configured `PNG root` / `Original DDS root` so relative path, package, original DDS, and semantics are much less likely to stay blank.
+- `Texture Editor` now supports right-drag panning, `Show in Archive Browser`, configurable keyboard shortcuts for common editor actions, active-layer copy/paste helpers, and a softer inspector/metadata presentation so the editor is quicker to use and less visually rough.
+- `Texture Editor` sharpen/soften now behave more predictably at low strength, and empty edit layers no longer feel broken when `Sample visible layers` is enabled because filter strokes can now read from the merged visible image while still writing into the active layer.
+- `Texture Editor` history can now be cleared intentionally so the current document state becomes the new editing baseline, instead of forcing old trial steps to stay in the session forever.
+- `Texture Editor` selection copy/paste and move behavior is now much closer to an editor workflow: `Ctrl+C` / `Ctrl+V` respect the current selection, pasted selections become isolated layers instead of whole-image copies, the live selection is cleared after paste so move works on the copied piece, and hiding the original layer now leaves the pasted selection layer visible by itself.
+- `Texture Editor` now offers both in-place paste and centered paste for copied layers/selections, and the canvas move-preview path no longer references brush-only overlay state.
+- `Texture Editor` floating selections now survive undo/redo correctly, masked cuts no longer clear the entire bounding box for soft/lasso selections, and floating transform state no longer drops out of history just because the move/commit/cancel path changed.
+- `Texture Editor` adjustment sliders now preview live without spamming the history list on every tick, and project open/save plus flattened export now run through background workers instead of blocking the UI thread during heavier document operations.
+- `Texture Editor` adjustment preview no longer drops selection and makes the controls look disabled while dragging sliders, because live preview now preserves the current adjustment instead of rebuilding the whole list state mid-drag.
+- `Texture Editor` now supports finer minimum paint/erase/sharpen/soften footprints and faster `Alt+click` color sampling for paint/fill work, which makes tiny cleanup edits easier on high-resolution textures.
+- The left Texture Editor action rail no longer clips utility buttons like `Shortcuts`, because the edit controls were reflowed into a more compact two-row layout instead of being squeezed into one narrow row.
+- `Texture Editor` now keeps the canvas at the real scaled image size instead of stretching textures into a forced minimum square, and wheel zoom also works reliably when the pointer is over the texture through the scroll viewport instead of only when the wheel event lands on the canvas widget itself.
+- `Texture Editor` floating selections now survive undo/redo correctly in non-checkpoint history restores, project save/load now preserves in-progress floating raster content, reopening an already-open source refreshes the source binding metadata, and wheel zoom behaves more reliably on precision scrolling input while anchoring correctly under the pointer.
+- `Texture Editor -> Replace Assistant` handoff now preserves original texture binding metadata even when the editor was opened from Archive Browser, Compare, or loose-file paths, and Replace Assistant review no longer blocks the UI thread while waiting synchronously for the previous preview worker to stop.
+- New `Texture Editor` gradient/patch/smudge/dodge-burn paths now route through the editor core correctly instead of being UI-only stubs, and Dodge/Burn no longer fails on the first real stroke because of a bad blend-weight shape.
+- Channel-aware editor operations now respect the current `RGBA` edit locks for fill, gradient, brush retouch, and recolor flows instead of always writing all visible channels.
+- Replace Assistant now respects the `overwrite existing package files` setting for `info.json` / `.no_encrypt`, and README dependency notes now match the actual bundled/editor runtime stack (`Pillow`, `numpy`, `OpenCV`).
+- New textures in `Texture Editor` now open at true 100% zoom instead of being forced into fit-to-window mode, and the zoom readouts now follow the live canvas state correctly instead of leaving stale percentage text behind.
+- `Replace Assistant` now imports and matches added files through a background worker with visible status/progress updates, so `Add Files` / `Add Folder` no longer feel like a silent freeze while the app indexes originals and matches imported textures.
+- Portable builds now explicitly collect `NumPy`, `OpenCV`, and `Pillow` assets for the new editor stack instead of depending on those libraries only being present in the development environment.
 - Archive scan completion no longer eagerly rebuilds the heaviest `Replace Assistant` and `Research` archive indices on the UI thread every time the cache loads, which reduces the short freeze that could happen right after startup archive hydration.
 - Startup archive auto-load no longer forces the Archive Browser tab to render immediately if you are working elsewhere, which reduces the visible startup hitch when the cache finishes loading in the background.
 - `Settings` now includes an opt-in crash-detail capture toggle that writes local traceback reports for unhandled exceptions and background-worker/archive-preview errors, and the latest crash report is included in the diagnostic bundle when available.
@@ -37,7 +95,7 @@ The format is intentionally simple:
 - `Research` now passes cancellation all the way through classification-review group assembly, so a cancelled refresh stops more promptly instead of continuing through the final unknown/classified review grouping work.
 
 ### Docs
-- Updated README and release notes for the `0.6.0-beta.1` beta feature set, including `Replace Assistant`, the `Texture Workflow` tab rename, ready mod package export, and the latest preview/stability fixes.
+- Updated README, Quick Start, About, and release notes for the current `Texture Editor` feature set, including the newer retouch tools, channel workflow, and deeper brush controls.
 
 ## [0.5.5] - 2026-04-12
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import threading
 from html import escape
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, List, Optional, Sequence
 
 from PySide6.QtCore import QObject, QSettings, Qt, QThread, QTimer, QUrl, Signal, Slot
@@ -77,6 +77,7 @@ from crimson_texture_forge.models import (
     ReplaceAssistantBuildSummary,
     ReplaceAssistantItem,
     ReplaceAssistantReviewItem,
+    TextureEditorSourceBinding,
 )
 from crimson_texture_forge.ui.widgets import PreviewLabel, PreviewScrollArea
 
@@ -86,7 +87,12 @@ class ReplaceAssistantPreviewWorker(QObject):
     error = Signal(int, str)
     finished = Signal()
 
-    def __init__(self, request_id: int, texconv_path: Optional[Path], source_path: Path) -> None:
+    def __init__(
+        self,
+        request_id: int,
+        texconv_path: Optional[Path],
+        source_path: Path,
+    ) -> None:
         super().__init__()
         self.request_id = request_id
         self.texconv_path = texconv_path
@@ -173,6 +179,68 @@ class ReplaceAssistantBuildWorker(QObject):
                 self.completed.emit(summary)
         except Exception as exc:
             self.error.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+
+class ReplaceAssistantImportWorker(QObject):
+    stage_message = Signal(str)
+    progress = Signal(int, int, str)
+    completed = Signal(object)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(
+        self,
+        paths: Sequence[Path | str],
+        *,
+        archive_entries: Sequence[ArchiveEntry],
+        original_dds_root: Optional[Path],
+        archive_index: Optional[ReplaceAssistantArchiveIndex],
+    ) -> None:
+        super().__init__()
+        self.paths = list(paths)
+        self.archive_entries = list(archive_entries)
+        self.original_dds_root = original_dds_root
+        self.archive_index = archive_index
+        self.stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            if self.stop_event.is_set():
+                return
+            active_index = self.archive_index
+            if active_index is None:
+                self.stage_message.emit("Indexing archive and original DDS files...")
+                active_index = build_replace_assistant_archive_index(
+                    self.archive_entries,
+                    original_dds_root=self.original_dds_root,
+                )
+            if self.stop_event.is_set():
+                return
+            items = build_replace_assistant_items(
+                self.paths,
+                archive_entries=self.archive_entries,
+                original_dds_root=self.original_dds_root,
+                archive_index=active_index,
+                on_stage=self.stage_message.emit,
+                on_progress=self.progress.emit,
+            )
+            if not self.stop_event.is_set():
+                self.completed.emit(
+                    {
+                        "items": items,
+                        "archive_index": active_index,
+                        "original_dds_root": self.original_dds_root,
+                    }
+                )
+        except Exception as exc:
+            if not self.stop_event.is_set():
+                self.error.emit(str(exc))
         finally:
             self.finished.emit()
 
@@ -456,7 +524,9 @@ class ReplaceAssistantReviewDialog(QDialog):
         self.details_browser.setHtml(f"<p>{escape(item.relative_path.as_posix())}</p>")
         if self.thread is not None:
             self.pending_item = item
-            self._stop_worker()
+            if self.worker is not None:
+                self.worker.stop()
+            return
         worker = ReplaceAssistantReviewCompareWorker(request_id, self.texconv_path, item)
         thread = QThread(self)
         worker.moveToThread(thread)
@@ -615,6 +685,7 @@ class ReplaceAssistantReviewDialog(QDialog):
 
 class ReplaceAssistantTab(QWidget):
     status_message_requested = Signal(str, bool)
+    open_in_texture_editor_requested = Signal(str, object)
 
     def __init__(
         self,
@@ -651,6 +722,8 @@ class ReplaceAssistantTab(QWidget):
         self.preview_worker: Optional[ReplaceAssistantPreviewWorker] = None
         self.preview_request_id = 0
         self.pending_preview_item: Optional[ReplaceAssistantItem] = None
+        self.import_thread: Optional[QThread] = None
+        self.import_worker: Optional[ReplaceAssistantImportWorker] = None
         self.build_thread: Optional[QThread] = None
         self.build_worker: Optional[ReplaceAssistantBuildWorker] = None
 
@@ -679,6 +752,7 @@ class ReplaceAssistantTab(QWidget):
         self.add_files_button = QPushButton("Add Files")
         self.add_folder_button = QPushButton("Add Folder")
         self.auto_match_button = QPushButton("Auto-Match")
+        self.open_in_editor_button = QPushButton("Open In Texture Editor")
         self.choose_local_original_button = QPushButton("Choose Local Original")
         self.choose_archive_original_button = QPushButton("Choose Archive Original")
         self.remove_selected_button = QPushButton("Remove Selected")
@@ -686,6 +760,7 @@ class ReplaceAssistantTab(QWidget):
         button_row.addWidget(self.add_files_button)
         button_row.addWidget(self.add_folder_button)
         button_row.addWidget(self.auto_match_button)
+        button_row.addWidget(self.open_in_editor_button)
         button_row.addWidget(self.choose_local_original_button)
         button_row.addWidget(self.choose_archive_original_button)
         button_row.addWidget(self.remove_selected_button)
@@ -954,6 +1029,7 @@ class ReplaceAssistantTab(QWidget):
         self.add_files_button.clicked.connect(self.import_files)
         self.add_folder_button.clicked.connect(self.import_folder)
         self.auto_match_button.clicked.connect(self.auto_match_all_items)
+        self.open_in_editor_button.clicked.connect(self.open_current_item_in_texture_editor)
         self.choose_local_original_button.clicked.connect(self.choose_local_original_for_selected)
         self.choose_archive_original_button.clicked.connect(self.choose_archive_original_for_selected)
         self.remove_selected_button.clicked.connect(self.remove_selected_items)
@@ -1030,6 +1106,7 @@ class ReplaceAssistantTab(QWidget):
     def _ensure_archive_index_current(self) -> ReplaceAssistantArchiveIndex:
         current_original_root = self._current_original_root_path()
         active_entries = self.archive_entries or list(self.get_archive_entries())
+        self.archive_entries = list(active_entries)
         entries_missing_from_index = bool(active_entries) and not self.archive_index.entries_by_relative_path
         root_changed = self.archive_index_original_root != current_original_root
         if entries_missing_from_index or root_changed:
@@ -1042,7 +1119,7 @@ class ReplaceAssistantTab(QWidget):
         return self.archive_index
 
     def set_archive_entries(self, entries: Sequence[ArchiveEntry], package_root_text: str = "") -> None:
-        self.archive_entries = list(entries)
+        self.archive_entries = entries if isinstance(entries, list) else list(entries)
         del package_root_text
         self.archive_index = build_replace_assistant_archive_index([])
         self.archive_index_original_root = None
@@ -1053,7 +1130,7 @@ class ReplaceAssistantTab(QWidget):
         self._update_controls()
 
     def is_busy(self) -> bool:
-        return self.preview_thread is not None or self.build_thread is not None
+        return self.preview_thread is not None or self.import_thread is not None or self.build_thread is not None
 
     def shutdown(self) -> None:
         if self.review_dialog is not None:
@@ -1061,14 +1138,18 @@ class ReplaceAssistantTab(QWidget):
             self.review_dialog = None
         if self.preview_worker is not None:
             self.preview_worker.stop()
-        if self.preview_thread is not None:
-            self.preview_thread.quit()
-            self.preview_thread.wait(2000)
+        if self.import_worker is not None:
+            self.import_worker.stop()
         if self.build_worker is not None:
             self.build_worker.stop()
-        if self.build_thread is not None:
-            self.build_thread.quit()
-            self.build_thread.wait(2000)
+        for thread in (self.preview_thread, self.import_thread, self.build_thread):
+            if thread is None:
+                continue
+            thread.quit()
+            if thread.wait(250):
+                continue
+            thread.terminate()
+            thread.wait(150)
 
     def schedule_settings_save(self) -> None:
         if not self._settings_ready:
@@ -1233,6 +1314,7 @@ class ReplaceAssistantTab(QWidget):
         self.package_author_edit.setEnabled(not busy)
         self.package_description_edit.setEnabled(not busy)
         self.package_nexus_edit.setEnabled(not busy)
+        self.open_in_editor_button.setEnabled(not busy and selected_count == 1)
         self.ncnn_group.setVisible(show_ncnn)
         self.ncnn_exe_path_edit.setEnabled(not busy and show_ncnn)
         self.ncnn_model_dir_edit.setEnabled(not busy and show_ncnn)
@@ -1268,29 +1350,113 @@ class ReplaceAssistantTab(QWidget):
         self._add_sources([folder])
 
     def _add_sources(self, paths: Sequence[str | Path]) -> None:
-        archive_index = self._ensure_archive_index_current()
-        new_items = build_replace_assistant_items(
+        if self.is_busy():
+            return
+        current_original_root = self._current_original_root_path()
+        active_entries = self.archive_entries or list(self.get_archive_entries())
+        entries_missing_from_index = bool(active_entries) and not self.archive_index.entries_by_relative_path
+        root_changed = self.archive_index_original_root != current_original_root
+        archive_index: Optional[ReplaceAssistantArchiveIndex]
+        if entries_missing_from_index or root_changed:
+            archive_index = None
+        else:
+            archive_index = self.archive_index
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Importing...")
+        self.status_label.setText("Importing edited files...")
+        self.append_log("Importing edited files and matching original DDS entries...")
+        worker = ReplaceAssistantImportWorker(
             paths,
-            archive_entries=self.archive_entries,
-            original_dds_root=self.archive_index_original_root,
+            archive_entries=active_entries,
+            original_dds_root=current_original_root,
             archive_index=archive_index,
         )
-        if not new_items:
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.stage_message.connect(self._handle_import_stage)
+        worker.progress.connect(self._handle_import_progress)
+        worker.completed.connect(self._handle_import_complete)
+        worker.error.connect(self._handle_import_error)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._cleanup_import_refs)
+        self.import_worker = worker
+        self.import_thread = thread
+        self._update_controls()
+        thread.start()
+
+    def _handle_import_stage(self, message: str) -> None:
+        self.status_label.setText(message)
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setFormat("Importing...")
+
+    def _handle_import_progress(self, current: int, total: int, detail: str) -> None:
+        self.status_label.setText(detail)
+        if total > 0:
+            self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(min(max(current, 0), total))
+            self.progress_bar.setFormat(f"{min(max(current, 0), total)} / {total}")
+        else:
+            self.progress_bar.setRange(0, 0)
+            self.progress_bar.setFormat("Importing...")
+
+    def _handle_import_complete(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        new_items = payload.get("items", [])
+        archive_index = payload.get("archive_index")
+        original_dds_root = payload.get("original_dds_root")
+        if isinstance(archive_index, ReplaceAssistantArchiveIndex):
+            self.archive_index = archive_index
+            self.archive_index_original_root = original_dds_root if isinstance(original_dds_root, Path) or original_dds_root is None else None
+        if not isinstance(new_items, list) or not new_items:
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("Ready")
+            self.status_label.setText("No importable PNG or DDS files were found.")
             self.append_log("No importable PNG or DDS files were found.")
             return
         existing_paths = {item.source_path.resolve().as_posix().lower() for item in self.items}
         added_count = 0
         for item in new_items:
-            if item.source_path.resolve().as_posix().lower() in existing_paths:
+            if not isinstance(item, ReplaceAssistantItem):
+                continue
+            resolved = item.source_path.resolve().as_posix().lower()
+            if resolved in existing_paths:
                 continue
             self.items.append(item)
+            existing_paths.add(resolved)
             added_count += 1
         self._refresh_queue_tree()
-        self._update_summary()
-        self._update_controls()
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(1)
+        self.progress_bar.setFormat("Ready")
+        self.status_label.setText(f"Imported {added_count:,} edited file(s) into Replace Assistant.")
         self.append_log(f"Imported {added_count:,} edited file(s) into Replace Assistant.")
 
+    def _handle_import_error(self, message: str) -> None:
+        self.append_log(f"ERROR: {message}")
+        self.status_label.setText(message)
+        self.status_message_requested.emit(message, True)
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Error")
+
+    def _cleanup_import_refs(self) -> None:
+        self.import_thread = None
+        self.import_worker = None
+        self._update_controls()
+
     def _refresh_queue_tree(self) -> None:
+        current_item = self.queue_tree.currentItem()
+        current_path = ""
+        if current_item is not None:
+            raw = current_item.data(0, Qt.UserRole)
+            if isinstance(raw, int) and 0 <= raw < len(self.items):
+                current_path = self.items[raw].source_path.resolve().as_posix().lower()
         selected_paths = {
             item.source_path.resolve().as_posix().lower()
             for item in self._selected_items()
@@ -1298,6 +1464,7 @@ class ReplaceAssistantTab(QWidget):
         self.queue_tree.blockSignals(True)
         self.queue_tree.setUpdatesEnabled(False)
         self.queue_tree.clear()
+        current_row: Optional[QTreeWidgetItem] = None
         for index, item in enumerate(self.items):
             original_text = ""
             if item.matched_original is not None:
@@ -1319,11 +1486,16 @@ class ReplaceAssistantTab(QWidget):
             row.setToolTip(1, original_text or "Unmatched")
             row.setToolTip(4, item.warning or item.status_detail or item.status)
             self.queue_tree.addTopLevelItem(row)
+            resolved_path = item.source_path.resolve().as_posix().lower()
             if item.source_path.resolve().as_posix().lower() in selected_paths:
                 row.setSelected(True)
+            if resolved_path == current_path:
+                current_row = row
         self.queue_tree.setUpdatesEnabled(True)
         self.queue_tree.blockSignals(False)
-        if self.queue_tree.topLevelItemCount() and self.queue_tree.currentItem() is None:
+        if current_row is not None:
+            self.queue_tree.setCurrentItem(current_row)
+        elif self.queue_tree.topLevelItemCount() and self.queue_tree.currentItem() is None:
             self.queue_tree.setCurrentItem(self.queue_tree.topLevelItem(0))
         self._update_summary()
         self._update_controls()
@@ -1357,6 +1529,113 @@ class ReplaceAssistantTab(QWidget):
             return
         self._schedule_preview(self.items[raw])
 
+    def _build_texture_editor_binding(self, item: ReplaceAssistantItem) -> TextureEditorSourceBinding:
+        matched = item.matched_original
+        package_root = item.detected_package_root or (matched.package_root if matched else "")
+        archive_relative_path = matched.archive_relative_path if matched is not None else (item.detected_relative_path or "")
+        relative_path = archive_relative_path
+        if package_root and archive_relative_path:
+            relative_path = str(Path(package_root) / Path(PurePosixPath(archive_relative_path)))
+        return TextureEditorSourceBinding(
+            launch_origin="replace_assistant",
+            display_name=item.source_path.name,
+            source_path=str(item.source_path),
+            source_identity_path=str(item.source_path),
+            relative_path=relative_path,
+            package_root=package_root,
+            archive_relative_path=archive_relative_path,
+            original_dds_path=str(matched.original_dds_path) if matched is not None and matched.original_dds_path is not None else "",
+        )
+
+    def _matched_original_from_binding(self, binding: TextureEditorSourceBinding) -> Optional[MatchedOriginalTexture]:
+        archive_relative_path = (binding.archive_relative_path or "").strip()
+        package_root = (binding.package_root or "").strip()
+        relative_path_text = (binding.relative_path or "").strip()
+        original_dds_path = Path(binding.original_dds_path).expanduser().resolve() if binding.original_dds_path else None
+        if original_dds_path is not None and not original_dds_path.exists():
+            original_dds_path = None
+        if not archive_relative_path and not relative_path_text and original_dds_path is None:
+            return None
+        if not relative_path_text and package_root and archive_relative_path:
+            relative_path_text = str(Path(package_root) / Path(PurePosixPath(archive_relative_path)))
+        if relative_path_text:
+            loose_relative = Path(PurePosixPath(relative_path_text))
+        elif package_root and archive_relative_path:
+            loose_relative = Path(package_root) / Path(PurePosixPath(archive_relative_path))
+        elif original_dds_path is not None:
+            loose_relative = Path(original_dds_path.name)
+        else:
+            return None
+        return MatchedOriginalTexture(
+            package_root=package_root,
+            archive_relative_path=archive_relative_path or PurePosixPath(loose_relative.as_posix()).as_posix(),
+            loose_relative_path=Path(loose_relative),
+            original_dds_path=original_dds_path,
+            archive_entry=None,
+            match_reason="preserved from Texture Editor binding",
+        )
+
+    def open_current_item_in_texture_editor(self) -> None:
+        item = self._current_item()
+        if item is None:
+            self.status_label.setText("Select one imported file first.")
+            return
+        self.open_in_texture_editor_requested.emit(str(item.source_path), self._build_texture_editor_binding(item))
+
+    def accept_editor_export(self, exported_png_path: Path, binding: TextureEditorSourceBinding) -> None:
+        resolved_output = exported_png_path.expanduser().resolve()
+        if not resolved_output.exists():
+            self.status_label.setText(f"Texture Editor export not found: {resolved_output}")
+            return
+        binding_identity = binding.source_identity_path or binding.source_path
+        binding_source = Path(binding_identity).expanduser().resolve() if binding_identity else None
+        updated_existing = False
+        if binding_source is not None:
+            for index, item in enumerate(self.items):
+                if item.source_path.expanduser().resolve() != binding_source:
+                    continue
+                matched = item.matched_original or self._matched_original_from_binding(binding)
+                self.items[index] = dataclasses.replace(
+                    item,
+                    source_path=resolved_output,
+                    source_kind=resolved_output.suffix.lower().lstrip("."),
+                    detected_relative_path=binding.archive_relative_path or binding.relative_path or item.detected_relative_path,
+                    detected_package_root=binding.package_root or item.detected_package_root,
+                    matched_original=matched,
+                    warning=item.warning,
+                    status="matched" if matched is not None else item.status,
+                    status_detail="edited in Texture Editor",
+                )
+                updated_existing = True
+                break
+        if not updated_existing:
+            matched = self._matched_original_from_binding(binding)
+            self.items.append(
+                ReplaceAssistantItem(
+                    source_path=resolved_output,
+                    source_kind=resolved_output.suffix.lower().lstrip("."),
+                    detected_relative_path=binding.archive_relative_path or binding.relative_path,
+                    detected_package_root=binding.package_root,
+                    matched_original=matched,
+                    status="matched" if matched is not None else "pending",
+                    status_detail="edited in Texture Editor",
+                )
+            )
+            self._refresh_queue_tree()
+            self.status_label.setText(f"Added Texture Editor export: {resolved_output.name}")
+            self.append_log(f"Texture Editor export added to Replace Assistant: {resolved_output}")
+            return
+        self._refresh_queue_tree()
+        for row_index, item in enumerate(self.items):
+            if item.source_path.expanduser().resolve() != resolved_output:
+                continue
+            row = self.queue_tree.topLevelItem(row_index)
+            if row is not None:
+                self.queue_tree.setCurrentItem(row)
+            break
+        self.status_label.setText(f"Updated Replace Assistant item from Texture Editor: {resolved_output.name}")
+        self.append_log(f"Texture Editor export applied to Replace Assistant: {resolved_output}")
+
     def _schedule_preview(self, item: ReplaceAssistantItem) -> None:
         self.preview_request_id += 1
         request_id = self.preview_request_id
@@ -1386,7 +1665,11 @@ class ReplaceAssistantTab(QWidget):
     def _start_preview_worker(self, request_id: int, item: ReplaceAssistantItem) -> None:
         texconv_text = self.get_texconv_path().strip()
         texconv_path = Path(texconv_text).expanduser() if texconv_text else None
-        worker = ReplaceAssistantPreviewWorker(request_id, texconv_path, item.source_path)
+        worker = ReplaceAssistantPreviewWorker(
+            request_id,
+            texconv_path,
+            item.source_path,
+        )
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)

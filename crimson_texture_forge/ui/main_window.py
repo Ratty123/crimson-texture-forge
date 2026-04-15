@@ -91,6 +91,7 @@ def run_gui() -> int:
     from crimson_texture_forge.ui.safe_upscale_wizard import SafeUpscaleWizard
     from crimson_texture_forge.ui.replace_assistant_tab import ReplaceAssistantTab
     from crimson_texture_forge.ui.text_search_tab import TextSearchTab
+    from crimson_texture_forge.ui.texture_editor_tab import TextureEditorTab
 
     def resolve_settings_file_path() -> Path:
         if getattr(sys, "frozen", False):
@@ -784,8 +785,10 @@ def run_gui() -> int:
             setup_buttons_row_1.setSpacing(8)
             self.init_workspace_button = QPushButton("Init Workspace")
             self.create_folders_button = QPushButton("Create Folders")
+            self.open_texture_editor_button = QPushButton("Open File In Texture Editor")
             setup_buttons_row_1.addWidget(self.init_workspace_button)
             setup_buttons_row_1.addWidget(self.create_folders_button)
+            setup_buttons_row_1.addWidget(self.open_texture_editor_button)
             setup_layout.addLayout(setup_buttons_row_1)
 
             setup_buttons_row_2 = QHBoxLayout()
@@ -1424,11 +1427,13 @@ def run_gui() -> int:
             self.compare_mip_details_button.setToolTip(
                 "Refresh Research, open Texture Analysis, and jump to the current compare file's mip details."
             )
+            self.compare_open_in_editor_button = QPushButton("Open In Texture Editor")
             self.refresh_compare_button = QPushButton("Refresh")
             self.refresh_compare_button.setToolTip("Refresh the compare list and current previews.")
             compare_header.addWidget(compare_preview_size_label)
             compare_header.addWidget(self.compare_preview_size_combo)
             compare_header.addWidget(self.compare_mip_details_button)
+            compare_header.addWidget(self.compare_open_in_editor_button)
             compare_header.addStretch(1)
             compare_header.addWidget(self.compare_previous_button)
             compare_header.addWidget(self.compare_next_button)
@@ -1720,18 +1725,29 @@ def run_gui() -> int:
             self.archive_package_filter_hint_label.setWordWrap(True)
             archive_controls_layout.addWidget(self.archive_package_filter_hint_label)
 
-            archive_actions_row = QHBoxLayout()
-            archive_actions_row.setSpacing(8)
+            archive_actions_row = QGridLayout()
+            archive_actions_row.setHorizontalSpacing(8)
+            archive_actions_row.setVerticalSpacing(8)
             self.archive_extract_selected_button = QPushButton("Extract Selected")
             self.archive_extract_filtered_button = QPushButton("Extract Filtered")
-            self.archive_extract_to_workflow_button = QPushButton("DDS To Texture Workflow")
+            self.archive_extract_to_workflow_button = QPushButton("DDS To Workflow")
+            self.archive_open_in_editor_button = QPushButton("Open in Texture Editor")
             self.archive_extract_to_workflow_button.setToolTip(
                 "If one or more archive files/folders are selected, only selected DDS files are extracted to the workflow root. "
                 "If nothing is selected, all DDS files from the current filtered view are used."
             )
-            archive_actions_row.addWidget(self.archive_extract_selected_button)
-            archive_actions_row.addWidget(self.archive_extract_filtered_button)
-            archive_actions_row.addWidget(self.archive_extract_to_workflow_button)
+            for button in (
+                self.archive_extract_selected_button,
+                self.archive_extract_filtered_button,
+                self.archive_extract_to_workflow_button,
+                self.archive_open_in_editor_button,
+            ):
+                button.setMinimumHeight(32)
+                button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            archive_actions_row.addWidget(self.archive_extract_selected_button, 0, 0)
+            archive_actions_row.addWidget(self.archive_extract_filtered_button, 0, 1)
+            archive_actions_row.addWidget(self.archive_extract_to_workflow_button, 1, 0)
+            archive_actions_row.addWidget(self.archive_open_in_editor_button, 1, 1)
             archive_controls_layout.addLayout(archive_actions_row)
 
             self.archive_stats_label = QLabel("No archives scanned.")
@@ -1952,7 +1968,28 @@ def run_gui() -> int:
             self.replace_assistant_tab.status_message_requested.connect(
                 lambda message, is_error: self.set_status_message(message, error=is_error)
             )
+            self.replace_assistant_tab.open_in_texture_editor_requested.connect(self._open_source_in_texture_editor)
             self.main_tabs.insertTab(1, self.replace_assistant_tab, "Replace Assistant")
+            self.texture_editor_tab = TextureEditorTab(
+                settings=self.settings,
+                base_dir=self.settings_file_path.parent,
+                get_texconv_path=lambda: self.texconv_path_edit.text(),
+                get_png_root=lambda: self.png_root_edit.text(),
+                get_original_dds_root=lambda: self.original_dds_edit.text(),
+                get_current_config=self.collect_config,
+            )
+            self.texture_editor_tab.status_message_requested.connect(
+                lambda message, is_error: self.set_status_message(message, error=is_error)
+            )
+            self.texture_editor_tab.browse_archive_requested.connect(self._show_archive_browser_from_texture_editor)
+            self.texture_editor_tab.open_in_compare_requested.connect(self._show_compare_from_texture_editor)
+            self.texture_editor_tab.send_to_replace_assistant_requested.connect(
+                self._handle_texture_editor_send_to_replace_assistant
+            )
+            self.texture_editor_tab.send_to_texture_workflow_requested.connect(
+                self._handle_texture_editor_send_to_texture_workflow
+            )
+            self.main_tabs.insertTab(2, self.texture_editor_tab, "Texture Editor")
             self.setCentralWidget(central)
 
             self.export_profile_action.triggered.connect(self.export_profile)
@@ -1968,6 +2005,7 @@ def run_gui() -> int:
             self.open_output_button.clicked.connect(self.open_output_folder)
             self.init_workspace_button.clicked.connect(self.initialize_workspace)
             self.create_folders_button.clicked.connect(self.create_missing_folders)
+            self.open_texture_editor_button.clicked.connect(self._browse_texture_editor_source)
             self.download_chainner_button.clicked.connect(self.open_chainner_download_page)
             self.download_texconv_button.clicked.connect(self.open_texconv_download_page)
             self.download_ncnn_button.clicked.connect(self.open_realesrgan_ncnn_download_page)
@@ -1982,6 +2020,7 @@ def run_gui() -> int:
             self.archive_extract_selected_button.clicked.connect(self.extract_selected_archive_entries)
             self.archive_extract_filtered_button.clicked.connect(self.extract_filtered_archive_entries)
             self.archive_extract_to_workflow_button.clicked.connect(self.extract_filtered_archive_dds_to_workflow)
+            self.archive_open_in_editor_button.clicked.connect(self._open_archive_current_in_texture_editor)
             self.archive_filter_apply_button.clicked.connect(self._apply_archive_filter)
             self.archive_filter_clear_button.clicked.connect(self._clear_archive_filters)
             self.archive_filter_edit.returnPressed.connect(self._apply_archive_filter)
@@ -2014,6 +2053,7 @@ def run_gui() -> int:
             self.compare_previous_button.clicked.connect(lambda: self._select_compare_offset(-1))
             self.compare_next_button.clicked.connect(lambda: self._select_compare_offset(1))
             self.compare_mip_details_button.clicked.connect(self._open_compare_in_texture_analysis)
+            self.compare_open_in_editor_button.clicked.connect(self._open_compare_in_texture_editor)
             self.compare_sync_pan_checkbox.toggled.connect(self._sync_compare_scroll_positions)
             self.original_compare_zoom_fit_button.clicked.connect(lambda: self._set_compare_fit_mode("original"))
             self.original_compare_zoom_100_button.clicked.connect(lambda: self._set_compare_zoom_factor("original", 1.0))
@@ -2099,11 +2139,13 @@ def run_gui() -> int:
             license_path = Path(__file__).resolve().parents[2] / "LICENSE"
             return f"""
             <h3>{APP_TITLE} v{APP_VERSION}</h3>
-            <p>A Windows desktop tool for Crimson Desert texture workflows and supporting archive/text-search tasks.</p>
+            <p>A Windows desktop tool for Crimson Desert texture workflows, guided replacement builds, archive research, and texture editing.</p>
             <h3>What It Covers</h3>
             <ul>
               <li>Read-only <code>.pamt/.paz</code> archive browsing and selective extraction</li>
-              <li>Loose DDS workflow scanning, DDS-to-PNG conversion, DDS rebuild, and compare</li>
+              <li><b>Texture Workflow</b> for loose DDS scanning, DDS-to-PNG conversion, DDS rebuild, compare, and optional mod-ready package export</li>
+              <li><b>Replace Assistant</b> for matching edited PNG/DDS files back to the original game DDS and building ready mod folders</li>
+              <li><b>Texture Editor</b> for layered visible-texture editing with selections, floating paste/move, masks, adjustments, channel locks, custom brush presets, and quick handoff back into the rebuild workflow</li>
               <li>Text Search with encrypted XML support, syntax-colored preview, and export of matched files</li>
               <li>Optional <b>chaiNNer</b> or <b>Real-ESRGAN NCNN</b> stage before DDS rebuild</li>
               <li>Persistent global settings, local config, and archive cache stored beside the EXE</li>
@@ -2122,12 +2164,21 @@ def run_gui() -> int:
               <li><b>Real-ESRGAN NCNN</b> runs directly from the app after you point it at a local executable and model folder. <b>Setup</b> now opens the official download page instead of downloading the package inside the app, and it can still import NCNN <code>.param</code> / <code>.bin</code> model pairs that you downloaded yourself.</li>
               <li><b>Run Summary</b> shows the current sources, backend, and policy before you start, without duplicating the workflow controls.</li>
             </ul>
+            <h3>Texture Editor Highlights</h3>
+            <ul>
+              <li>Layered visible-texture editing with paint, erase, fill, gradient, clone, heal, smudge, dodge/burn, patch, sharpen, and soften tools, plus brush presets, custom saved presets, brush tips, and patterned brush footprints.</li>
+              <li>Selections, floating paste/move workflow, masks, RGBA channel locks, and non-destructive document-top adjustments.</li>
+              <li>RGBA/original/split views, grid guides, and direct handoff to <b>Compare</b>, <b>Replace Assistant</b>, and <b>Texture Workflow</b>.</li>
+              <li>Designed for visible-color texture work. Technical textures still show warnings and need extra care.</li>
+            </ul>
             <h3>Dependencies</h3>
             <ul>
               <li><a href=\"https://doc.qt.io/qtforpython-6/\">PySide6 / Qt for Python</a></li>
               <li><a href=\"https://pyinstaller.org/\">PyInstaller</a></li>
               <li><a href=\"https://github.com/python-lz4/python-lz4\">python-lz4</a></li>
               <li><a href=\"https://cryptography.io/\">cryptography</a></li>
+              <li><a href=\"https://numpy.org/\">NumPy</a></li>
+              <li><a href=\"https://opencv.org/\">OpenCV</a></li>
               <li><a href=\"https://github.com/microsoft/DirectXTex\">DirectXTex / texconv</a></li>
               <li><a href=\"https://chainner.app/download/\">chaiNNer</a></li>
               <li><a href=\"https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan\">Real-ESRGAN NCNN Vulkan</a></li>
@@ -2151,6 +2202,7 @@ def run_gui() -> int:
               <li><b>chaiNNer</b> remains an external dependency and chain behavior is only as reliable as the chain you provide.</li>
               <li><b>Real-ESRGAN NCNN</b> support assumes the standard command-line executable and supported model folder layout.</li>
               <li>Large archive sets still take noticeable time to prepare, even after the recent refresh/cache optimizations.</li>
+              <li>The editor is texture-first, not a full Photoshop replacement. Visible-color texture work is the main focus today.</li>
             </ul>
             <h3>Notes</h3>
             <p>The archive browser is read-only. It extracts to loose files only and never writes back to <code>.pamt</code> or <code>.paz</code>.</p>
@@ -4321,7 +4373,14 @@ def run_gui() -> int:
         def _handle_archive_scan_complete(self, result: object) -> None:
             payload = result if isinstance(result, dict) else {}
             self.archive_entries = payload.get("entries", []) if isinstance(payload.get("entries"), list) else []
-            self.text_search_tab.set_archive_entries(self.archive_entries, self.archive_package_root_edit.text().strip())
+            package_root_text = self.archive_package_root_edit.text().strip()
+            QTimer.singleShot(
+                0,
+                lambda entries=self.archive_entries, package_root_text=package_root_text: self.text_search_tab.set_archive_entries(
+                    entries,
+                    package_root_text,
+                ),
+            )
             browser_state = payload.get("browser_state") if isinstance(payload.get("browser_state"), dict) else {}
             self.archive_structure_filter_children = (
                 browser_state.get("structure_children", {})
@@ -4352,9 +4411,12 @@ def run_gui() -> int:
             self.archive_filtered_dds_count = int(browser_state.get("dds_count", 0))
             self.archive_filters_dirty = False
             self._update_archive_filter_button_state()
-            self.replace_assistant_tab.set_archive_entries(
-                self.archive_entries,
-                self.archive_package_root_edit.text().strip(),
+            QTimer.singleShot(
+                0,
+                lambda entries=self.archive_entries, package_root_text=package_root_text: self.replace_assistant_tab.set_archive_entries(
+                    entries,
+                    package_root_text,
+                ),
             )
             source = str(payload.get("source", "scan"))
             cache_path_text = str(payload.get("cache_path", "")).strip()
@@ -4757,6 +4819,223 @@ def run_gui() -> int:
             entry = self._current_archive_entry()
             return entry.path if entry is not None else ""
 
+        def _build_texture_editor_binding_for_loose_path(
+            self,
+            source_path: Path,
+            *,
+            launch_origin: str,
+            original_dds_path: Optional[Path] = None,
+        ) -> TextureEditorSourceBinding:
+            resolved = source_path.expanduser().resolve()
+            relative_path = ""
+            package_root = ""
+            archive_relative_path = ""
+            original_root_text = self.original_dds_edit.text().strip()
+            png_root_text = self.png_root_edit.text().strip()
+            original_root = Path(original_root_text).expanduser().resolve() if original_root_text else None
+            png_root = Path(png_root_text).expanduser().resolve() if png_root_text else None
+
+            for root in (original_root, png_root):
+                if root is None:
+                    continue
+                try:
+                    relative = resolved.relative_to(root)
+                except Exception:
+                    continue
+                relative_path = PurePosixPath(relative.as_posix()).as_posix()
+                parts = [part for part in PurePosixPath(relative_path).parts if part]
+                if parts:
+                    package_root = parts[0]
+                    archive_relative_path = PurePosixPath(*parts[1:]).as_posix() if len(parts) > 1 else parts[0]
+                break
+
+            chosen_original = original_dds_path
+            if chosen_original is None and resolved.suffix.lower() == ".dds":
+                chosen_original = resolved
+            if chosen_original is None and original_root is not None and relative_path:
+                candidate = (original_root / Path(PurePosixPath(relative_path))).with_suffix(".dds")
+                if candidate.exists():
+                    chosen_original = candidate
+
+            return TextureEditorSourceBinding(
+                launch_origin=launch_origin,
+                display_name=resolved.name,
+                source_path=str(resolved),
+                relative_path=relative_path,
+                package_root=package_root,
+                archive_relative_path=archive_relative_path,
+                original_dds_path=str(chosen_original) if chosen_original is not None else "",
+            )
+
+        def _open_source_in_texture_editor(self, source_path_text: str, binding: object) -> None:
+            if not source_path_text:
+                self.set_status_message("No source file was provided for Texture Editor.", error=True)
+                return
+            source_path = Path(source_path_text).expanduser()
+            if not source_path.exists():
+                self.set_status_message(f"Texture Editor source not found: {source_path}", error=True)
+                return
+            texture_binding = binding if isinstance(binding, TextureEditorSourceBinding) else None
+            self.main_tabs.setCurrentWidget(self.texture_editor_tab)
+            self.texture_editor_tab.open_source_path(source_path, binding=texture_binding)
+
+        def _show_archive_browser_from_texture_editor(self, archive_relative_path: str = "") -> None:
+            self.main_tabs.setCurrentWidget(self.archive_browser_tab)
+            normalized_path = PurePosixPath(str(archive_relative_path or "").replace("\\", "/")).as_posix().strip()
+            if not self.archive_entries:
+                QMessageBox.information(
+                    self,
+                    "Archive Browser",
+                    "Archive packages are not loaded yet. Open Archive Browser and scan or load the archive cache first.",
+                )
+                self.set_status_message("Archive Browser is open. Load or refresh archive packages to browse DDS files.")
+                return
+            if normalized_path:
+                preferred_index = next(
+                    (index for index, entry in enumerate(self.archive_filtered_entries) if entry.path == normalized_path),
+                    -1,
+                )
+                if preferred_index >= 0:
+                    target_item = self._select_archive_tree_entry(preferred_index)
+                    if target_item is not None:
+                        self.archive_tree.setCurrentItem(target_item)
+                        target_item.setSelected(True)
+                        self.archive_tree.scrollToItem(target_item, QAbstractItemView.PositionAtCenter)
+                        self.set_status_message(f"Focused Archive Browser on {normalized_path}.")
+                        return
+                if any(entry.path == normalized_path for entry in self.archive_entries):
+                    self.set_status_message(
+                        "Archive Browser is open, but the current archive filters hide this file. Clear or adjust the filters to reveal it.",
+                        error=True,
+                    )
+                else:
+                    self.set_status_message(
+                        f"Archive Browser is open. Could not find {normalized_path} in the loaded archive index.",
+                        error=True,
+                    )
+            else:
+                self.set_status_message("Archive Browser is open. Select a DDS file and use 'Open in Texture Editor'.")
+
+        def _open_archive_current_in_texture_editor(self) -> None:
+            entry = self._current_archive_entry()
+            if entry is None:
+                self.set_status_message("Select an archive file first.", error=True)
+                return
+            try:
+                source_path, _note = ensure_archive_preview_source(entry)
+            except Exception as exc:
+                self.set_status_message(f"Could not open archive file in Texture Editor: {exc}", error=True)
+                return
+            package_root = entry.pamt_path.parent.name.strip() or "package"
+            archive_relative_path = PurePosixPath(entry.path.replace("\\", "/")).as_posix()
+            binding = TextureEditorSourceBinding(
+                launch_origin="archive_browser",
+                display_name=entry.basename,
+                source_path=str(source_path),
+                relative_path=str(Path(package_root) / Path(PurePosixPath(archive_relative_path))),
+                package_root=package_root,
+                archive_relative_path=archive_relative_path,
+                original_dds_path=str(source_path) if source_path.suffix.lower() == ".dds" else "",
+            )
+            self._open_source_in_texture_editor(str(source_path), binding)
+
+        def _open_compare_in_texture_editor(self) -> None:
+            relative_path = self.current_compare_path_for_research().strip()
+            if not relative_path:
+                self.set_status_message("Select a DDS file in Compare first.", error=True)
+                return
+            original_root_text = self.original_dds_edit.text().strip()
+            output_root_text = self.output_root_edit.text().strip()
+            relative = Path(PurePosixPath(relative_path))
+            original_path = Path(original_root_text).expanduser() / relative if original_root_text else None
+            output_path = Path(output_root_text).expanduser() / relative if output_root_text else None
+            source_path = output_path if output_path is not None and output_path.exists() else original_path
+            if source_path is None or not source_path.exists():
+                self.set_status_message("Could not find a compare source file to open in Texture Editor.", error=True)
+                return
+            binding = self._build_texture_editor_binding_for_loose_path(
+                source_path,
+                launch_origin="compare",
+                original_dds_path=original_path if original_path is not None and original_path.exists() else None,
+            )
+            self._open_source_in_texture_editor(str(source_path), binding)
+
+        def _browse_texture_editor_source(self) -> None:
+            initial_dir = self.png_root_edit.text().strip() or self.original_dds_edit.text().strip() or str(self.settings_file_path.parent)
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Open image or DDS in Texture Editor",
+                initial_dir,
+                "Supported files (*.png *.dds *.jpg *.jpeg *.bmp *.tga *.webp);;All files (*.*)",
+            )
+            if not file_path:
+                return
+            source_path = Path(file_path)
+            binding = self._build_texture_editor_binding_for_loose_path(source_path, launch_origin="texture_workflow")
+            self._open_source_in_texture_editor(str(source_path), binding)
+
+        def _handle_texture_editor_send_to_replace_assistant(self, png_path_text: str, binding: object) -> None:
+            source_path = Path(png_path_text).expanduser()
+            if not source_path.exists():
+                self.set_status_message(f"Texture Editor export not found: {source_path}", error=True)
+                return
+            texture_binding = binding if isinstance(binding, TextureEditorSourceBinding) else TextureEditorSourceBinding()
+            self.replace_assistant_tab.accept_editor_export(source_path, texture_binding)
+            self.main_tabs.setCurrentWidget(self.replace_assistant_tab)
+
+        def _handle_texture_editor_send_to_texture_workflow(self, png_path_text: str, binding: object) -> None:
+            png_root_text = self.png_root_edit.text().strip()
+            if not png_root_text:
+                self.set_status_message("Set PNG root before sending editor output to Texture Workflow.", error=True)
+                return
+            source_path = Path(png_path_text).expanduser()
+            if not source_path.exists():
+                self.set_status_message(f"Texture Editor export not found: {source_path}", error=True)
+                return
+            texture_binding = binding if isinstance(binding, TextureEditorSourceBinding) else TextureEditorSourceBinding()
+            relative_path = texture_binding.relative_path.strip()
+            if not relative_path:
+                self.set_status_message(
+                    "Texture Editor output is missing a relative game path, so it cannot be placed into PNG root automatically.",
+                    error=True,
+                )
+                return
+            destination = Path(png_root_text).expanduser() / Path(PurePosixPath(relative_path)).with_suffix(".png")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, destination)
+            self.main_tabs.setCurrentWidget(self.workflow_tab)
+            self.set_status_message(f"Texture Editor export copied to PNG root: {destination}", error=False)
+
+        def _show_compare_from_texture_editor(self, relative_path_text: str, binding: object) -> None:
+            texture_binding = binding if isinstance(binding, TextureEditorSourceBinding) else TextureEditorSourceBinding()
+            compare_path = str(relative_path_text or "").strip()
+            if not compare_path:
+                compare_path = (texture_binding.relative_path or texture_binding.archive_relative_path).strip()
+            if not compare_path:
+                self.set_status_message(
+                    "Texture Editor could not determine a relative game path for Compare.",
+                    error=True,
+                )
+                return
+            self.main_tabs.setCurrentWidget(self.workflow_tab)
+            self.content_tabs.setCurrentWidget(self.compare_tab)
+            self.refresh_compare_list(select_current=True)
+            target_item = None
+            for row in range(self.compare_list.count()):
+                item = self.compare_list.item(row)
+                if item is not None and str(item.data(Qt.UserRole) or "").strip() == compare_path:
+                    target_item = item
+                    break
+            if target_item is None:
+                self.set_status_message(
+                    "Compare is open, but the current compare roots do not contain this texture yet.",
+                    error=True,
+                )
+                return
+            self.compare_list.setCurrentItem(target_item)
+            self.compare_list.scrollToItem(target_item, QAbstractItemView.PositionAtCenter)
+            self.set_status_message(f"Focused Compare on {compare_path}.", error=False)
+
         def extract_related_archive_set_from_paths(self, raw_paths: object, description: str) -> None:
             if not isinstance(raw_paths, list):
                 self.set_status_message("No related archive paths were supplied for extraction.", error=True)
@@ -5091,6 +5370,9 @@ def run_gui() -> int:
             self.archive_extract_selected_button.setEnabled(self.worker_thread is None and selected_count > 0)
             self.archive_extract_filtered_button.setEnabled(self.worker_thread is None and has_filtered_entries)
             self.archive_extract_to_workflow_button.setEnabled(self.worker_thread is None and workflow_extract_enabled)
+            self.archive_open_in_editor_button.setEnabled(
+                self.worker_thread is None and self._current_archive_entry() is not None
+            )
             if not self.archive_entries:
                 self.archive_stats_label.setText("No archives scanned.")
                 return
@@ -5474,6 +5756,9 @@ def run_gui() -> int:
             self.compare_mip_details_button.setEnabled(
                 not busy and 0 <= self.compare_list.currentRow() < self.compare_list.count()
             )
+            self.compare_open_in_editor_button.setEnabled(
+                not busy and 0 <= self.compare_list.currentRow() < self.compare_list.count()
+            )
             self.compare_sync_pan_checkbox.setEnabled(not busy)
             self.archive_package_root_edit.setEnabled(not busy)
             self.archive_extract_root_edit.setEnabled(not busy)
@@ -5498,12 +5783,14 @@ def run_gui() -> int:
             filtered_has_dds = any(entry.extension == ".dds" for entry in self.archive_filtered_entries)
             workflow_extract_enabled = selected_has_dds if selected_entries else filtered_has_dds
             self.archive_extract_to_workflow_button.setEnabled(not busy and workflow_extract_enabled)
+            self.archive_open_in_editor_button.setEnabled(not busy and self._current_archive_entry() is not None)
             self.archive_tree.setEnabled(not busy)
             self.archive_preview_text_edit.setEnabled(not busy)
             self.archive_preview_info_edit.setEnabled(not busy)
             self.text_search_tab.set_external_busy(busy)
             self.research_tab.setEnabled(not busy)
             self.replace_assistant_tab.set_external_busy(busy)
+            self.texture_editor_tab.setEnabled(not busy)
             self.settings_tab.setEnabled(not busy)
             self.archive_preview_loose_toggle_button.setEnabled(
                 not busy and self.archive_preview_loose_toggle_button.isVisible()
@@ -6149,6 +6436,7 @@ def run_gui() -> int:
             self.compare_previous_button.setEnabled(count > 0 and current_row > 0)
             self.compare_next_button.setEnabled(count > 0 and 0 <= current_row < count - 1)
             self.compare_mip_details_button.setEnabled(count > 0 and 0 <= current_row < count)
+            self.compare_open_in_editor_button.setEnabled(count > 0 and 0 <= current_row < count)
 
         def _open_compare_in_texture_analysis(self) -> None:
             relative_path = self.current_compare_path_for_research().strip()
@@ -6488,17 +6776,23 @@ def run_gui() -> int:
                 if self.compare_preview_worker is not None:
                     self.compare_preview_worker.stop()
                 self.compare_preview_thread.quit()
-                self.compare_preview_thread.wait(3000)
+                if not self.compare_preview_thread.wait(250):
+                    self.compare_preview_thread.terminate()
+                    self.compare_preview_thread.wait(150)
             if self.archive_preview_thread is not None:
                 if self.archive_preview_worker is not None:
                     self.archive_preview_worker.stop()
                 self.archive_preview_thread.quit()
-                self.archive_preview_thread.wait(3000)
+                if not self.archive_preview_thread.wait(250):
+                    self.archive_preview_thread.terminate()
+                    self.archive_preview_thread.wait(150)
             self.settings_tab.flush_settings_save()
             self.replace_assistant_tab.flush_settings_save()
+            self.texture_editor_tab.flush_settings_save()
             self.text_search_tab.shutdown()
             self.research_tab.shutdown()
             self.replace_assistant_tab.shutdown()
+            self.texture_editor_tab.shutdown()
             super().closeEvent(event)
 
     apply_windows_app_user_model_id()

@@ -151,6 +151,12 @@ if (Test-Path $iconPath) {
     }
 }
 
+$pyInstallerArgs += @(
+    "--collect-all", "numpy",
+    "--collect-all", "cv2",
+    "--collect-all", "PIL"
+)
+
 if ($Mode -eq "onefile") {
     $pyInstallerArgs += "--onefile"
 } else {

@@ -332,13 +332,23 @@ def build_replace_assistant_items(
     archive_entries: Sequence[ArchiveEntry],
     original_dds_root: Optional[Path] = None,
     archive_index: Optional[ReplaceAssistantArchiveIndex] = None,
+    on_stage: Optional[Callable[[str], None]] = None,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
 ) -> List[ReplaceAssistantItem]:
+    if on_stage is not None:
+        on_stage("Scanning selected files...")
+    discovered_paths = collect_replace_assistant_imports(imported_paths)
     active_index = archive_index or build_replace_assistant_archive_index(
         archive_entries,
         original_dds_root=original_dds_root,
     )
+    if on_stage is not None:
+        on_stage("Matching imported files to original DDS entries...")
     items: List[ReplaceAssistantItem] = []
-    for source_path in collect_replace_assistant_imports(imported_paths):
+    total = len(discovered_paths)
+    if on_progress is not None and total:
+        on_progress(0, total, f"Matching 0 / {total} imported file(s)...")
+    for index, source_path in enumerate(discovered_paths, start=1):
         matched = match_replace_assistant_original(source_path, active_index)
         items.append(
             ReplaceAssistantItem(
@@ -352,6 +362,8 @@ def build_replace_assistant_items(
                 status_detail=matched.match_reason or "unmatched",
             )
         )
+        if on_progress is not None and total:
+            on_progress(index, total, f"Matching {index} / {total} imported file(s)...")
     return items
 
 
@@ -419,6 +431,8 @@ def build_replace_assistant_preview_assets(
     if suffix in {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tga"}:
         return str(resolved_source), f"Edited image | {resolved_source.name}", f"Edited image preview from: {resolved_source}"
     return "", f"Edited file | {resolved_source.name}", f"Edited file preview from: {resolved_source}\nThis file type cannot be previewed as an image."
+
+
 def _normalize_edited_dds_to_png(
     texconv_path: Path,
     source_path: Path,
@@ -611,10 +625,11 @@ def build_replace_assistant_package(
                     stop_event=stop_event,
                     on_log=on_log,
                 )
+                processing_source_png = normalized_png
                 processed_png = normalized_png
                 if options.build_mode == "upscale_then_rebuild":
                     processed_png = _apply_optional_ncnn(
-                        normalized_png,
+                        processing_source_png,
                         options=options,
                         target_stem=target_stem,
                         scratch_root=scratch_root / f"item_{index}",
@@ -624,7 +639,7 @@ def build_replace_assistant_package(
                     if options.upscale_post_correction_mode and options.upscale_post_correction_mode.lower() != "none":
                         decision, correction_plan = build_source_match_plan_for_path(
                             relative_path=original_rel.as_posix(),
-                            source_png_path=normalized_png,
+                            source_png_path=processing_source_png,
                             mode=options.upscale_post_correction_mode,
                             preset=options.upscale_texture_preset,
                             enable_automatic_rules=options.enable_automatic_texture_rules,
@@ -636,7 +651,7 @@ def build_replace_assistant_package(
                                 f"[{index}/{total_items}] POST {source_path.name} -> {decision.texture_type}/{decision.semantic_subtype} using {correction_plan.correction_eligibility}"
                             )
                         apply_post_upscale_color_correction(
-                            normalized_png,
+                            processing_source_png,
                             processed_png,
                             options.upscale_post_correction_mode,
                             correction_plan=correction_plan,
@@ -710,11 +725,20 @@ def build_replace_assistant_package(
                 dry_run=False,
                 on_log=None,
             )
-            write_mod_package_info(
-                final_package_root,
-                options.package_info,
-                create_no_encrypt_file=options.create_no_encrypt_file,
+            info_json_path = final_package_root / "info.json"
+            no_encrypt_path = final_package_root / ".no_encrypt"
+            should_write_package_info = (
+                options.overwrite_existing_package_files
+                or not info_json_path.exists()
+                or (options.create_no_encrypt_file and not no_encrypt_path.exists())
+                or ((not options.create_no_encrypt_file) and no_encrypt_path.exists())
             )
+            if should_write_package_info:
+                write_mod_package_info(
+                    final_package_root,
+                    options.package_info,
+                    create_no_encrypt_file=options.create_no_encrypt_file,
+                )
             if on_log:
                 on_log(f"Replace package written to: {final_package_root}")
             return ReplaceAssistantBuildSummary(

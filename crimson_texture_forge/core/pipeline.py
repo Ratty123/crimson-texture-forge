@@ -294,6 +294,28 @@ def _legacy_luminance_texconv_format(
         return "R8G8_UNORM"
     return None
 
+
+def _legacy_alpha_texconv_format(
+    rgb_bit_count: int,
+    r_mask: int,
+    g_mask: int,
+    b_mask: int,
+    a_mask: int,
+) -> Optional[str]:
+    mask_tuple = (r_mask, g_mask, b_mask, a_mask)
+    if rgb_bit_count == 8 and mask_tuple in {
+        (0x00000000, 0x00000000, 0x00000000, 0x000000FF),
+        (0x000000FF, 0x00000000, 0x00000000, 0x00000000),
+        (0x00000000, 0x00000000, 0x00000000, 0x00000000),
+    }:
+        return "A8_UNORM"
+    if rgb_bit_count == 16 and mask_tuple in {
+        (0x00000000, 0x00000000, 0x00000000, 0x0000FFFF),
+        (0x0000FFFF, 0x00000000, 0x00000000, 0x00000000),
+    }:
+        return "R16_UNORM"
+    return None
+
 def parse_dds(dds_path: Path) -> DdsInfo:
     with dds_path.open("rb") as handle:
         blob = handle.read(148)
@@ -327,7 +349,7 @@ def parse_dds(dds_path: Path) -> DdsInfo:
 
     texconv_format: Optional[str] = None
 
-    has_alpha = bool(pf_flags & DDPF_ALPHAPIXELS)
+    has_alpha = bool(pf_flags & (DDPF_ALPHAPIXELS | DDPF_ALPHA))
 
     if pf_flags & DDPF_FOURCC:
         if fourcc == b"DX10":
@@ -383,6 +405,13 @@ def parse_dds(dds_path: Path) -> DdsInfo:
         if not texconv_format:
             raise ValueError(
                 "Unsupported luminance mask combination: "
+                f"bits={rgb_bit_count} R={r_mask:#010x} G={g_mask:#010x} B={b_mask:#010x} A={a_mask:#010x}"
+            )
+    elif pf_flags & DDPF_ALPHA:
+        texconv_format = _legacy_alpha_texconv_format(rgb_bit_count, r_mask, g_mask, b_mask, a_mask)
+        if not texconv_format:
+            raise ValueError(
+                "Unsupported alpha-only mask combination: "
                 f"bits={rgb_bit_count} R={r_mask:#010x} G={g_mask:#010x} B={b_mask:#010x} A={a_mask:#010x}"
             )
     else:
@@ -2525,7 +2554,7 @@ def ensure_dds_preview_png(
 
         cache_dir.mkdir(parents=True, exist_ok=True)
         cmd = build_preview_png_command(texconv_path, dds_path, cache_dir)
-        return_code, stdout, stderr = run_process_with_cancellation(cmd, stop_event=None)
+        return_code, stdout, stderr = run_process_with_cancellation(cmd, stop_event=stop_event)
         if return_code != 0:
             detail = stderr.strip() or stdout.strip() or f"texconv failed with exit code {return_code}"
             raise ValueError(f"Could not generate preview for {dds_path.name}: {detail}")
@@ -2578,12 +2607,16 @@ def ensure_dds_display_preview_png(
     max_dimension: int = _COMPARE_DISPLAY_PREVIEW_MAX_DIMENSION,
     stop_event: Optional[threading.Event] = None,
 ) -> Path:
+    resolved_info: Optional[DdsInfo] = dds_info
     try:
-        resolved_info = dds_info or parse_dds(dds_path)
+        if resolved_info is None:
+            resolved_info = parse_dds(dds_path)
     except Exception as exc:
         if dds_info is not None:
             raise
-        raise ValueError(f"Could not parse DDS header for preview: {exc}") from exc
+        resolved_info = None
+    if resolved_info is None:
+        return ensure_dds_preview_png(texconv_path, dds_path, stop_event=stop_event)
     resize_dims = _preview_resize_dimensions(
         resolved_info.width,
         resolved_info.height,

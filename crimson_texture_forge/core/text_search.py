@@ -188,6 +188,8 @@ def search_archive_text_entries(
     total_entries = len(entries)
     if on_log:
         on_log(f"Scanning {total_entries:,} archive entries for text-like files.")
+    if on_progress:
+        on_progress(0, total_entries, "Preparing archive text search...")
     progress_step = max(250, total_entries // 200) if total_entries > 0 else 250
     for index, entry in enumerate(entries, start=1):
         raise_if_cancelled(stop_event, "Text search stopped by user.")
@@ -267,23 +269,31 @@ def search_loose_text_files(
     pattern = _compile_search_pattern(query, regex=regex, case_sensitive=case_sensitive)
     results: List[TextSearchResult] = []
     candidate_count = 0
+    scanned_count = 0
     skipped_read_error_count = 0
     if on_log:
         on_log(f"Scanning loose text files under {root}.")
-    for index, path in enumerate(
-        _iter_loose_text_files(
-            root,
-            extension_filters,
-            path_filter,
-            stop_event=stop_event,
-        ),
-        start=1,
-    ):
+    if on_progress:
+        on_progress(0, 0, f"Scanning loose text files under {root}...")
+    for path in root.rglob("*"):
         raise_if_cancelled(stop_event, "Text search stopped by user.")
-        candidate_count += 1
+        if not path.is_file():
+            continue
+        scanned_count += 1
+        if on_progress and (scanned_count == 1 or scanned_count % 500 == 0):
+            try:
+                detail_path = path.relative_to(root).as_posix()
+            except ValueError:
+                detail_path = path.name
+            on_progress(scanned_count, 0, f"Scanning loose text files... {detail_path}")
+        if path.suffix.lower() not in extension_filters:
+            continue
         relative_path = path.relative_to(root).as_posix()
+        if not _path_matches_filter(relative_path, path_filter):
+            continue
+        candidate_count += 1
         if on_progress:
-            on_progress(index - 1, 0, f"Searching loose text files... {relative_path}")
+            on_progress(candidate_count - 1, 0, f"Searching loose text files... {relative_path}")
         try:
             data = path.read_bytes()
         except OSError as exc:

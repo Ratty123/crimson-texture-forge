@@ -36,6 +36,8 @@ from crimson_texture_forge.ui.themes import get_theme
 
 
 class PreviewLabel(QLabel):
+    color_sampled = Signal(str)
+
     def __init__(self, title: str):
         super().__init__(title)
         self.setAlignment(Qt.AlignCenter)
@@ -57,6 +59,7 @@ class PreviewLabel(QLabel):
         self._fit_scale = 1.0
         self._scroll_area = None
         self._wheel_zoom_handler: Optional[Callable[[int], None]] = None
+        self._color_pick_enabled = False
         self._drag_active = False
         self._drag_start_global_pos = None
         self._drag_start_h = 0
@@ -87,6 +90,10 @@ class PreviewLabel(QLabel):
 
     def set_wheel_zoom_handler(self, handler: Optional[Callable[[int], None]]) -> None:
         self._wheel_zoom_handler = handler
+
+    def set_color_pick_enabled(self, enabled: bool) -> None:
+        self._color_pick_enabled = enabled
+        self._update_cursor()
 
     def set_zoom_factor(self, zoom_factor: float) -> None:
         self._zoom_factor = max(0.1, zoom_factor)
@@ -164,6 +171,15 @@ class PreviewLabel(QLabel):
             self._apply_scaled_pixmap(self.text())
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.LeftButton and self._color_pick_enabled:
+            current_pixmap = self.pixmap()
+            point = event.position().toPoint()
+            if current_pixmap is not None and not current_pixmap.isNull():
+                if 0 <= point.x() < current_pixmap.width() and 0 <= point.y() < current_pixmap.height():
+                    color = current_pixmap.toImage().pixelColor(point)
+                    self.color_sampled.emit(color.name().upper())
+                    event.accept()
+                    return
         if (
             event.button() == Qt.LeftButton
             and self._can_pan()
@@ -223,7 +239,9 @@ class PreviewLabel(QLabel):
         )
 
     def _update_cursor(self) -> None:
-        if self._drag_active:
+        if self._color_pick_enabled:
+            self.setCursor(Qt.CrossCursor)
+        elif self._drag_active:
             self.setCursor(Qt.ClosedHandCursor)
         elif self._can_pan():
             self.setCursor(Qt.OpenHandCursor)
@@ -908,7 +926,7 @@ class QuickStartDialog(QDialog):
         layout.addWidget(title_label)
 
         intro_label = QLabel(
-            "This app is a workspace manager for archive extraction, optional PNG upscaling, and DDS rebuild."
+            "This app is a workspace manager for archive extraction, texture editing, optional PNG upscaling, DDS rebuild, and mod-ready loose export."
         )
         intro_label.setObjectName("HintLabel")
         intro_label.setWordWrap(True)
@@ -920,10 +938,12 @@ class QuickStartDialog(QDialog):
         self.browser.setHtml(
             """
             <h3>Overview</h3>
-            <p><b>Crimson Texture Forge</b> is a read-only archive and loose-file workflow tool for Crimson Desert. Its main jobs are archive extraction, DDS-to-PNG conversion, optional upscaling, DDS rebuild, compare review, texture research, and text search.</p>
+            <p><b>Crimson Texture Forge</b> is a read-only archive and loose-file workflow tool for Crimson Desert. Its main jobs are archive extraction, texture editing, DDS-to-PNG conversion, optional upscaling, DDS rebuild, compare review, texture research, and text search.</p>
             <ul>
               <li><b>Archive Browser</b>: scan <b>.pamt/.paz</b>, preview supported assets, filter, and extract to normal folders.</li>
               <li><b>Texture Workflow</b>: scan loose DDS files, optionally convert DDS to PNG with <b>texconv</b>, optionally upscale with <b>chaiNNer</b> or <b>Real-ESRGAN NCNN</b>, rebuild DDS, and compare results.</li>
+              <li><b>Replace Assistant</b>: take edited PNG/DDS files, match them to the original game texture, rebuild corrected DDS output, and export a ready mod folder.</li>
+              <li><b>Texture Editor</b>: edit visible textures as layered PNG documents with selections, floating paste/move, masks, adjustments, channel locks, custom brush presets, and direct handoff back to the rebuild workflow.</li>
               <li><b>Research</b>: inspect grouped texture sets, classification, unknown-family review, references, DDS QA results, exported reports, and local notes.</li>
               <li><b>Text Search</b>: search archive or loose text-like files such as <b>.xml</b>, preview matches with syntax colors, and export results while preserving folder structure.</li>
               <li><b>Settings</b>: store persistent global preferences such as theme, startup cache behavior, remembered layouts, and cleanup confirmations.</li>
@@ -938,6 +958,8 @@ class QuickStartDialog(QDialog):
               <li>Use <b>Preview Policy</b> before <b>Start</b> if you want to inspect the planned per-texture action.</li>
               <li>Click <b>Scan</b> in the Texture Workflow tab.</li>
               <li>Run a small subset first, then review the output in <b>Compare</b> before trying a larger batch.</li>
+              <li>If you already edited a texture outside the app, use <b>Replace Assistant</b> instead of the batch workflow.</li>
+              <li>If you want to edit visible textures inside the app, open them in <b>Texture Editor</b> and then send the flattened result back into <b>Replace Assistant</b> or <b>Texture Workflow</b>.</li>
             </ol>
             <h3>Backend chooser</h3>
             <p><b>Run Summary</b> gives you a read-only overview of the current sources, backend, texture policy, direct-backend settings, and export behavior before you start.</p>
@@ -966,6 +988,16 @@ class QuickStartDialog(QDialog):
             <ul>
               <li>Use <b>Research</b> for grouped texture sets, classifier output, <b>Unknown Resolver</b> approval, references, DDS analysis, reports, heatmaps, and local notes.</li>
               <li>Use <b>Text Search</b> for archive or loose text-like files such as <b>.xml</b>, <b>.json</b>, <b>.cfg</b>, and <b>.lua</b>, including preview, regex search, and export.</li>
+            </ul>
+            <h3>Texture Editor tips</h3>
+            <ul>
+              <li><b>Texture Editor</b> is built for visible-color texture work, not technical-map authoring.</li>
+              <li>Use selections, masks, and adjustment layers to keep edits reversible.</li>
+              <li>Brush presets, custom saved presets, brush tips, roundness/angle/smoothing controls, and patterned brush footprints are there to make paint/erase/clone/heal/smudge/dodge-burn work feel more like a real texture editor instead of one fixed round brush.</li>
+              <li><b>Gradient</b>, <b>Patch</b>, <b>Smudge</b>, and <b>Dodge/Burn</b> are meant for common texture cleanup and blending tasks that would otherwise push you into Photoshop.</li>
+              <li>Use the <b>Channels</b> section when you only want to paint/fill/recolor into `RGB`, `Alpha`, or a subset of channels.</li>
+              <li>Use <b>Open in Compare</b> from the editor if you want to review the edited texture against the original source.</li>
+              <li>When you are happy with the edit, send it to <b>Replace Assistant</b> for one-off replacement packaging or <b>Texture Workflow</b> for the wider DDS rebuild pipeline.</li>
             </ul>
             <h3>Common failure causes</h3>
             <ul>

@@ -483,6 +483,167 @@ class ReplaceAssistantBuildSummary:
 
 
 @dataclass(slots=True)
+class TextureEditorSourceBinding:
+    launch_origin: str = ""
+    display_name: str = ""
+    source_path: str = ""
+    source_identity_path: str = ""
+    relative_path: str = ""
+    package_root: str = ""
+    archive_relative_path: str = ""
+    original_dds_path: str = ""
+    original_texconv_format: str = ""
+    texture_type: str = "unknown"
+    semantic_subtype: str = "unknown"
+    technical_warning: str = ""
+
+
+@dataclass(slots=True)
+class TextureEditorLayer:
+    layer_id: str
+    name: str
+    relative_png_path: str
+    visible: bool = True
+    opacity: int = 100
+    blend_mode: str = "normal"
+    offset_x: int = 0
+    offset_y: int = 0
+    locked: bool = False
+    alpha_locked: bool = False
+    mask_layer_id: str = ""
+    mask_enabled: bool = True
+    revision: int = 0
+    thumbnail_cache_key: str = ""
+
+
+@dataclass(slots=True)
+class TextureEditorSelection:
+    mode: str = "none"
+    rect: Optional[Tuple[int, int, int, int]] = None
+    polygon_points: Tuple[Tuple[float, float], ...] = ()
+    mask_polygons: Tuple[Tuple[Tuple[float, float], ...], ...] = ()
+    inverted: bool = False
+    feather_radius: int = 0
+
+
+@dataclass(slots=True)
+class TextureEditorFloatingSelection:
+    source_layer_id: str = ""
+    label: str = ""
+    bounds: Tuple[int, int, int, int] = (0, 0, 0, 0)
+    offset_x: int = 0
+    offset_y: int = 0
+    scale_x: float = 1.0
+    scale_y: float = 1.0
+    rotation_degrees: float = 0.0
+    flip_x: bool = False
+    flip_y: bool = False
+    paste_mode: str = "in_place"
+    committed: bool = True
+
+
+@dataclass(slots=True)
+class TextureEditorToolSettings:
+    tool: str = "paint"
+    color_hex: str = "#C85A30"
+    secondary_color_hex: str = "#FFFFFF"
+    brush_preset: str = "custom"
+    brush_tip: str = "round"
+    brush_pattern: str = "solid"
+    size_step_mode: str = "normal"
+    paint_blend_mode: str = "normal"
+    size: float = 32.0
+    hardness: int = 80
+    opacity: int = 100
+    flow: int = 100
+    spacing: int = 20
+    roundness: int = 100
+    angle_degrees: int = 0
+    smoothing: int = 0
+    strength: int = 50
+    sharpen_mode: str = "unsharp_mask"
+    soften_mode: str = "gaussian"
+    smudge_strength: int = 45
+    dodge_burn_mode: str = "dodge_midtones"
+    dodge_burn_exposure: int = 20
+    patch_blend: int = 70
+    gradient_type: str = "linear"
+    sample_visible_layers: bool = True
+    clone_aligned: bool = True
+    fill_tolerance: int = 24
+    fill_contiguous: bool = True
+    clone_source_point: Optional[Tuple[int, int]] = None
+    selection_combine_mode: str = "replace"
+    lasso_snap_to_edges: bool = False
+    lasso_snap_radius: int = 10
+    lasso_edge_sensitivity: int = 55
+    recolor_mode: str = "tint"
+    recolor_source_hex: str = "#808080"
+    recolor_target_hex: str = "#C85A30"
+    recolor_tolerance: int = 48
+    recolor_strength: int = 100
+    recolor_preserve_luminance: bool = True
+
+
+@dataclass(slots=True)
+class TextureEditorHistoryEntry:
+    label: str
+    timestamp: float = 0.0
+
+
+@dataclass(slots=True)
+class TextureEditorCommand:
+    kind: str
+    label: str
+    timestamp: float = 0.0
+    dirty_bounds: Optional[Tuple[int, int, int, int]] = None
+    checkpoint: bool = False
+
+
+@dataclass(slots=True)
+class TextureEditorAdjustmentLayer:
+    layer_id: str
+    name: str
+    adjustment_type: str
+    enabled: bool = True
+    opacity: int = 100
+    parameters: Dict[str, float] = field(default_factory=dict)
+    mask_layer_id: str = ""
+    revision: int = 0
+
+
+@dataclass(slots=True)
+class TextureEditorDocument:
+    title: str
+    width: int
+    height: int
+    project_path: Optional[Path] = None
+    workspace_root: Optional[Path] = None
+    active_layer_id: str = ""
+    layers: Tuple[TextureEditorLayer, ...] = ()
+    source_binding: TextureEditorSourceBinding = field(default_factory=TextureEditorSourceBinding)
+    selection: TextureEditorSelection = field(default_factory=TextureEditorSelection)
+    floating_selection: Optional[TextureEditorFloatingSelection] = None
+    adjustment_layers: Tuple[TextureEditorAdjustmentLayer, ...] = ()
+    technical_warning: str = ""
+    last_flattened_png_path: str = ""
+    composite_revision: int = 0
+    quick_mask_enabled: bool = False
+    edit_red_channel: bool = True
+    edit_green_channel: bool = True
+    edit_blue_channel: bool = True
+    edit_alpha_channel: bool = True
+
+
+@dataclass(slots=True)
+class TextureEditorWorkspace:
+    open_document_ids: Tuple[str, ...] = ()
+    active_document_id: str = ""
+    clipboard_kind: str = ""
+    document_view_state: Dict[str, Dict[str, object]] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class ComparePreviewPaneResult:
     status: str
     title: str = ""

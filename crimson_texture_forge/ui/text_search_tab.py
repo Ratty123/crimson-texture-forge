@@ -47,6 +47,16 @@ from crimson_texture_forge.ui.themes import get_theme
 from crimson_texture_forge.ui.widgets import CodePreviewEditor, LogHighlighter
 
 
+def _shutdown_thread(thread: Optional[QThread], *, grace_ms: int = 250, force_ms: int = 150) -> None:
+    if thread is None:
+        return
+    thread.quit()
+    if thread.wait(grace_ms):
+        return
+    thread.terminate()
+    thread.wait(force_ms)
+
+
 class TextSearchWorker(QObject):
     log_message = Signal(str)
     progress_changed = Signal(int, int, str)
@@ -74,7 +84,7 @@ class TextSearchWorker(QObject):
         self.path_filter = path_filter
         self.case_sensitive = case_sensitive
         self.regex_enabled = regex_enabled
-        self.archive_entries = list(archive_entries)
+        self.archive_entries = archive_entries if isinstance(archive_entries, list) else list(archive_entries)
         self.loose_root = loose_root
         self.stop_event = threading.Event()
 
@@ -488,7 +498,7 @@ class TextSearchTab(QWidget):
         return self.search_thread is not None
 
     def set_archive_entries(self, entries: Sequence[ArchiveEntry], package_root_text: str = "") -> None:
-        self.archive_entries = list(entries)
+        self.archive_entries = entries if isinstance(entries, list) else list(entries)
         self.archive_package_root_text = package_root_text.strip()
         if self.source_combo.currentData() == "archive" and not self.search_results:
             self.results_summary_label.setText(
@@ -566,14 +576,10 @@ class TextSearchTab(QWidget):
         self._preview_debounce_timer.stop()
         if self.search_worker is not None:
             self.search_worker.stop()
-        if self.search_thread is not None:
-            self.search_thread.quit()
-            self.search_thread.wait(3000)
         if self.preview_worker is not None:
             self.preview_worker.stop()
-        if self.preview_thread is not None:
-            self.preview_thread.quit()
-            self.preview_thread.wait(3000)
+        _shutdown_thread(self.search_thread)
+        _shutdown_thread(self.preview_thread)
 
     def clear_log(self) -> None:
         self.log_view.clear()

@@ -77,6 +77,16 @@ from crimson_texture_forge.models import AppConfig, ArchiveEntry, ArchivePreview
 from crimson_texture_forge.ui.widgets import PreviewLabel, PreviewScrollArea
 
 
+def _shutdown_thread(thread: Optional[QThread], *, grace_ms: int = 250, force_ms: int = 150) -> None:
+    if thread is None:
+        return
+    thread.quit()
+    if thread.wait(grace_ms):
+        return
+    thread.terminate()
+    thread.wait(force_ms)
+
+
 class ResearchRefreshWorker(QObject):
     progress_changed = Signal(int, int, str)
     completed = Signal(object)
@@ -473,9 +483,7 @@ class ResearchTab(QWidget):
         if self.unknown_preview_worker is not None:
             self.unknown_preview_worker.stop()
         for thread in (self.refresh_thread, self.resolve_thread, self.unknown_preview_thread):
-            if thread is not None:
-                thread.quit()
-                thread.wait(3000)
+            _shutdown_thread(thread)
 
     def refresh_archive_picker(self) -> None:
         entries = list(self.get_filtered_archive_entries()) or list(self.get_archive_entries())
