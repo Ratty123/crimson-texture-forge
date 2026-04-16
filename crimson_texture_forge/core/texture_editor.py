@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import dataclasses
 import json
 import math
@@ -209,6 +210,7 @@ def _selection_to_dict(selection: TextureEditorSelection) -> Dict[str, object]:
         "rect": list(selection.rect) if selection.rect else None,
         "polygon_points": [list(point) for point in selection.polygon_points],
         "mask_polygons": [[list(point) for point in polygon] for polygon in selection.mask_polygons],
+        "mask_png_base64": base64.b64encode(selection.mask_png_blob).decode("ascii") if selection.mask_png_blob else "",
         "inverted": bool(selection.inverted),
         "feather_radius": int(selection.feather_radius),
     }
@@ -242,11 +244,19 @@ def _selection_from_dict(data: Dict[str, object]) -> TextureEditorSelection:
             if len(points) >= 3:
                 polygons.append(points)
         mask_polygons = tuple(polygons)
+    mask_png_blob = b""
+    mask_png_base64 = data.get("mask_png_base64")
+    if isinstance(mask_png_base64, str) and mask_png_base64.strip():
+        try:
+            mask_png_blob = base64.b64decode(mask_png_base64)
+        except Exception:
+            mask_png_blob = b""
     return TextureEditorSelection(
         mode=str(data.get("mode", "none") or "none"),
         rect=rect,
         polygon_points=polygon_points,
         mask_polygons=mask_polygons,
+        mask_png_blob=mask_png_blob,
         inverted=bool(data.get("inverted", False)),
         feather_radius=max(0, int(data.get("feather_radius", 0) or 0)),
     )
@@ -301,7 +311,14 @@ def _adjustment_layer_to_dict(layer: TextureEditorAdjustmentLayer) -> Dict[str, 
         "adjustment_type": str(layer.adjustment_type),
         "enabled": bool(layer.enabled),
         "opacity": int(layer.opacity),
-        "parameters": {str(key): float(value) for key, value in layer.parameters.items()},
+        "parameters": {
+            str(key): (
+                str(value)
+                if isinstance(value, str)
+                else float(value)
+            )
+            for key, value in layer.parameters.items()
+        },
         "mask_layer_id": str(layer.mask_layer_id),
         "revision": int(layer.revision),
     }
@@ -309,9 +326,12 @@ def _adjustment_layer_to_dict(layer: TextureEditorAdjustmentLayer) -> Dict[str, 
 
 def _adjustment_layer_from_dict(data: Dict[str, object]) -> TextureEditorAdjustmentLayer:
     parameters_raw = data.get("parameters")
-    parameters: Dict[str, float] = {}
+    parameters: Dict[str, object] = {}
     if isinstance(parameters_raw, dict):
         for key, value in parameters_raw.items():
+            if isinstance(value, str):
+                parameters[str(key)] = value
+                continue
             try:
                 parameters[str(key)] = float(value)
             except Exception:
@@ -441,7 +461,7 @@ def load_texture_editor_project(
                 try:
                     layer_pixels[str(mask_layer_id)] = _load_rgba_array(mask_path)
                 except Exception:
-                    continue
+                    missing_assets.append(str(mask_path))
             else:
                 missing_assets.append(str(mask_path))
     floating_pixels: Optional[np.ndarray] = None
@@ -506,6 +526,30 @@ def _selection_mask_to_polygons(mask: np.ndarray) -> Tuple[Tuple[Tuple[float, fl
     return tuple(polygons)
 
 
+def _encode_selection_mask_png(mask: Optional[np.ndarray]) -> bytes:
+    if mask is None:
+        return b""
+    array = np.asarray(mask, dtype=np.uint8)
+    if array.size == 0 or not np.any(array):
+        return b""
+    encoded = cv2.imencode(".png", array)[1]
+    return bytes(encoded)
+
+
+def _decode_selection_mask_png(blob: bytes, width: int, height: int) -> Optional[np.ndarray]:
+    if not blob or width <= 0 or height <= 0:
+        return None
+    decoded = cv2.imdecode(np.frombuffer(blob, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    if decoded is None:
+        return None
+    if decoded.ndim == 3:
+        decoded = decoded[..., -1]
+    mask = np.asarray(decoded, dtype=np.uint8)
+    if mask.shape[:2] != (height, width):
+        return None
+    return mask.copy()
+
+
 def _selection_from_mask(
     mask: Optional[np.ndarray],
     *,
@@ -516,12 +560,18 @@ def _selection_from_mask(
         return TextureEditorSelection(inverted=False, feather_radius=max(0, int(feather_radius)))
     polygons = _selection_mask_to_polygons(mask)
     if not polygons:
-        return TextureEditorSelection(inverted=False, feather_radius=max(0, int(feather_radius)))
+        return TextureEditorSelection(
+            mode="mask",
+            inverted=bool(inverted),
+            feather_radius=max(0, int(feather_radius)),
+            mask_png_blob=_encode_selection_mask_png(mask),
+        )
     first_polygon = polygons[0]
     return TextureEditorSelection(
         mode="mask",
         polygon_points=first_polygon,
         mask_polygons=polygons,
+        mask_png_blob=_encode_selection_mask_png(mask),
         inverted=bool(inverted),
         feather_radius=max(0, int(feather_radius)),
     )
@@ -556,6 +606,113 @@ def _effective_brush_size(settings: TextureEditorToolSettings) -> float:
     if mode == "fine":
         return max(0.25, base * 0.25)
     return base
+
+
+def _expand_stroke_points_for_symmetry(
+    points: Sequence[Tuple[int, int]],
+    width: int,
+    height: int,
+    symmetry_mode: str,
+) -> List[Tuple[int, int]]:
+    if not points:
+        return []
+    mode = (symmetry_mode or "off").strip().lower()
+    if mode == "off" or width <= 0 or height <= 0:
+        return [(int(x), int(y)) for x, y in points]
+    unique_points: List[Tuple[int, int]] = []
+    seen: set[Tuple[int, int]] = set()
+    for x, y in points:
+        candidates = [(int(x), int(y))]
+        if mode in {"horizontal", "both"}:
+            candidates.append((max(0, width - 1 - int(x)), int(y)))
+        if mode in {"vertical", "both"}:
+            candidates.append((int(x), max(0, height - 1 - int(y))))
+        if mode == "both":
+            candidates.append((max(0, width - 1 - int(x)), max(0, height - 1 - int(y))))
+        for point in candidates:
+            if point not in seen:
+                seen.add(point)
+                unique_points.append(point)
+    return unique_points
+
+
+def _resize_array(
+    pixels: np.ndarray,
+    width: int,
+    height: int,
+    *,
+    nearest: bool = False,
+) -> np.ndarray:
+    source = np.asarray(pixels, dtype=np.uint8)
+    target_width = max(1, int(width))
+    target_height = max(1, int(height))
+    if source.shape[1] == target_width and source.shape[0] == target_height:
+        return np.ascontiguousarray(source.copy())
+    if nearest:
+        interpolation = cv2.INTER_NEAREST
+    else:
+        shrinking = target_width < source.shape[1] or target_height < source.shape[0]
+        interpolation = cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR
+    resized = cv2.resize(source, (target_width, target_height), interpolation=interpolation)
+    return np.ascontiguousarray(resized, dtype=np.uint8)
+
+
+@lru_cache(maxsize=128)
+def _load_custom_brush_tip_alpha(path_text: str, mtime_ns: int) -> Optional[np.ndarray]:
+    try:
+        path = Path(path_text).expanduser().resolve()
+        with Image.open(path) as image:
+            rgba = image.convert("RGBA")
+            alpha = np.asarray(rgba.getchannel("A"), dtype=np.uint8)
+            if not np.any(alpha):
+                grayscale = np.asarray(rgba.convert("L"), dtype=np.uint8)
+                alpha = grayscale
+    except Exception:
+        return None
+    if alpha.size == 0:
+        return None
+    max_side = max(alpha.shape[0], alpha.shape[1], 1)
+    canvas = np.zeros((max_side, max_side), dtype=np.uint8)
+    offset_y = (max_side - alpha.shape[0]) // 2
+    offset_x = (max_side - alpha.shape[1]) // 2
+    canvas[offset_y:offset_y + alpha.shape[0], offset_x:offset_x + alpha.shape[1]] = alpha
+    return np.ascontiguousarray(canvas, dtype=np.uint8)
+
+
+def _build_custom_brush_stamp(
+    path_text: str,
+    size: float,
+    strength_percent: int,
+    *,
+    roundness: int = 100,
+    angle_degrees: int = 0,
+    hardness: int = 100,
+) -> Optional[np.ndarray]:
+    try:
+        resolved = Path(path_text).expanduser().resolve()
+        stat = resolved.stat()
+    except Exception:
+        return None
+    base_alpha = _load_custom_brush_tip_alpha(str(resolved), int(getattr(stat, "st_mtime_ns", 0)))
+    if base_alpha is None:
+        return None
+    radius = max(0.5, float(size) / 2.0)
+    diameter = max(1, int(math.ceil(radius * 2.0 + 2.0)))
+    roundness_ratio = max(0.15, min(1.0, float(roundness) / 100.0))
+    target_w = max(1, int(round(float(diameter) * roundness_ratio)))
+    target_h = max(1, int(round(float(diameter))))
+    pil_alpha = Image.fromarray(base_alpha, mode="L")
+    pil_alpha = pil_alpha.resize((target_w, target_h), resample=Image.Resampling.LANCZOS)
+    canvas = Image.new("L", (diameter, diameter), 0)
+    canvas.paste(pil_alpha, ((diameter - target_w) // 2, (diameter - target_h) // 2))
+    if angle_degrees:
+        canvas = canvas.rotate(float(angle_degrees), resample=Image.Resampling.BICUBIC, expand=False, fillcolor=0)
+    stamp = np.asarray(canvas, dtype=np.float32) / 255.0
+    hardness_ratio = max(0.0, min(1.0, hardness / 100.0))
+    exponent = max(0.25, 2.0 - (hardness_ratio * 1.75))
+    stamp = np.power(np.clip(stamp, 0.0, 1.0), exponent)
+    stamp *= max(0.0, min(1.0, strength_percent / 100.0))
+    return np.clip(stamp, 0.0, 1.0).astype(np.float32)
 
 
 def _smooth_stroke_points(
@@ -698,6 +855,56 @@ def _build_curves_lut(shadows: float, midtones: float, highlights: float) -> np.
     return np.clip(np.round(curve * 255.0), 0, 255).astype(np.uint8)
 
 
+def _adjustment_target_mask(rgb: np.ndarray, target_range: str) -> np.ndarray:
+    rgb_f = rgb.astype(np.float32) / 255.0
+    red = rgb_f[..., 0]
+    green = rgb_f[..., 1]
+    blue = rgb_f[..., 2]
+    max_rgb = np.maximum(np.maximum(red, green), blue)
+    min_rgb = np.minimum(np.minimum(red, green), blue)
+    chroma = max_rgb - min_rgb
+    target = (target_range or "neutrals").strip().lower()
+    if target == "reds":
+        weight = np.clip(red - np.maximum(green, blue), 0.0, 1.0)
+    elif target == "greens":
+        weight = np.clip(green - np.maximum(red, blue), 0.0, 1.0)
+    elif target == "blues":
+        weight = np.clip(blue - np.maximum(red, green), 0.0, 1.0)
+    elif target == "cyans":
+        weight = np.clip(np.minimum(green, blue) - red, 0.0, 1.0)
+    elif target == "magentas":
+        weight = np.clip(np.minimum(red, blue) - green, 0.0, 1.0)
+    elif target == "yellows":
+        weight = np.clip(np.minimum(red, green) - blue, 0.0, 1.0)
+    elif target == "whites":
+        weight = np.clip((max_rgb - 0.55) / 0.45, 0.0, 1.0)
+        weight *= np.clip(1.0 - (chroma * 1.75), 0.0, 1.0)
+    elif target == "blacks":
+        weight = np.clip((0.35 - max_rgb) / 0.35, 0.0, 1.0)
+        weight *= np.clip(1.0 - (chroma * 1.75), 0.0, 1.0)
+    else:
+        neutral_bias = np.clip(1.0 - (chroma * 2.0), 0.0, 1.0)
+        luminance = (red * 0.299) + (green * 0.587) + (blue * 0.114)
+        tonal = np.clip(1.0 - np.abs((luminance * 2.0) - 1.0), 0.0, 1.0)
+        weight = neutral_bias * tonal
+    return weight[..., None].astype(np.float32)
+
+
+def _trim_rgba_transparent_bounds(pixels: np.ndarray) -> np.ndarray:
+    rgba = np.asarray(pixels, dtype=np.uint8)
+    if rgba.size == 0:
+        return rgba
+    alpha = rgba[..., 3]
+    ys, xs = np.where(alpha > 0)
+    if xs.size == 0 or ys.size == 0:
+        return rgba[:1, :1].copy()
+    x0 = int(xs.min())
+    y0 = int(ys.min())
+    x1 = int(xs.max()) + 1
+    y1 = int(ys.max()) + 1
+    return rgba[y0:y1, x0:x1].copy()
+
+
 def _apply_adjustment_to_rgba(
     rgba: np.ndarray,
     adjustment: TextureEditorAdjustmentLayer,
@@ -722,6 +929,54 @@ def _apply_adjustment_to_rgba(
         hsv[..., 1] = np.clip(hsv[..., 1] * (1.0 + (sat_shift / 100.0)), 0.0, 255.0)
         hsv[..., 2] = np.clip(hsv[..., 2] * (1.0 + (light_shift / 100.0)), 0.0, 255.0)
         adjusted_rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+    elif adj_type == "brightness_contrast":
+        brightness = max(-1.0, min(1.0, float(params.get("brightness", 0.0)) / 100.0))
+        contrast = max(-1.0, min(1.0, float(params.get("contrast", 0.0)) / 100.0))
+        saturation = max(-1.0, min(1.0, float(params.get("saturation", 0.0)) / 100.0))
+        rgb_f = rgb.astype(np.float32) / 255.0
+        rgb_f = np.clip(((rgb_f - 0.5) * (1.0 + contrast)) + 0.5 + brightness, 0.0, 1.0)
+        luma = (rgb_f[..., 0:1] * 0.299) + (rgb_f[..., 1:2] * 0.587) + (rgb_f[..., 2:3] * 0.114)
+        rgb_f = np.clip(luma + ((rgb_f - luma) * (1.0 + saturation)), 0.0, 1.0)
+        adjusted_rgb = np.clip(np.round(rgb_f * 255.0), 0.0, 255.0).astype(np.uint8)
+    elif adj_type == "exposure":
+        exposure = max(-2.0, min(2.0, float(params.get("exposure", 0.0)) / 50.0))
+        offset = max(-0.5, min(0.5, float(params.get("offset", 0.0)) / 200.0))
+        gamma = max(0.1, min(4.0, float(params.get("gamma", 1.0))))
+        rgb_f = rgb.astype(np.float32) / 255.0
+        rgb_f = np.clip((rgb_f * (2.0 ** exposure)) + offset, 0.0, 1.0)
+        rgb_f = np.power(rgb_f, 1.0 / gamma)
+        adjusted_rgb = np.clip(np.round(rgb_f * 255.0), 0.0, 255.0).astype(np.uint8)
+    elif adj_type == "color_balance":
+        red_cyan = max(-100.0, min(100.0, float(params.get("red_cyan", 0.0)))) * 0.9
+        green_magenta = max(-100.0, min(100.0, float(params.get("green_magenta", 0.0)))) * 0.9
+        blue_yellow = max(-100.0, min(100.0, float(params.get("blue_yellow", 0.0)))) * 0.9
+        adjusted_rgb = rgb.astype(np.int16)
+        adjusted_rgb[..., 0] += int(round(red_cyan))
+        adjusted_rgb[..., 1] += int(round(green_magenta))
+        adjusted_rgb[..., 2] += int(round(blue_yellow))
+        adjusted_rgb = np.clip(adjusted_rgb, 0, 255).astype(np.uint8)
+    elif adj_type == "vibrance":
+        vibrance = max(-100.0, min(100.0, float(params.get("vibrance", 0.0)))) / 100.0
+        saturation = max(-100.0, min(100.0, float(params.get("saturation", 0.0)))) / 100.0
+        lightness = max(-100.0, min(100.0, float(params.get("lightness", 0.0)))) / 100.0
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+        sat_norm = hsv[..., 1] / 255.0
+        vib_weight = np.where(vibrance >= 0.0, 1.0 - sat_norm, sat_norm)
+        hsv[..., 1] = np.clip(hsv[..., 1] * (1.0 + (vibrance * vib_weight)), 0.0, 255.0)
+        hsv[..., 1] = np.clip(hsv[..., 1] * (1.0 + saturation), 0.0, 255.0)
+        hsv[..., 2] = np.clip(hsv[..., 2] * (1.0 + lightness), 0.0, 255.0)
+        adjusted_rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+    elif adj_type == "selective_color":
+        target_range = str(params.get("target_range", "neutrals") or "neutrals")
+        red_cyan = max(-100.0, min(100.0, float(params.get("red_cyan", 0.0))))
+        green_magenta = max(-100.0, min(100.0, float(params.get("green_magenta", 0.0))))
+        blue_yellow = max(-100.0, min(100.0, float(params.get("blue_yellow", 0.0))))
+        mask = _adjustment_target_mask(rgb, target_range)
+        adjusted_rgb_f = rgb.astype(np.float32)
+        adjusted_rgb_f[..., 0:1] += red_cyan * mask
+        adjusted_rgb_f[..., 1:2] += green_magenta * mask
+        adjusted_rgb_f[..., 2:3] += blue_yellow * mask
+        adjusted_rgb = np.clip(np.round(adjusted_rgb_f), 0.0, 255.0).astype(np.uint8)
     elif adj_type == "curves":
         lut = _build_curves_lut(
             float(params.get("shadows", 0.0)),
@@ -792,6 +1047,108 @@ def _flatten_texture_editor_raster_layers(
     return base
 
 
+def _document_bounds(
+    document: TextureEditorDocument,
+    bounds: Tuple[int, int, int, int],
+) -> Optional[Tuple[int, int, int, int]]:
+    x = max(0, min(int(document.width), int(bounds[0])))
+    y = max(0, min(int(document.height), int(bounds[1])))
+    width = max(0, int(bounds[2]))
+    height = max(0, int(bounds[3]))
+    x1 = min(int(document.width), x + width)
+    y1 = min(int(document.height), y + height)
+    if x1 <= x or y1 <= y:
+        return None
+    return x, y, x1 - x, y1 - y
+
+
+def _adjustment_mask_canvas_region(
+    document: TextureEditorDocument,
+    layer_pixels: Dict[str, np.ndarray],
+    mask_layer_id: str,
+    bounds: Optional[Tuple[int, int, int, int]] = None,
+) -> Optional[np.ndarray]:
+    if not mask_layer_id:
+        return None
+    layer = next((candidate for candidate in document.layers if candidate.layer_id == mask_layer_id), None)
+    mask_pixels = layer_pixels.get(mask_layer_id)
+    if layer is None or mask_pixels is None:
+        return None
+    if bounds is None:
+        x = 0
+        y = 0
+        width = int(document.width)
+        height = int(document.height)
+    else:
+        normalized = _document_bounds(document, bounds)
+        if normalized is None:
+            return None
+        x, y, width, height = normalized
+    canvas_mask = np.zeros((height, width, 4), dtype=np.uint8)
+    intersection = _layer_canvas_intersection(layer, mask_pixels, document)
+    if intersection is None:
+        return canvas_mask
+    dx0, dy0, dx1, dy1, sx0, sy0, sx1, sy1 = intersection
+    rx0 = max(dx0, x)
+    ry0 = max(dy0, y)
+    rx1 = min(dx1, x + width)
+    ry1 = min(dy1, y + height)
+    if rx1 <= rx0 or ry1 <= ry0:
+        return canvas_mask
+    local_x0 = rx0 - x
+    local_y0 = ry0 - y
+    src_x0 = sx0 + (rx0 - dx0)
+    src_y0 = sy0 + (ry0 - dy0)
+    src_x1 = src_x0 + (rx1 - rx0)
+    src_y1 = src_y0 + (ry1 - ry0)
+    canvas_mask[local_y0:local_y0 + (ry1 - ry0), local_x0:local_x0 + (rx1 - rx0)] = mask_pixels[src_y0:src_y1, src_x0:src_x1]
+    return canvas_mask
+
+
+def _flatten_texture_editor_raster_layers_region(
+    document: TextureEditorDocument,
+    layer_pixels: Dict[str, np.ndarray],
+    bounds: Tuple[int, int, int, int],
+) -> np.ndarray:
+    normalized = _document_bounds(document, bounds)
+    if normalized is None:
+        return np.zeros((1, 1, 4), dtype=np.uint8)
+    crop_x, crop_y, crop_width, crop_height = normalized
+    base = np.zeros((crop_height, crop_width, 4), dtype=np.uint8)
+    for layer in document.layers:
+        pixels = layer_pixels.get(layer.layer_id)
+        if pixels is None or not layer.visible:
+            continue
+        intersection = _layer_canvas_intersection(layer, pixels, document)
+        if intersection is None:
+            continue
+        dx0, dy0, dx1, dy1, sx0, sy0, sx1, sy1 = intersection
+        rx0 = max(dx0, crop_x)
+        ry0 = max(dy0, crop_y)
+        rx1 = min(dx1, crop_x + crop_width)
+        ry1 = min(dy1, crop_y + crop_height)
+        if rx1 <= rx0 or ry1 <= ry0:
+            continue
+        src_x0 = sx0 + (rx0 - dx0)
+        src_y0 = sy0 + (ry0 - dy0)
+        src_x1 = src_x0 + (rx1 - rx0)
+        src_y1 = src_y0 + (ry1 - ry0)
+        dst_x0 = rx0 - crop_x
+        dst_y0 = ry0 - crop_y
+        src_region = pixels[src_y0:src_y1, src_x0:src_x1]
+        if layer.mask_layer_id and layer.mask_enabled:
+            mask_pixels = layer_pixels.get(layer.mask_layer_id)
+            if mask_pixels is not None:
+                src_region = _apply_mask_to_src_region(src_region, mask_pixels[src_y0:src_y1, src_x0:src_x1])
+        base[dst_y0:dst_y0 + (ry1 - ry0), dst_x0:dst_x0 + (rx1 - rx0)] = _blend_layer_region(
+            base[dst_y0:dst_y0 + (ry1 - ry0), dst_x0:dst_x0 + (rx1 - rx0)],
+            src_region,
+            opacity=layer.opacity,
+            mode=layer.blend_mode,
+        )
+    return base
+
+
 def flatten_texture_editor_layers(
     document: TextureEditorDocument,
     layer_pixels: Dict[str, np.ndarray],
@@ -801,7 +1158,25 @@ def flatten_texture_editor_layers(
         return base
     result = base
     for adjustment in document.adjustment_layers:
-        mask_region = layer_pixels.get(adjustment.mask_layer_id) if adjustment.mask_layer_id else None
+        mask_region = _adjustment_mask_canvas_region(document, layer_pixels, adjustment.mask_layer_id)
+        result = _apply_adjustment_to_rgba(result, adjustment, mask_region=mask_region)
+    return result
+
+
+def flatten_texture_editor_layers_region(
+    document: TextureEditorDocument,
+    layer_pixels: Dict[str, np.ndarray],
+    bounds: Tuple[int, int, int, int],
+) -> np.ndarray:
+    normalized = _document_bounds(document, bounds)
+    if normalized is None:
+        return np.zeros((1, 1, 4), dtype=np.uint8)
+    base = _flatten_texture_editor_raster_layers_region(document, layer_pixels, normalized)
+    if not document.adjustment_layers:
+        return base
+    result = base
+    for adjustment in document.adjustment_layers:
+        mask_region = _adjustment_mask_canvas_region(document, layer_pixels, adjustment.mask_layer_id, normalized)
         result = _apply_adjustment_to_rgba(result, adjustment, mask_region=mask_region)
     return result
 
@@ -815,6 +1190,85 @@ def export_texture_editor_flattened_png(
     return save_rgba_array_png(flattened, output_path.expanduser().resolve())
 
 
+def export_texture_editor_region_png(
+    document: TextureEditorDocument,
+    layer_pixels: Dict[str, np.ndarray],
+    output_path: Path,
+    bounds: Tuple[int, int, int, int],
+    *,
+    padding: int = 0,
+    trim_transparent: bool = False,
+) -> Path:
+    normalized = _document_bounds(document, bounds)
+    if normalized is None:
+        raise ValueError("Region export bounds are empty.")
+    crop_x, crop_y, crop_width, crop_height = normalized
+    flattened = flatten_texture_editor_layers(document, layer_pixels)
+    region = flattened[crop_y:crop_y + crop_height, crop_x:crop_x + crop_width].copy()
+    if trim_transparent:
+        region = _trim_rgba_transparent_bounds(region)
+    pad_amount = max(0, int(padding))
+    if pad_amount > 0:
+        region = cv2.copyMakeBorder(
+            region,
+            pad_amount,
+            pad_amount,
+            pad_amount,
+            pad_amount,
+            cv2.BORDER_CONSTANT,
+            value=(0, 0, 0, 0),
+        )
+    return save_rgba_array_png(region, output_path.expanduser().resolve())
+
+
+def export_texture_editor_grid_slices(
+    document: TextureEditorDocument,
+    layer_pixels: Dict[str, np.ndarray],
+    output_dir: Path,
+    *,
+    cell_width: int,
+    cell_height: int,
+    padding: int = 0,
+    trim_transparent: bool = False,
+    skip_empty: bool = True,
+) -> List[Path]:
+    grid_w = max(1, int(cell_width))
+    grid_h = max(1, int(cell_height))
+    pad_amount = max(0, int(padding))
+    output_root = output_dir.expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    flattened = flatten_texture_editor_layers(document, layer_pixels)
+    exported: List[Path] = []
+    rows = int(math.ceil(float(document.height) / float(grid_h)))
+    cols = int(math.ceil(float(document.width) / float(grid_w)))
+    for row in range(rows):
+        for col in range(cols):
+            x = col * grid_w
+            y = row * grid_h
+            x1 = min(int(document.width), x + grid_w)
+            y1 = min(int(document.height), y + grid_h)
+            if x1 <= x or y1 <= y:
+                continue
+            tile = flattened[y:y1, x:x1].copy()
+            if skip_empty and not np.any(tile[..., 3] > 0):
+                continue
+            if trim_transparent:
+                tile = _trim_rgba_transparent_bounds(tile)
+            if pad_amount > 0:
+                tile = cv2.copyMakeBorder(
+                    tile,
+                    pad_amount,
+                    pad_amount,
+                    pad_amount,
+                    pad_amount,
+                    cv2.BORDER_CONSTANT,
+                    value=(0, 0, 0, 0),
+                )
+            file_name = f"{_safe_slug(document.title)}_r{row:02d}_c{col:02d}.png"
+            exported.append(save_rgba_array_png(tile, output_root / file_name))
+    return exported
+
+
 def build_texture_editor_selection_mask(
     width: int,
     height: int,
@@ -824,8 +1278,12 @@ def build_texture_editor_selection_mask(
     height = max(0, int(height))
     if width <= 0 or height <= 0 or selection.mode == "none":
         return None
-    mask = np.zeros((height, width), dtype=np.uint8)
-    if selection.mask_polygons:
+    decoded_mask = _decode_selection_mask_png(selection.mask_png_blob, width, height)
+    if decoded_mask is not None:
+        mask = decoded_mask
+    else:
+        mask = np.zeros((height, width), dtype=np.uint8)
+    if decoded_mask is None and selection.mask_polygons:
         for polygon_points in selection.mask_polygons:
             points = np.asarray(polygon_points, dtype=np.float32)
             if len(points) < 3:
@@ -852,7 +1310,7 @@ def build_texture_editor_selection_mask(
             )
             current_patch = mask[min_y:max_y, min_x:max_x]
             mask[min_y:max_y, min_x:max_x] = np.maximum(current_patch, antialiased_patch)
-    elif selection.mode == "rect" and selection.rect is not None:
+    elif decoded_mask is None and selection.mode == "rect" and selection.rect is not None:
         x, y, w, h = selection.rect
         x0 = max(0, min(width, int(x)))
         y0 = max(0, min(height, int(y)))
@@ -860,7 +1318,7 @@ def build_texture_editor_selection_mask(
         y1 = max(y0, min(height, int(y + h)))
         if x1 > x0 and y1 > y0:
             mask[y0:y1, x0:x1] = 255
-    elif selection.mode == "lasso" and selection.polygon_points:
+    elif decoded_mask is None and selection.mode == "lasso" and selection.polygon_points:
         points = np.asarray(selection.polygon_points, dtype=np.float32)
         if len(points) >= 3:
             scale_factor = 4
@@ -1026,6 +1484,752 @@ def shrink_texture_editor_selection(
     )
 
 
+def apply_texture_editor_selection_to_layer_mask(
+    document: TextureEditorDocument,
+    layer_pixels: Dict[str, np.ndarray],
+    layer_id: str,
+) -> Tuple[TextureEditorDocument, Dict[str, np.ndarray], Optional[str]]:
+    selection_mask = build_texture_editor_selection_mask(document.width, document.height, document.selection)
+    if selection_mask is None or not np.any(selection_mask > 0):
+        return document, layer_pixels, None
+    layer = next((candidate for candidate in document.layers if candidate.layer_id == layer_id), None)
+    pixels = layer_pixels.get(layer_id)
+    if layer is None or pixels is None:
+        return document, layer_pixels, None
+    updated_document, updated_pixels, mask_layer_id = create_texture_editor_layer_mask(document, layer_pixels, layer_id)
+    if not mask_layer_id:
+        return document, layer_pixels, None
+    updated_layer = next((candidate for candidate in updated_document.layers if candidate.layer_id == layer_id), None)
+    if updated_layer is None:
+        return document, layer_pixels, None
+    mask_pixels = np.zeros_like(updated_pixels.get(mask_layer_id, pixels), dtype=np.uint8)
+    intersection = _layer_canvas_intersection(updated_layer, pixels, document)
+    if intersection is not None:
+        dx0, dy0, dx1, dy1, sx0, sy0, sx1, sy1 = intersection
+        local_selection = selection_mask[dy0:dy1, dx0:dx1]
+        if local_selection.shape[:2] == (sy1 - sy0, sx1 - sx0):
+            mask_pixels[sy0:sy1, sx0:sx1, 0] = local_selection
+            mask_pixels[sy0:sy1, sx0:sx1, 1] = local_selection
+            mask_pixels[sy0:sy1, sx0:sx1, 2] = local_selection
+            mask_pixels[sy0:sy1, sx0:sx1, 3] = local_selection
+    updated_pixels[mask_layer_id] = mask_pixels
+    updated_document = bump_texture_editor_layer_revision(updated_document, layer_id)
+    return updated_document, updated_pixels, mask_layer_id
+
+
+def load_texture_editor_layer_mask_as_selection(
+    document: TextureEditorDocument,
+    layer_pixels: Dict[str, np.ndarray],
+    layer_id: str,
+    *,
+    combine_mode: str = "replace",
+) -> TextureEditorDocument:
+    layer = next((candidate for candidate in document.layers if candidate.layer_id == layer_id), None)
+    pixels = layer_pixels.get(layer_id)
+    if layer is None or pixels is None or not layer.mask_layer_id:
+        return document
+    mask_pixels = layer_pixels.get(layer.mask_layer_id)
+    if mask_pixels is None:
+        return document
+    canvas_mask = np.zeros((document.height, document.width), dtype=np.uint8)
+    intersection = _layer_canvas_intersection(layer, pixels, document)
+    if intersection is None:
+        return document
+    dx0, dy0, dx1, dy1, sx0, sy0, sx1, sy1 = intersection
+    mask_region = mask_pixels[sy0:sy1, sx0:sx1]
+    if mask_region.shape[:2] != (dy1 - dy0, dx1 - dx0):
+        return document
+    canvas_mask[dy0:dy1, dx0:dx1] = mask_region[..., 3]
+    existing = build_texture_editor_selection_mask(document.width, document.height, document.selection)
+    combined = _combine_selection_masks(existing, canvas_mask, combine_mode=combine_mode)
+    return dataclasses.replace(
+        document,
+        selection=_selection_from_mask(
+            combined,
+            feather_radius=max(0, int(document.selection.feather_radius)),
+        ),
+    )
+
+
+def extract_texture_editor_layer_channel_to_rgba(
+    pixels: np.ndarray,
+    channel_key: str,
+) -> np.ndarray:
+    rgba = np.asarray(pixels, dtype=np.uint8)
+    key = (channel_key or "alpha").strip().lower()
+    channel_index = {
+        "red": 0,
+        "green": 1,
+        "blue": 2,
+        "alpha": 3,
+    }.get(key, 3)
+    channel = rgba[..., channel_index]
+    extracted = np.stack(
+        [channel, channel, channel, np.full_like(channel, 255, dtype=np.uint8)],
+        axis=-1,
+    )
+    return np.ascontiguousarray(extracted, dtype=np.uint8)
+
+
+def write_texture_editor_layer_luma_to_channel(
+    pixels: np.ndarray,
+    channel_key: str,
+) -> np.ndarray:
+    rgba = np.asarray(pixels, dtype=np.uint8)
+    updated = rgba.copy()
+    luma = np.clip(
+        np.round(
+            (rgba[..., 0].astype(np.float32) * 0.299)
+            + (rgba[..., 1].astype(np.float32) * 0.587)
+            + (rgba[..., 2].astype(np.float32) * 0.114)
+        ),
+        0.0,
+        255.0,
+    ).astype(np.uint8)
+    channel_index = {
+        "red": 0,
+        "green": 1,
+        "blue": 2,
+        "alpha": 3,
+    }.get((channel_key or "alpha").strip().lower(), 3)
+    updated[..., channel_index] = luma
+    return updated
+
+
+def copy_texture_editor_layer_channel(
+    pixels: np.ndarray,
+    channel_key: str,
+) -> np.ndarray:
+    rgba = np.asarray(pixels, dtype=np.uint8)
+    channel_index = {
+        "red": 0,
+        "green": 1,
+        "blue": 2,
+        "alpha": 3,
+    }.get((channel_key or "alpha").strip().lower(), 3)
+    return np.ascontiguousarray(rgba[..., channel_index].copy(), dtype=np.uint8)
+
+
+def paste_texture_editor_channel_into_layer(
+    pixels: np.ndarray,
+    channel_key: str,
+    channel_data: np.ndarray,
+) -> np.ndarray:
+    rgba = np.asarray(pixels, dtype=np.uint8)
+    updated = rgba.copy()
+    incoming = np.asarray(channel_data, dtype=np.uint8)
+    if incoming.ndim == 3:
+        incoming = incoming[..., 0]
+    if incoming.shape[:2] != rgba.shape[:2]:
+        incoming = _resize_array(incoming, rgba.shape[1], rgba.shape[0], nearest=False)
+        if incoming.ndim == 3:
+            incoming = incoming[..., 0]
+    channel_index = {
+        "red": 0,
+        "green": 1,
+        "blue": 2,
+        "alpha": 3,
+    }.get((channel_key or "alpha").strip().lower(), 3)
+    updated[..., channel_index] = np.asarray(incoming, dtype=np.uint8)
+    return updated
+
+
+def swap_texture_editor_layer_channels(
+    pixels: np.ndarray,
+    channel_a: str,
+    channel_b: str,
+) -> np.ndarray:
+    rgba = np.asarray(pixels, dtype=np.uint8)
+    updated = rgba.copy()
+    index_a = {
+        "red": 0,
+        "green": 1,
+        "blue": 2,
+        "alpha": 3,
+    }.get((channel_a or "red").strip().lower(), 0)
+    index_b = {
+        "red": 0,
+        "green": 1,
+        "blue": 2,
+        "alpha": 3,
+    }.get((channel_b or "blue").strip().lower(), 2)
+    if index_a == index_b:
+        return updated
+    temp = updated[..., index_a].copy()
+    updated[..., index_a] = updated[..., index_b]
+    updated[..., index_b] = temp
+    return updated
+
+
+def apply_texture_editor_selection_stroke(
+    document: TextureEditorDocument,
+    tool_settings: TextureEditorToolSettings,
+    points: Sequence[Tuple[int, int]],
+) -> TextureEditorDocument:
+    mask = build_texture_editor_selection_mask(document.width, document.height, document.selection)
+    if mask is None:
+        mask = np.zeros((max(1, document.height), max(1, document.width)), dtype=np.uint8)
+    updated_mask = np.asarray(mask, dtype=np.uint8).copy()
+    effective_size = _effective_brush_size(tool_settings)
+    spacing = max(1, int(round(effective_size * max(0.05, tool_settings.spacing / 100.0))))
+    stroke_points = _interpolate_stroke(points, spacing, smoothing=max(0, int(getattr(tool_settings, "smoothing", 0))))
+    if not stroke_points:
+        return document
+    stroke_points = _expand_stroke_points_for_symmetry(
+        stroke_points,
+        document.width,
+        document.height,
+        getattr(tool_settings, "symmetry_mode", "off"),
+    )
+    strength_percent = max(0, min(100, int(round(tool_settings.opacity * max(0.05, tool_settings.flow / 100.0)))))
+    stamp = _build_effective_brush_stamp(tool_settings, size=effective_size, strength_percent=strength_percent)
+    for point in stroke_points:
+        clipped = _clip_stamp_region((int(point[0]), int(point[1])), stamp, document.width, document.height)
+        if clipped is None:
+            continue
+        (x0, y0, x1, y1), (sx0, sy0, sx1, sy1) = clipped
+        stamp_alpha = stamp[sy0:sy1, sx0:sx1]
+        if not np.any(stamp_alpha):
+            continue
+        region = updated_mask[y0:y1, x0:x1].astype(np.float32) / 255.0
+        if tool_settings.tool == "erase":
+            region = region * (1.0 - stamp_alpha)
+        else:
+            region = np.maximum(region, stamp_alpha)
+        updated_mask[y0:y1, x0:x1] = np.clip(np.round(region * 255.0), 0.0, 255.0).astype(np.uint8)
+    return dataclasses.replace(
+        document,
+        selection=_selection_from_mask(
+            updated_mask,
+            feather_radius=max(0, int(document.selection.feather_radius)),
+        ),
+        quick_mask_enabled=True,
+        composite_revision=int(document.composite_revision) + 1,
+    )
+
+
+def apply_texture_editor_selection_fill(
+    document: TextureEditorDocument,
+    tool_settings: TextureEditorToolSettings,
+    point: Tuple[int, int],
+) -> TextureEditorDocument:
+    width = max(1, int(document.width))
+    height = max(1, int(document.height))
+    x = max(0, min(width - 1, int(point[0])))
+    y = max(0, min(height - 1, int(point[1])))
+    mask = build_texture_editor_selection_mask(width, height, document.selection)
+    if mask is None:
+        mask = np.zeros((height, width), dtype=np.uint8)
+    updated_mask = np.asarray(mask, dtype=np.uint8).copy()
+    fill_value = 0 if tool_settings.tool == "erase" else 255
+    tolerance = max(0, min(255, int(getattr(tool_settings, "fill_tolerance", 24))))
+    flags = 4 if bool(getattr(tool_settings, "fill_contiguous", True)) else 8
+    working = updated_mask.copy()
+    cv2.floodFill(
+        working,
+        None,
+        (x, y),
+        int(fill_value),
+        loDiff=int(tolerance),
+        upDiff=int(tolerance),
+        flags=flags,
+    )
+    return dataclasses.replace(
+        document,
+        selection=_selection_from_mask(
+            working,
+            feather_radius=max(0, int(document.selection.feather_radius)),
+        ),
+        quick_mask_enabled=True,
+        composite_revision=int(document.composite_revision) + 1,
+    )
+
+
+def load_texture_editor_layer_channel_as_selection(
+    document: TextureEditorDocument,
+    layer: TextureEditorLayer,
+    pixels: np.ndarray,
+    channel_key: str,
+    *,
+    mask_pixels: Optional[np.ndarray] = None,
+    combine_mode: str = "replace",
+) -> TextureEditorDocument:
+    rgba = np.asarray(pixels, dtype=np.uint8)
+    if rgba.ndim != 3 or rgba.shape[2] < 4:
+        return document
+    channel_index = {
+        "red": 0,
+        "green": 1,
+        "blue": 2,
+        "alpha": 3,
+    }.get((channel_key or "alpha").strip().lower(), 3)
+    canvas_mask = np.zeros((max(1, document.height), max(1, document.width)), dtype=np.uint8)
+    intersection = _layer_canvas_intersection(layer, rgba, document)
+    if intersection is None:
+        return document
+    dx0, dy0, dx1, dy1, sx0, sy0, sx1, sy1 = intersection
+    channel_patch = rgba[sy0:sy1, sx0:sx1, channel_index].astype(np.uint8)
+    if mask_pixels is not None and mask_pixels.shape[:2] == rgba.shape[:2]:
+        channel_patch = np.clip(
+            np.round(
+                channel_patch.astype(np.float32)
+                * (mask_pixels[sy0:sy1, sx0:sx1, 3].astype(np.float32) / 255.0)
+            ),
+            0.0,
+            255.0,
+        ).astype(np.uint8)
+    canvas_mask[dy0:dy1, dx0:dx1] = np.maximum(canvas_mask[dy0:dy1, dx0:dx1], channel_patch)
+    existing = build_texture_editor_selection_mask(document.width, document.height, document.selection)
+    combined = _combine_selection_masks(existing, canvas_mask, combine_mode=combine_mode)
+    return dataclasses.replace(
+        document,
+        selection=_selection_from_mask(
+            combined,
+            feather_radius=max(0, int(document.selection.feather_radius)),
+        ),
+        composite_revision=int(document.composite_revision) + 1,
+    )
+
+
+def write_texture_editor_selection_to_layer_channel(
+    document: TextureEditorDocument,
+    layer: TextureEditorLayer,
+    pixels: np.ndarray,
+    channel_key: str,
+) -> np.ndarray:
+    selection_mask = build_texture_editor_selection_mask(document.width, document.height, document.selection)
+    if selection_mask is None or not np.any(selection_mask > 0):
+        return pixels
+    rgba = np.asarray(pixels, dtype=np.uint8)
+    updated = rgba.copy()
+    channel_index = {
+        "red": 0,
+        "green": 1,
+        "blue": 2,
+        "alpha": 3,
+    }.get((channel_key or "alpha").strip().lower(), 3)
+    intersection = _layer_canvas_intersection(layer, rgba, document)
+    if intersection is None:
+        return updated
+    dx0, dy0, dx1, dy1, sx0, sy0, sx1, sy1 = intersection
+    selection_patch = selection_mask[dy0:dy1, dx0:dx1]
+    updated[sy0:sy1, sx0:sx1, channel_index] = selection_patch.astype(np.uint8)
+    return updated
+
+
+def _blank_texture_editor_layer(
+    document: TextureEditorDocument,
+) -> Tuple[TextureEditorLayer, np.ndarray]:
+    layer_id = _new_layer_id()
+    layer = TextureEditorLayer(
+        layer_id=layer_id,
+        name="Base Layer",
+        relative_png_path="layers/base_layer.png",
+        visible=True,
+        opacity=100,
+        blend_mode="normal",
+        offset_x=0,
+        offset_y=0,
+        revision=0,
+        thumbnail_cache_key=uuid.uuid4().hex,
+    )
+    pixels = np.zeros((max(1, document.height), max(1, document.width), 4), dtype=np.uint8)
+    return layer, pixels
+
+
+def crop_texture_editor_document_to_bounds(
+    document: TextureEditorDocument,
+    layer_pixels: Dict[str, np.ndarray],
+    bounds: Tuple[int, int, int, int],
+) -> Tuple[TextureEditorDocument, Dict[str, np.ndarray]]:
+    crop_x = max(0, min(document.width, int(bounds[0])))
+    crop_y = max(0, min(document.height, int(bounds[1])))
+    crop_w = max(0, int(bounds[2]))
+    crop_h = max(0, int(bounds[3]))
+    crop_x1 = min(document.width, crop_x + crop_w)
+    crop_y1 = min(document.height, crop_y + crop_h)
+    if crop_x1 <= crop_x or crop_y1 <= crop_y:
+        return document, layer_pixels
+    new_width = crop_x1 - crop_x
+    new_height = crop_y1 - crop_y
+    new_pixels: Dict[str, np.ndarray] = {}
+    new_layers: List[TextureEditorLayer] = []
+    for layer in document.layers:
+        pixels = layer_pixels.get(layer.layer_id)
+        if pixels is None:
+            continue
+        intersection = _layer_canvas_intersection(layer, pixels, document)
+        if intersection is None:
+            continue
+        dx0, dy0, dx1, dy1, sx0, sy0, sx1, sy1 = intersection
+        region_x0 = max(dx0, crop_x)
+        region_y0 = max(dy0, crop_y)
+        region_x1 = min(dx1, crop_x1)
+        region_y1 = min(dy1, crop_y1)
+        if region_x1 <= region_x0 or region_y1 <= region_y0:
+            continue
+        local_x0 = sx0 + (region_x0 - dx0)
+        local_y0 = sy0 + (region_y0 - dy0)
+        local_x1 = local_x0 + (region_x1 - region_x0)
+        local_y1 = local_y0 + (region_y1 - region_y0)
+        cropped_pixels = pixels[local_y0:local_y1, local_x0:local_x1].copy()
+        if cropped_pixels.size == 0:
+            continue
+        next_mask_id = layer.mask_layer_id if layer.mask_layer_id in layer_pixels else ""
+        if next_mask_id:
+            mask_pixels = layer_pixels.get(next_mask_id)
+            if mask_pixels is not None and mask_pixels.shape[:2] == pixels.shape[:2]:
+                cropped_mask = mask_pixels[local_y0:local_y1, local_x0:local_x1].copy()
+                if cropped_mask.size > 0:
+                    new_pixels[next_mask_id] = cropped_mask
+                else:
+                    next_mask_id = ""
+            else:
+                next_mask_id = ""
+        new_pixels[layer.layer_id] = cropped_pixels
+        new_layers.append(
+            dataclasses.replace(
+                layer,
+                offset_x=int(region_x0 - crop_x),
+                offset_y=int(region_y0 - crop_y),
+                mask_layer_id=next_mask_id,
+                revision=int(layer.revision) + 1,
+                thumbnail_cache_key=uuid.uuid4().hex,
+            )
+        )
+    cropped_selection = build_texture_editor_selection_mask(document.width, document.height, document.selection)
+    next_selection = TextureEditorSelection(inverted=False, feather_radius=max(0, int(document.selection.feather_radius)))
+    if cropped_selection is not None:
+        next_selection = _selection_from_mask(
+            cropped_selection[crop_y:crop_y1, crop_x:crop_x1],
+            feather_radius=max(0, int(document.selection.feather_radius)),
+        )
+    if not new_layers:
+        blank_document = dataclasses.replace(document, width=new_width, height=new_height)
+        blank_layer, blank_pixels = _blank_texture_editor_layer(blank_document)
+        new_layers = [blank_layer]
+        new_pixels = {blank_layer.layer_id: blank_pixels}
+    available_auxiliary_ids = set(new_pixels.keys())
+    updated_adjustments = tuple(
+        dataclasses.replace(
+            adjustment,
+            mask_layer_id=adjustment.mask_layer_id if adjustment.mask_layer_id in available_auxiliary_ids else "",
+            revision=int(adjustment.revision) + (0 if not adjustment.mask_layer_id or adjustment.mask_layer_id in available_auxiliary_ids else 1),
+        )
+        for adjustment in document.adjustment_layers
+    )
+    active_layer_id = document.active_layer_id if any(layer.layer_id == document.active_layer_id for layer in new_layers) else new_layers[-1].layer_id
+    updated_document = dataclasses.replace(
+        document,
+        width=new_width,
+        height=new_height,
+        active_layer_id=active_layer_id,
+        layers=tuple(new_layers),
+        selection=next_selection,
+        floating_selection=None,
+        adjustment_layers=updated_adjustments,
+        composite_revision=int(document.composite_revision) + 1,
+    )
+    return updated_document, new_pixels
+
+
+def crop_texture_editor_document_to_selection(
+    document: TextureEditorDocument,
+    layer_pixels: Dict[str, np.ndarray],
+) -> Tuple[TextureEditorDocument, Dict[str, np.ndarray]]:
+    selection_mask = build_texture_editor_selection_mask(document.width, document.height, document.selection)
+    if selection_mask is None or not np.any(selection_mask > 0):
+        return document, layer_pixels
+    ys, xs = np.where(selection_mask > 0)
+    if xs.size == 0 or ys.size == 0:
+        return document, layer_pixels
+    bounds = (int(xs.min()), int(ys.min()), int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1))
+    return crop_texture_editor_document_to_bounds(document, layer_pixels, bounds)
+
+
+def trim_texture_editor_document_transparent_bounds(
+    document: TextureEditorDocument,
+    layer_pixels: Dict[str, np.ndarray],
+) -> Tuple[TextureEditorDocument, Dict[str, np.ndarray]]:
+    flattened = flatten_texture_editor_layers(document, layer_pixels)
+    alpha = flattened[..., 3]
+    ys, xs = np.where(alpha > 0)
+    if xs.size == 0 or ys.size == 0:
+        return document, layer_pixels
+    bounds = (int(xs.min()), int(ys.min()), int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1))
+    return crop_texture_editor_document_to_bounds(document, layer_pixels, bounds)
+
+
+def flip_texture_editor_document(
+    document: TextureEditorDocument,
+    layer_pixels: Dict[str, np.ndarray],
+    *,
+    horizontal: bool,
+    vertical: bool,
+) -> Tuple[TextureEditorDocument, Dict[str, np.ndarray]]:
+    if not horizontal and not vertical:
+        return document, layer_pixels
+    new_pixels = dict(layer_pixels)
+    new_layers: List[TextureEditorLayer] = []
+    for layer in document.layers:
+        pixels = layer_pixels.get(layer.layer_id)
+        if pixels is None:
+            continue
+        transformed = pixels.copy()
+        if horizontal:
+            transformed = np.ascontiguousarray(np.flip(transformed, axis=1))
+        if vertical:
+            transformed = np.ascontiguousarray(np.flip(transformed, axis=0))
+        new_pixels[layer.layer_id] = transformed
+        next_offset_x = int(document.width - layer.offset_x - pixels.shape[1]) if horizontal else int(layer.offset_x)
+        next_offset_y = int(document.height - layer.offset_y - pixels.shape[0]) if vertical else int(layer.offset_y)
+        if layer.mask_layer_id and layer.mask_layer_id in layer_pixels:
+            mask_pixels = layer_pixels[layer.mask_layer_id]
+            transformed_mask = mask_pixels.copy()
+            if horizontal:
+                transformed_mask = np.ascontiguousarray(np.flip(transformed_mask, axis=1))
+            if vertical:
+                transformed_mask = np.ascontiguousarray(np.flip(transformed_mask, axis=0))
+            new_pixels[layer.mask_layer_id] = transformed_mask
+        new_layers.append(
+            dataclasses.replace(
+                layer,
+                offset_x=next_offset_x,
+                offset_y=next_offset_y,
+                revision=int(layer.revision) + 1,
+                thumbnail_cache_key=uuid.uuid4().hex,
+            )
+        )
+    selection_mask = build_texture_editor_selection_mask(document.width, document.height, document.selection)
+    if selection_mask is not None:
+        if horizontal:
+            selection_mask = np.ascontiguousarray(np.flip(selection_mask, axis=1))
+        if vertical:
+            selection_mask = np.ascontiguousarray(np.flip(selection_mask, axis=0))
+        next_selection = _selection_from_mask(
+            selection_mask,
+            feather_radius=max(0, int(document.selection.feather_radius)),
+        )
+    else:
+        next_selection = TextureEditorSelection(inverted=False, feather_radius=max(0, int(document.selection.feather_radius)))
+    updated_document = dataclasses.replace(
+        document,
+        layers=tuple(new_layers),
+        selection=next_selection,
+        composite_revision=int(document.composite_revision) + 1,
+    )
+    return updated_document, new_pixels
+
+
+def rotate_texture_editor_document_90(
+    document: TextureEditorDocument,
+    layer_pixels: Dict[str, np.ndarray],
+    *,
+    clockwise: bool,
+) -> Tuple[TextureEditorDocument, Dict[str, np.ndarray]]:
+    new_width = int(document.height)
+    new_height = int(document.width)
+    rotation_k = 3 if clockwise else 1
+    new_pixels = dict(layer_pixels)
+    new_layers: List[TextureEditorLayer] = []
+    for layer in document.layers:
+        pixels = layer_pixels.get(layer.layer_id)
+        if pixels is None:
+            continue
+        rotated = np.ascontiguousarray(np.rot90(pixels, rotation_k))
+        new_pixels[layer.layer_id] = rotated
+        old_h, old_w = pixels.shape[:2]
+        if clockwise:
+            next_offset_x = int(document.height - layer.offset_y - old_h)
+            next_offset_y = int(layer.offset_x)
+        else:
+            next_offset_x = int(layer.offset_y)
+            next_offset_y = int(document.width - layer.offset_x - old_w)
+        if layer.mask_layer_id and layer.mask_layer_id in layer_pixels:
+            mask_pixels = layer_pixels[layer.mask_layer_id]
+            new_pixels[layer.mask_layer_id] = np.ascontiguousarray(np.rot90(mask_pixels, rotation_k))
+        new_layers.append(
+            dataclasses.replace(
+                layer,
+                offset_x=next_offset_x,
+                offset_y=next_offset_y,
+                revision=int(layer.revision) + 1,
+                thumbnail_cache_key=uuid.uuid4().hex,
+            )
+        )
+    selection_mask = build_texture_editor_selection_mask(document.width, document.height, document.selection)
+    if selection_mask is not None:
+        selection_mask = np.ascontiguousarray(np.rot90(selection_mask, rotation_k))
+        next_selection = _selection_from_mask(
+            selection_mask,
+            feather_radius=max(0, int(document.selection.feather_radius)),
+        )
+    else:
+        next_selection = TextureEditorSelection(inverted=False, feather_radius=max(0, int(document.selection.feather_radius)))
+    updated_document = dataclasses.replace(
+        document,
+        width=new_width,
+        height=new_height,
+        layers=tuple(new_layers),
+        selection=next_selection,
+        composite_revision=int(document.composite_revision) + 1,
+    )
+    return updated_document, new_pixels
+
+
+def resize_texture_editor_document_image(
+    document: TextureEditorDocument,
+    layer_pixels: Dict[str, np.ndarray],
+    new_width: int,
+    new_height: int,
+) -> Tuple[TextureEditorDocument, Dict[str, np.ndarray]]:
+    target_width = max(1, int(new_width))
+    target_height = max(1, int(new_height))
+    if target_width == int(document.width) and target_height == int(document.height):
+        return document, layer_pixels
+    scale_x = float(target_width) / max(1.0, float(document.width))
+    scale_y = float(target_height) / max(1.0, float(document.height))
+    new_pixels: Dict[str, np.ndarray] = {}
+    new_layers: List[TextureEditorLayer] = []
+    resized_mask_ids: set[str] = set()
+    for layer in document.layers:
+        pixels = layer_pixels.get(layer.layer_id)
+        if pixels is None:
+            continue
+        resized = _resize_array(
+            pixels,
+            max(1, int(round(pixels.shape[1] * scale_x))),
+            max(1, int(round(pixels.shape[0] * scale_y))),
+        )
+        new_pixels[layer.layer_id] = resized
+        next_mask_id = layer.mask_layer_id if layer.mask_layer_id in layer_pixels else ""
+        if next_mask_id and next_mask_id not in resized_mask_ids:
+            mask_pixels = layer_pixels[next_mask_id]
+            new_pixels[next_mask_id] = _resize_array(
+                mask_pixels,
+                max(1, int(round(mask_pixels.shape[1] * scale_x))),
+                max(1, int(round(mask_pixels.shape[0] * scale_y))),
+            )
+            resized_mask_ids.add(next_mask_id)
+        new_layers.append(
+            dataclasses.replace(
+                layer,
+                offset_x=int(round(layer.offset_x * scale_x)),
+                offset_y=int(round(layer.offset_y * scale_y)),
+                revision=int(layer.revision) + 1,
+                thumbnail_cache_key=uuid.uuid4().hex,
+            )
+        )
+    selection_mask = build_texture_editor_selection_mask(document.width, document.height, document.selection)
+    if selection_mask is not None:
+        resized_selection = _resize_array(selection_mask, target_width, target_height, nearest=False)
+        next_selection = _selection_from_mask(
+            resized_selection,
+            feather_radius=max(0, int(document.selection.feather_radius)),
+        )
+    else:
+        next_selection = TextureEditorSelection(inverted=False, feather_radius=max(0, int(document.selection.feather_radius)))
+    next_floating = document.floating_selection
+    if next_floating is not None:
+        bounds = next_floating.bounds
+        next_floating = dataclasses.replace(
+            next_floating,
+            bounds=(
+                int(round(bounds[0] * scale_x)),
+                int(round(bounds[1] * scale_y)),
+                max(1, int(round(bounds[2] * scale_x))),
+                max(1, int(round(bounds[3] * scale_y))),
+            ),
+            offset_x=int(round(next_floating.offset_x * scale_x)),
+            offset_y=int(round(next_floating.offset_y * scale_y)),
+        )
+    updated_document = dataclasses.replace(
+        document,
+        width=target_width,
+        height=target_height,
+        layers=tuple(new_layers),
+        selection=next_selection,
+        floating_selection=next_floating,
+        composite_revision=int(document.composite_revision) + 1,
+    )
+    return updated_document, new_pixels
+
+
+def resize_texture_editor_document_canvas(
+    document: TextureEditorDocument,
+    layer_pixels: Dict[str, np.ndarray],
+    new_width: int,
+    new_height: int,
+    *,
+    anchor: str = "top_left",
+) -> Tuple[TextureEditorDocument, Dict[str, np.ndarray]]:
+    target_width = max(1, int(new_width))
+    target_height = max(1, int(new_height))
+    if target_width == int(document.width) and target_height == int(document.height):
+        return document, layer_pixels
+    anchor_key = (anchor or "top_left").strip().lower()
+    if anchor_key == "center":
+        delta_x = int(round((target_width - int(document.width)) / 2.0))
+        delta_y = int(round((target_height - int(document.height)) / 2.0))
+    else:
+        delta_x = 0
+        delta_y = 0
+    new_layers = tuple(
+        dataclasses.replace(
+            layer,
+            offset_x=int(layer.offset_x + delta_x),
+            offset_y=int(layer.offset_y + delta_y),
+            revision=int(layer.revision) + 1,
+            thumbnail_cache_key=uuid.uuid4().hex,
+        )
+        for layer in document.layers
+    )
+    selection_mask = build_texture_editor_selection_mask(document.width, document.height, document.selection)
+    if selection_mask is not None:
+        next_mask = np.zeros((target_height, target_width), dtype=np.uint8)
+        src_x0 = max(0, -delta_x)
+        src_y0 = max(0, -delta_y)
+        dst_x0 = max(0, delta_x)
+        dst_y0 = max(0, delta_y)
+        copy_width = min(int(document.width) - src_x0, target_width - dst_x0)
+        copy_height = min(int(document.height) - src_y0, target_height - dst_y0)
+        if copy_width > 0 and copy_height > 0:
+            next_mask[dst_y0:dst_y0 + copy_height, dst_x0:dst_x0 + copy_width] = selection_mask[
+                src_y0:src_y0 + copy_height,
+                src_x0:src_x0 + copy_width,
+            ]
+        next_selection = _selection_from_mask(
+            next_mask,
+            feather_radius=max(0, int(document.selection.feather_radius)),
+        )
+    else:
+        next_selection = TextureEditorSelection(inverted=False, feather_radius=max(0, int(document.selection.feather_radius)))
+    next_floating = document.floating_selection
+    if next_floating is not None:
+        bounds = next_floating.bounds
+        next_floating = dataclasses.replace(
+            next_floating,
+            bounds=(
+                int(bounds[0] + delta_x),
+                int(bounds[1] + delta_y),
+                int(bounds[2]),
+                int(bounds[3]),
+            ),
+            offset_x=int(next_floating.offset_x + delta_x),
+            offset_y=int(next_floating.offset_y + delta_y),
+        )
+    updated_document = dataclasses.replace(
+        document,
+        width=target_width,
+        height=target_height,
+        layers=new_layers,
+        selection=next_selection,
+        floating_selection=next_floating,
+        composite_revision=int(document.composite_revision) + 1,
+    )
+    return updated_document, dict(layer_pixels)
+
+
 def snap_lasso_points_to_edges(
     rgba_image: np.ndarray,
     polygon_points: Sequence[Tuple[float, float]],
@@ -1137,6 +2341,40 @@ def _build_brush_stamp(
         stamp *= modulation
     stamp *= max(0.0, min(1.0, strength_percent / 100.0))
     return np.clip(stamp, 0.0, 1.0)
+
+
+def _build_effective_brush_stamp(
+    tool_settings: TextureEditorToolSettings,
+    *,
+    size: float,
+    strength_percent: int,
+) -> np.ndarray:
+    brush_tip = str(getattr(tool_settings, "brush_tip", "round") or "round")
+    if brush_tip == "image_stamp":
+        custom_path = str(getattr(tool_settings, "custom_brush_tip_path", "") or "").strip()
+        stamp = _build_custom_brush_stamp(
+            custom_path,
+            size,
+            strength_percent,
+            roundness=max(10, min(100, int(getattr(tool_settings, "roundness", 100)))),
+            angle_degrees=int(getattr(tool_settings, "angle_degrees", 0)),
+            hardness=max(0, min(100, int(getattr(tool_settings, "hardness", 100)))),
+        )
+        if stamp is not None:
+            return stamp
+        brush_tip = "round"
+    brush_pattern = getattr(tool_settings, "brush_pattern", "solid")
+    if getattr(tool_settings, "tool", "") not in {"paint", "erase", "clone", "heal", "smudge", "dodge_burn"}:
+        brush_pattern = "solid"
+    return _build_brush_stamp(
+        size,
+        max(0, min(100, int(getattr(tool_settings, "hardness", 100)))),
+        strength_percent,
+        brush_tip,
+        brush_pattern,
+        max(10, min(100, int(getattr(tool_settings, "roundness", 100)))),
+        int(getattr(tool_settings, "angle_degrees", 0)),
+    )
 
 
 def _interpolate_stroke(
@@ -1380,19 +2618,15 @@ def apply_texture_editor_stroke(
     stroke_points = _interpolate_stroke(points, spacing, smoothing=max(0, int(getattr(tool_settings, "smoothing", 0))))
     if not stroke_points:
         return updated
+    if tool_settings.tool in {"paint", "erase", "sharpen", "soften", "smudge", "dodge_burn"}:
+        stroke_points = _expand_stroke_points_for_symmetry(
+            stroke_points,
+            document.width,
+            document.height,
+            getattr(tool_settings, "symmetry_mode", "off"),
+        )
     strength_percent = max(0, min(100, int(round(tool_settings.opacity * max(0.05, tool_settings.flow / 100.0)))))
-    brush_pattern = getattr(tool_settings, "brush_pattern", "solid")
-    if tool_settings.tool not in {"paint", "erase", "clone", "heal", "smudge", "dodge_burn"}:
-        brush_pattern = "solid"
-    stamp = _build_brush_stamp(
-        effective_size,
-        max(0, min(100, tool_settings.hardness)),
-        strength_percent,
-        getattr(tool_settings, "brush_tip", "round"),
-        brush_pattern,
-        max(10, min(100, int(getattr(tool_settings, "roundness", 100)))),
-        int(getattr(tool_settings, "angle_degrees", 0)),
-    )
+    stamp = _build_effective_brush_stamp(tool_settings, size=effective_size, strength_percent=strength_percent)
     color_rgb = _parse_hex_rgb(tool_settings.color_hex)
     if tool_settings.tool in {"clone", "heal"} and source_snapshot is None:
         return updated
@@ -1873,6 +3107,12 @@ def extract_texture_editor_selection(
     max_x = int(xs.max()) + 1
     max_y = int(ys.max()) + 1
     local_pixels = pixels[sy0 + min_y:sy0 + max_y, sx0 + min_x:sx0 + max_x].copy()
+    if layer.mask_layer_id and layer.mask_enabled:
+        mask_pixels = layer_pixels.get(layer.mask_layer_id)
+        if mask_pixels is not None:
+            local_mask = mask_pixels[sy0 + min_y:sy0 + max_y, sx0 + min_x:sx0 + max_x]
+            if local_mask.shape[:2] == local_pixels.shape[:2]:
+                local_pixels = _apply_mask_to_src_region(local_pixels, local_mask)
     local_alpha = np.clip(layer_selection[min_y:max_y, min_x:max_x].astype(np.float32) / 255.0, 0.0, 1.0)[..., None]
     extracted = np.clip(np.round(local_pixels.astype(np.float32) * local_alpha), 0, 255).astype(np.uint8)
     return extracted, (dx0 + min_x, dy0 + min_y, max_x - min_x, max_y - min_y)
@@ -1977,18 +3217,20 @@ def merge_texture_editor_layer_down(
     bottom_pixels = layer_pixels.get(bottom_layer.layer_id)
     if top_pixels is None or bottom_pixels is None:
         return document, layer_pixels
+    merge_pixels = {
+        bottom_layer.layer_id: bottom_pixels,
+        top_layer.layer_id: top_pixels,
+    }
+    for auxiliary_id in (bottom_layer.mask_layer_id, top_layer.mask_layer_id):
+        if auxiliary_id and auxiliary_id in layer_pixels:
+            merge_pixels[auxiliary_id] = layer_pixels[auxiliary_id]
     merge_document = dataclasses.replace(
         document,
         layers=(bottom_layer, top_layer),
         active_layer_id=bottom_layer.layer_id,
+        adjustment_layers=(),
     )
-    merged_pixels = flatten_texture_editor_layers(
-        merge_document,
-        {
-            bottom_layer.layer_id: bottom_pixels,
-            top_layer.layer_id: top_pixels,
-        },
-    )
+    merged_pixels = _flatten_texture_editor_raster_layers(merge_document, merge_pixels)
     new_pixels = dict(layer_pixels)
     new_pixels[bottom_layer.layer_id] = merged_pixels
     new_pixels.pop(top_layer.layer_id, None)
@@ -1998,11 +3240,32 @@ def merge_texture_editor_layer_down(
         offset_y=0,
         opacity=100,
         blend_mode="normal",
+        mask_layer_id="",
+        mask_enabled=True,
         revision=int(bottom_layer.revision) + 1,
         thumbnail_cache_key=uuid.uuid4().hex,
     )
     del layers[current_index]
-    return dataclasses.replace(document, layers=tuple(layers), active_layer_id=bottom_layer.layer_id), new_pixels
+    updated_document = dataclasses.replace(
+        document,
+        layers=tuple(layers),
+        active_layer_id=bottom_layer.layer_id,
+        composite_revision=int(document.composite_revision) + 1,
+    )
+    referenced_auxiliary_ids = {
+        layer.mask_layer_id
+        for layer in updated_document.layers
+        if layer.mask_layer_id
+    }
+    referenced_auxiliary_ids.update(
+        adjustment.mask_layer_id
+        for adjustment in updated_document.adjustment_layers
+        if adjustment.mask_layer_id
+    )
+    for auxiliary_id in {top_layer.mask_layer_id, bottom_layer.mask_layer_id}:
+        if auxiliary_id and auxiliary_id not in referenced_auxiliary_ids:
+            new_pixels.pop(auxiliary_id, None)
+    return updated_document, new_pixels
 
 
 def reorder_texture_editor_layer(
@@ -2034,6 +3297,8 @@ def update_texture_editor_layer(
     offset_y: Optional[int] = None,
     locked: Optional[bool] = None,
     alpha_locked: Optional[bool] = None,
+    mask_layer_id: Optional[str] = None,
+    mask_enabled: Optional[bool] = None,
 ) -> TextureEditorDocument:
     updated_layers: List[TextureEditorLayer] = []
     for layer in document.layers:
@@ -2051,6 +3316,8 @@ def update_texture_editor_layer(
                 offset_y=int(offset_y) if offset_y is not None else layer.offset_y,
                 locked=bool(locked) if locked is not None else layer.locked,
                 alpha_locked=bool(alpha_locked) if alpha_locked is not None else layer.alpha_locked,
+                mask_layer_id=str(mask_layer_id) if mask_layer_id is not None else layer.mask_layer_id,
+                mask_enabled=bool(mask_enabled) if mask_enabled is not None else layer.mask_enabled,
                 revision=int(layer.revision) + 1,
                 thumbnail_cache_key=uuid.uuid4().hex,
             )

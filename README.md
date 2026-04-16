@@ -4,11 +4,11 @@ Windows desktop tool for **Crimson Desert texture workflows**, **read-only archi
 
 Project changelog: [CHANGELOG.md](CHANGELOG.md)
 
-Latest prerelease: `0.6.0-beta.3`
+Latest prerelease: `0.6.0-beta.4`
 
-- expanded `Texture Editor` into a much more complete layered texture-editing workspace
-- added more real editing tools, masks, adjustments, channel editing, and brush controls
-- improved archive preview, DDS compatibility, startup responsiveness, and workflow stability
+- expanded `Texture Editor` again with deeper packed-channel tools, navigator/rulers/guides, atlas helpers, and more advanced adjustments
+- added stronger transform, mask, brush, and document-editing workflows for real in-app texture modification
+- improved editor stability, DDS preview behavior, text-search/research responsiveness, and heavier-session performance
 
 Project guidelines:
 
@@ -402,6 +402,10 @@ It only opens external pages in your browser when you explicitly trigger actions
 ### Compare View: Alternate Example
 
 ![Workflow Compare 2](docs/screenshots/workflow_compare2.png)
+
+### Texture Editor
+
+![Texture Editor](docs/screenshots/CTF_texture_editor_prototype.png)
 
 ### Research: Archive Insights
 

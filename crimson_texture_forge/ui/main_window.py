@@ -80,6 +80,7 @@ def run_gui() -> int:
     from crimson_texture_forge.ui.widgets import (
         AboutDialog,
         CollapsibleSection,
+        ensure_app_wheel_guard,
         LogHighlighter,
         PreviewLabel,
         PreviewScrollArea,
@@ -504,15 +505,19 @@ def run_gui() -> int:
                 if self.stop_event.is_set():
                     return
                 payload = {
-                    "original": self._build_result_with_loaded_image(
+                    "original": build_compare_preview_pane_result(
+                        self.texconv_path,
                         self.original_path,
                         "Original DDS not found.",
                         self.original_planner_summary,
+                        stop_event=self.stop_event,
                     ),
-                    "output": self._build_result_with_loaded_image(
+                    "output": build_compare_preview_pane_result(
+                        self.texconv_path,
                         self.output_path,
                         "Output DDS not found.",
                         self.output_planner_summary,
+                        stop_event=self.stop_event,
                     ),
                 }
                 if not self.stop_event.is_set():
@@ -522,27 +527,6 @@ def run_gui() -> int:
                     self.error.emit(self.request_id, str(exc))
             finally:
                 self.finished.emit()
-
-        def _build_result_with_loaded_image(
-            self,
-            dds_path: Optional[Path],
-            missing_message: str,
-            planner_summary: str,
-        ) -> ComparePreviewPaneResult:
-            result = build_compare_preview_pane_result(
-                self.texconv_path,
-                dds_path,
-                missing_message,
-                planner_summary,
-                stop_event=self.stop_event,
-            )
-            if self.stop_event.is_set() or result.status != "ok" or not result.preview_png_path:
-                return result
-            reader = QImageReader(result.preview_png_path)
-            image = reader.read()
-            if image.isNull():
-                return result
-            return dataclasses.replace(result, preview_image=image)
 
     class ArchivePreviewWorker(QObject):
         completed = Signal(int, object)
@@ -579,7 +563,6 @@ def run_gui() -> int:
                 )
                 if self.stop_event.is_set():
                     return
-                payload = self._attach_loaded_images(payload)
                 if not self.stop_event.is_set():
                     self.completed.emit(self.request_id, payload)
             except Exception as exc:
@@ -587,28 +570,6 @@ def run_gui() -> int:
                     self.error.emit(self.request_id, str(exc))
             finally:
                 self.finished.emit()
-
-        def _attach_loaded_images(self, result: ArchivePreviewResult) -> ArchivePreviewResult:
-            preview_image = self._load_image(result.preview_image_path)
-            loose_preview_image = None
-            if preview_image is None and result.loose_preview_image_path:
-                loose_preview_image = self._load_image(result.loose_preview_image_path)
-            if preview_image is None and loose_preview_image is None:
-                return result
-            return dataclasses.replace(
-                result,
-                preview_image=preview_image,
-                loose_preview_image=loose_preview_image,
-            )
-
-        def _load_image(self, image_path: str) -> object:
-            if self.stop_event.is_set() or not image_path:
-                return None
-            reader = QImageReader(image_path)
-            image = reader.read()
-            if self.stop_event.is_set() or image.isNull():
-                return None
-            return image
 
     class MainWindow(QMainWindow):
         def __init__(self) -> None:
@@ -6776,16 +6737,12 @@ def run_gui() -> int:
                 if self.compare_preview_worker is not None:
                     self.compare_preview_worker.stop()
                 self.compare_preview_thread.quit()
-                if not self.compare_preview_thread.wait(250):
-                    self.compare_preview_thread.terminate()
-                    self.compare_preview_thread.wait(150)
+                self.compare_preview_thread.wait(4000)
             if self.archive_preview_thread is not None:
                 if self.archive_preview_worker is not None:
                     self.archive_preview_worker.stop()
                 self.archive_preview_thread.quit()
-                if not self.archive_preview_thread.wait(250):
-                    self.archive_preview_thread.terminate()
-                    self.archive_preview_thread.wait(150)
+                self.archive_preview_thread.wait(4000)
             self.settings_tab.flush_settings_save()
             self.replace_assistant_tab.flush_settings_save()
             self.texture_editor_tab.flush_settings_save()
@@ -6800,6 +6757,7 @@ def run_gui() -> int:
     app.setOrganizationName(APP_ORGANIZATION)
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
+    ensure_app_wheel_guard(app)
     icon_path = resolve_app_icon_path()
     if icon_path is not None:
         app_icon = QIcon(str(icon_path))

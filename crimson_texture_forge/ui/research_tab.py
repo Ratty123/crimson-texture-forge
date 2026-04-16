@@ -77,13 +77,12 @@ from crimson_texture_forge.models import AppConfig, ArchiveEntry, ArchivePreview
 from crimson_texture_forge.ui.widgets import PreviewLabel, PreviewScrollArea
 
 
-def _shutdown_thread(thread: Optional[QThread], *, grace_ms: int = 250, force_ms: int = 150) -> None:
+def _shutdown_thread(thread: Optional[QThread], *, grace_ms: int = 2000, force_ms: int = 2000) -> None:
     if thread is None:
         return
     thread.quit()
     if thread.wait(grace_ms):
         return
-    thread.terminate()
     thread.wait(force_ms)
 
 
@@ -1516,6 +1515,7 @@ class ResearchTab(QWidget):
         self.reference_resolve_button.setEnabled(True)
 
     def _populate_texture_groups(self, groups: object) -> None:
+        self.texture_group_tree.setUpdatesEnabled(False)
         self.texture_group_tree.clear()
         first_group_item: Optional[QTreeWidgetItem] = None
         for group in groups if isinstance(groups, list) else []:
@@ -1548,6 +1548,7 @@ class ResearchTab(QWidget):
         else:
             self.texture_group_status_label.setText("No grouped texture sets are available in the current Research snapshot.")
             self.texture_group_extract_button.setEnabled(False)
+        self.texture_group_tree.setUpdatesEnabled(True)
 
     def _resolve_group_item(self, item: Optional[QTreeWidgetItem]) -> Optional[QTreeWidgetItem]:
         current = item
@@ -1604,6 +1605,7 @@ class ResearchTab(QWidget):
         self.texture_group_extract_button.setEnabled(True)
 
     def _populate_classifications(self, rows: object) -> None:
+        self.classifier_tree.setUpdatesEnabled(False)
         self.classifier_tree.clear()
         for row in rows if isinstance(rows, list) else []:
             if not isinstance(row, TextureClassificationRow):
@@ -1613,6 +1615,7 @@ class ResearchTab(QWidget):
             )
             item.setToolTip(0, row.path)
             self.classifier_tree.addTopLevelItem(item)
+        self.classifier_tree.setUpdatesEnabled(True)
 
     def _current_unknown_resolver_groups(self) -> object:
         if self.unknown_show_classified_checkbox.isChecked():
@@ -1731,6 +1734,7 @@ class ResearchTab(QWidget):
     def _populate_unknown_resolver(self, groups: object) -> None:
         previous_group = self._current_unknown_group()
         previous_group_key = previous_group.group_key if previous_group is not None else ""
+        self.unknown_group_tree.setUpdatesEnabled(False)
         self.unknown_group_tree.clear()
         first_item: Optional[QTreeWidgetItem] = None
         selected_item: Optional[QTreeWidgetItem] = None
@@ -1786,6 +1790,7 @@ class ResearchTab(QWidget):
                 if not self.pending_classification_review_focus_keys
                 else "No current-run unclassified DDS files matched the current Research snapshot. Scan archives or broaden the current Archive Browser view if needed."
             )
+        self.unknown_group_tree.setUpdatesEnabled(True)
         self._update_unknown_resolver_controls()
 
     def _current_unknown_group(self) -> Optional[UnknownResolverGroup]:
@@ -2218,6 +2223,7 @@ class ResearchTab(QWidget):
         self._set_unknown_preview_image_controls_enabled(False)
 
     def _populate_heatmap_rows(self, rows: object) -> None:
+        self.heatmap_tree.setUpdatesEnabled(False)
         self.heatmap_tree.clear()
         grouped: Dict[str, QTreeWidgetItem] = {}
         for row in rows if isinstance(rows, list) else []:
@@ -2245,8 +2251,10 @@ class ResearchTab(QWidget):
             if row.sample_paths:
                 item.setToolTip(0, "\n".join(row.sample_paths))
             parent.addChild(item)
+        self.heatmap_tree.setUpdatesEnabled(True)
 
     def _populate_mip_rows(self, rows: object) -> None:
+        self.mip_tree.setUpdatesEnabled(False)
         self.mip_tree.clear()
         for row in rows if isinstance(rows, list) else []:
             if not isinstance(row, MipAnalysisRow):
@@ -2281,8 +2289,10 @@ class ResearchTab(QWidget):
             first = self.mip_tree.topLevelItem(0)
             if first is not None:
                 self.mip_tree.setCurrentItem(first)
+        self.mip_tree.setUpdatesEnabled(True)
 
     def _populate_normal_rows(self, rows: object) -> None:
+        self.normal_tree.setUpdatesEnabled(False)
         self.normal_tree.clear()
         for row in rows if isinstance(rows, list) else []:
             if not isinstance(row, NormalValidationRow):
@@ -2314,6 +2324,7 @@ class ResearchTab(QWidget):
                 "Select a row in Mip Analysis or Bulk Normal Validator to see where the result came from and what it means."
             )
             self.analysis_detail_edit.clear()
+        self.normal_tree.setUpdatesEnabled(True)
 
     @staticmethod
     def _normalize_relative_path(relative_path: str) -> str:

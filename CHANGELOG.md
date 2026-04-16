@@ -9,6 +9,23 @@ The format is intentionally simple:
 - `Fixed` for bug fixes
 - `Docs` for README, guide, or release-note changes
 
+## [0.6.0-beta.4] - 2026-04-16
+
+### Added
+- `Texture Editor` gained a much deeper set of texture-editing workflows, including direct on-canvas transform handles for floating selections, richer mask/selection handoff, stronger packed-channel tools, custom image-stamp brushes, symmetry painting, editable quick mask, navigator/rulers/guides, pixel inspection, atlas export helpers, and additional non-destructive adjustments such as `Vibrance`, `Selective Color`, `Brightness/Contrast`, `Exposure`, and `Color Balance`.
+- The editor now adds more document-level operations and texture-focused utilities, including crop/trim/canvas/image resize actions, region or grid-slice export helpers for atlas-style work, plus stronger channel copy/paste/swap flows for packed-texture cleanup inside the app.
+
+### Changed
+- `Texture Editor` now feels more like a real texture compositor, with stronger transform ergonomics, richer brush behavior, better channel-aware editing, finer control over selection/mask workflows, and more practical navigation and precision feedback while working on large textures.
+- Heavy editor sessions now use lighter refresh/history behavior in common dirty-region edit paths, while `Text Search` and `Research` also avoid more unnecessary full UI stalls during large result updates.
+
+### Fixed
+- Fixed a broad set of `Texture Editor` issues around selection-to-mask creation, selective-color project save/load, masked copy/extract behavior, merge-down correctness with masks/adjustments, floating selection/project persistence, zoom reliability, and several loaded-editor workflow regressions found during the full feature verification pass.
+- Fixed more archive-side and app-wide behavior issues, including cancellation-aware loose DDS preview fallback, safer preview shutdown behavior, broader DDS preview compatibility, and app-wide prevention of accidental mouse-wheel setting changes over combo/spin/slider controls.
+
+### Docs
+- Updated the README and prerelease notes for `0.6.0-beta.4` to reflect the latest `Texture Editor`, preview, DDS, and workflow improvements now present in the current beta.
+
 ## [0.6.0-beta.3] - 2026-04-15
 
 ### Added

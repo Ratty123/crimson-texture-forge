@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import html
+import math
 import threading
 import time
 from pathlib import Path, PurePosixPath
@@ -9,7 +10,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSettings, QSize, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, QSettings, QSize, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -65,20 +66,32 @@ from crimson_texture_forge.core.texture_editor import (
     apply_texture_editor_fill,
     apply_texture_editor_gradient,
     apply_texture_editor_patch,
+    apply_texture_editor_selection_fill,
+    apply_texture_editor_selection_stroke,
+    apply_texture_editor_selection_to_layer_mask,
     apply_texture_editor_stroke,
     bump_texture_editor_layer_revision,
     build_texture_editor_selection_mask,
     capture_texture_editor_snapshot,
     clear_texture_editor_selection,
+    copy_texture_editor_layer_channel,
     create_texture_editor_document_from_source,
     create_texture_editor_layer_mask,
+    crop_texture_editor_document_to_selection,
     delete_texture_editor_layer_mask,
     duplicate_texture_editor_layer,
     extract_texture_editor_selection,
+    extract_texture_editor_layer_channel_to_rgba,
     export_texture_editor_flattened_png,
+    export_texture_editor_grid_slices,
+    export_texture_editor_region_png,
     flatten_texture_editor_layers,
+    flatten_texture_editor_layers_region,
+    flip_texture_editor_document,
     grow_texture_editor_selection,
     invert_texture_editor_layer_mask,
+    load_texture_editor_layer_mask_as_selection,
+    load_texture_editor_layer_channel_as_selection,
     load_texture_editor_project,
     make_texture_editor_workspace_root,
     merge_texture_editor_layer_down,
@@ -86,16 +99,24 @@ from crimson_texture_forge.core.texture_editor import (
     remove_texture_editor_layer,
     remove_texture_editor_adjustment_layer,
     reorder_texture_editor_layer,
+    resize_texture_editor_document_canvas,
+    resize_texture_editor_document_image,
     restore_texture_editor_snapshot,
+    rotate_texture_editor_document_90,
     set_texture_editor_layer_mask_enabled,
     save_texture_editor_project,
     select_all_texture_editor,
     shrink_texture_editor_selection,
     snap_lasso_points_to_edges,
+    swap_texture_editor_layer_channels,
+    trim_texture_editor_document_transparent_bounds,
     add_texture_editor_adjustment_layer,
     update_texture_editor_adjustment_layer,
     update_texture_editor_selection_settings,
     update_texture_editor_layer,
+    paste_texture_editor_channel_into_layer,
+    write_texture_editor_selection_to_layer_channel,
+    write_texture_editor_layer_luma_to_channel,
 )
 from crimson_texture_forge.models import (
     TextureEditorAdjustmentLayer,
@@ -364,6 +385,203 @@ class ShortcutEditorDialog(QDialog):
         return {key: edit.keySequence().toString(QKeySequence.NativeText) for key, edit in self._edits.items()}
 
 
+class TextureEditorNavigator(QWidget):
+    center_requested = Signal(float, float)
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._image: Optional[QImage] = None
+        self._image_width = 0
+        self._image_height = 0
+        self._viewport_rect: Optional[Tuple[float, float, float, float]] = None
+        self._dragging = False
+        self.setMinimumSize(170, 120)
+        self.setMaximumHeight(180)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def set_state(
+        self,
+        image: Optional[QImage],
+        *,
+        image_width: int,
+        image_height: int,
+        viewport_rect: Optional[Tuple[float, float, float, float]],
+    ) -> None:
+        self._image = image.copy() if image is not None else None
+        self._image_width = max(0, int(image_width))
+        self._image_height = max(0, int(image_height))
+        self._viewport_rect = viewport_rect
+        self.update()
+
+    def _target_rect(self) -> QRectF:
+        if self._image_width <= 0 or self._image_height <= 0:
+            return QRectF()
+        inner = QRectF(8.0, 8.0, max(1.0, float(self.width()) - 16.0), max(1.0, float(self.height()) - 16.0))
+        scale = min(inner.width() / float(self._image_width), inner.height() / float(self._image_height))
+        width = float(self._image_width) * scale
+        height = float(self._image_height) * scale
+        x = inner.x() + ((inner.width() - width) / 2.0)
+        y = inner.y() + ((inner.height() - height) / 2.0)
+        return QRectF(x, y, width, height)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#1B202A"))
+        target = self._target_rect()
+        if target.isEmpty():
+            painter.setPen(QColor("#8B97AA"))
+            painter.drawText(self.rect(), Qt.AlignCenter, "Navigator")
+            return
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.setPen(QPen(QColor(255, 255, 255, 18), 1))
+        painter.setBrush(QColor(255, 255, 255, 6))
+        painter.drawRoundedRect(target, 6, 6)
+        if self._image is not None:
+            painter.drawImage(target, self._image)
+        else:
+            painter.setPen(QColor("#8B97AA"))
+            painter.drawText(target.toRect(), Qt.AlignCenter, "No preview")
+        if self._viewport_rect is not None and self._image_width > 0 and self._image_height > 0:
+            vx, vy, vw, vh = self._viewport_rect
+            view = QRectF(
+                target.x() + ((vx / float(self._image_width)) * target.width()),
+                target.y() + ((vy / float(self._image_height)) * target.height()),
+                max(6.0, (vw / float(self._image_width)) * target.width()),
+                max(6.0, (vh / float(self._image_height)) * target.height()),
+            )
+            view = view.intersected(target)
+            painter.setBrush(QColor(116, 193, 255, 30))
+            painter.setPen(QPen(QColor("#74C1FF"), 1.4))
+            painter.drawRoundedRect(view, 4, 4)
+
+    def _emit_center_request(self, pos) -> None:
+        target = self._target_rect()
+        if target.isEmpty() or self._image_width <= 0 or self._image_height <= 0 or not target.contains(pos):
+            return
+        ratio_x = (float(pos.x()) - target.x()) / max(1.0, target.width())
+        ratio_y = (float(pos.y()) - target.y()) / max(1.0, target.height())
+        image_x = max(0.0, min(float(self._image_width), ratio_x * float(self._image_width)))
+        image_y = max(0.0, min(float(self._image_height), ratio_y * float(self._image_height)))
+        self.center_requested.emit(image_x, image_y)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() != Qt.LeftButton:
+            return
+        self._dragging = True
+        self._emit_center_request(event.position())
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if self._dragging:
+            self._emit_center_request(event.position())
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            self._dragging = False
+
+
+class TextureEditorRuler(QWidget):
+    def __init__(self, orientation: Qt.Orientation, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._orientation = orientation
+        self._image_length = 0
+        self._other_length = 0
+        self._display_scale = 1.0
+        self._scroll_value = 0
+        self._hover_position: Optional[int] = None
+        self._guides: Tuple[int, ...] = ()
+        if orientation == Qt.Horizontal:
+            self.setFixedHeight(22)
+            self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        else:
+            self.setFixedWidth(22)
+            self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+
+    def set_state(
+        self,
+        *,
+        image_length: int,
+        other_length: int,
+        display_scale: float,
+        scroll_value: int,
+        hover_position: Optional[int],
+        guides: Sequence[int],
+    ) -> None:
+        self._image_length = max(0, int(image_length))
+        self._other_length = max(0, int(other_length))
+        self._display_scale = max(0.0001, float(display_scale))
+        self._scroll_value = max(0, int(scroll_value))
+        self._hover_position = None if hover_position is None else int(hover_position)
+        self._guides = tuple(int(value) for value in guides)
+        self.update()
+
+    def _tick_step(self) -> int:
+        if self._display_scale <= 0:
+            return 100
+        desired = 80.0 / self._display_scale
+        magnitude = 1
+        while magnitude * 10 <= desired:
+            magnitude *= 10
+        for factor in (1, 2, 5, 10):
+            candidate = magnitude * factor
+            if candidate >= desired:
+                return max(1, int(candidate))
+        return max(1, int(magnitude * 10))
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#1C212B"))
+        if self._image_length <= 0:
+            return
+        painter.setPen(QPen(QColor(255, 255, 255, 18), 1))
+        if self._orientation == Qt.Horizontal:
+            painter.drawLine(0, self.height() - 1, self.width(), self.height() - 1)
+            visible_pixels = self.width() / self._display_scale
+        else:
+            painter.drawLine(self.width() - 1, 0, self.width() - 1, self.height())
+            visible_pixels = self.height() / self._display_scale
+        start_pixel = float(self._scroll_value) / self._display_scale
+        end_pixel = min(float(self._image_length), start_pixel + visible_pixels)
+        step = self._tick_step()
+        first_tick = int(math.floor(start_pixel / float(step)) * step)
+        painter.setPen(QPen(QColor("#A9B6CB"), 1))
+        value = first_tick
+        while value <= end_pixel + step:
+            widget_pos = (float(value) - start_pixel) * self._display_scale
+            if self._orientation == Qt.Horizontal:
+                x = int(round(widget_pos))
+                painter.drawLine(x, self.height() - 8, x, self.height())
+                painter.drawText(x + 2, 12, str(value))
+            else:
+                y = int(round(widget_pos))
+                painter.drawLine(self.width() - 8, y, self.width(), y)
+                painter.save()
+                painter.translate(8, y + 16)
+                painter.rotate(-90)
+                painter.drawText(0, 0, str(value))
+                painter.restore()
+            value += step
+        guide_pen = QPen(QColor(116, 193, 255, 140), 1)
+        hover_pen = QPen(QColor("#F2C14E"), 1)
+        for guide in self._guides:
+            pos = (float(guide) - start_pixel) * self._display_scale
+            painter.setPen(guide_pen)
+            if self._orientation == Qt.Horizontal:
+                x = int(round(pos))
+                painter.drawLine(x, 0, x, self.height())
+            else:
+                y = int(round(pos))
+                painter.drawLine(0, y, self.width(), y)
+        if self._hover_position is not None:
+            pos = (float(self._hover_position) - start_pixel) * self._display_scale
+            painter.setPen(hover_pen)
+            if self._orientation == Qt.Horizontal:
+                x = int(round(pos))
+                painter.drawLine(x, 0, x, self.height())
+            else:
+                y = int(round(pos))
+                painter.drawLine(0, y, self.width(), y)
+
+
 class TextureEditorTaskWorker(QObject):
     completed = Signal(object)
     error = Signal(str)
@@ -397,7 +615,9 @@ class TextureEditorCanvas(QWidget):
     selection_committed = Signal(object)
     clone_source_picked = Signal(object)
     color_sampled = Signal(str)
+    hover_info_changed = Signal(object)
     wheel_zoom_requested = Signal(int, int, int)
+    floating_transform_requested = Signal(object)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -418,12 +638,22 @@ class TextureEditorCanvas(QWidget):
         self._brush_roundness = 100
         self._brush_angle = 0
         self._brush_pattern = "solid"
+        self._symmetry_mode = "off"
         self._view_mode = "edited"
         self._split_percent = 50
         self._grid_enabled = False
         self._grid_size = 64
+        self._guides_enabled = False
+        self._vertical_guides: Tuple[int, ...] = ()
+        self._horizontal_guides: Tuple[int, ...] = ()
         self._selection = TextureEditorSelection()
         self._floating_bounds: Optional[Tuple[int, int, int, int]] = None
+        self._floating_origin_bounds: Optional[Tuple[int, int, int, int]] = None
+        self._floating_offset_x = 0
+        self._floating_offset_y = 0
+        self._floating_scale_x = 1.0
+        self._floating_scale_y = 1.0
+        self._floating_rotation_degrees = 0.0
         self._quick_mask_image: Optional[QImage] = None
         self._clone_source_point: Optional[Tuple[int, int]] = None
         self._hover_point: Optional[Tuple[int, int]] = None
@@ -434,6 +664,13 @@ class TextureEditorCanvas(QWidget):
         self._lasso_points: List[Tuple[float, float]] = []
         self._pan_start = None
         self._last_stroke_point: Optional[Tuple[int, int]] = None
+        self._transform_drag_mode = ""
+        self._transform_drag_start_point: Optional[Tuple[float, float]] = None
+        self._transform_drag_start_bounds: Optional[Tuple[int, int, int, int]] = None
+        self._transform_drag_start_origin_bounds: Optional[Tuple[int, int, int, int]] = None
+        self._transform_drag_start_offset = (0, 0)
+        self._transform_drag_start_scale = (1.0, 1.0)
+        self._transform_drag_start_rotation = 0.0
         self.setMouseTracking(True)
         self.setMinimumSize(1, 1)
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
@@ -516,6 +753,25 @@ class TextureEditorCanvas(QWidget):
         self._grid_size = max(2, int(grid_size))
         self.update()
 
+    def set_guide_state(
+        self,
+        *,
+        enabled: bool,
+        vertical_guides: Sequence[int],
+        horizontal_guides: Sequence[int],
+    ) -> None:
+        self._guides_enabled = bool(enabled)
+        self._vertical_guides = tuple(max(0, int(value)) for value in vertical_guides)
+        self._horizontal_guides = tuple(max(0, int(value)) for value in horizontal_guides)
+        self.update()
+
+    def set_symmetry_mode(self, mode: str) -> None:
+        normalized = (mode or "off").strip().lower()
+        if normalized == self._symmetry_mode:
+            return
+        self._symmetry_mode = normalized
+        self.update()
+
     def _build_channel_qimage(self, channel_key: str) -> Optional[QImage]:
         if self._edited_rgba is None:
             return None
@@ -586,7 +842,11 @@ class TextureEditorCanvas(QWidget):
         painter.setBrush(Qt.NoBrush)
         painter.setPen(QPen(QColor(255, 255, 255, 210), 1.1))
         tip_key = (self._brush_tip or "round").strip().lower()
-        if tip_key == "square":
+        if tip_key == "image_stamp":
+            painter.drawRect(QRect(int(round(-width / 2.0)), int(round(-height / 2.0)), max(1, int(round(width))), max(1, int(round(height)))))
+            painter.drawLine(int(round(-width / 2.0)), int(round(-height / 2.0)), int(round(width / 2.0)), int(round(height / 2.0)))
+            painter.drawLine(int(round(width / 2.0)), int(round(-height / 2.0)), int(round(-width / 2.0)), int(round(height / 2.0)))
+        elif tip_key == "square":
             painter.drawRect(QRect(int(round(-width / 2.0)), int(round(-height / 2.0)), max(1, int(round(width))), max(1, int(round(height)))))
         elif tip_key == "diamond":
             path = QPainterPath()
@@ -606,7 +866,9 @@ class TextureEditorCanvas(QWidget):
                 )
             )
         painter.setPen(QPen(QColor("#74C1FF"), 0.9))
-        if tip_key == "square":
+        if tip_key == "image_stamp":
+            painter.drawRect(QRect(int(round(-(width + 2.0) / 2.0)), int(round(-(height + 2.0) / 2.0)), max(1, int(round(width + 2.0))), max(1, int(round(height + 2.0)))))
+        elif tip_key == "square":
             painter.drawRect(QRect(int(round(-(width + 2.0) / 2.0)), int(round(-(height + 2.0) / 2.0)), max(1, int(round(width + 2.0))), max(1, int(round(height + 2.0)))))
         elif tip_key == "diamond":
             path = QPainterPath()
@@ -628,7 +890,8 @@ class TextureEditorCanvas(QWidget):
         painter.restore()
 
     def _draw_brush_hud(self, painter: QPainter, center_x: float, center_y: float) -> None:
-        hud_text = f"{max(0.25, self._brush_size):.2f}px  H{self._brush_hardness}%  {self._brush_tip.title()}  R{self._brush_roundness}%  A{self._brush_angle}°"
+        tip_label = "Stamp" if (self._brush_tip or "").strip().lower() == "image_stamp" else self._brush_tip.title()
+        hud_text = f"{max(0.25, self._brush_size):.2f}px  H{self._brush_hardness}%  {tip_label}  R{self._brush_roundness}%  A{self._brush_angle}°"
         metrics = painter.fontMetrics()
         text_width = metrics.horizontalAdvance(hud_text) + 12
         text_height = metrics.height() + 8
@@ -641,6 +904,27 @@ class TextureEditorCanvas(QWidget):
         painter.setPen(QColor("#E7EDF7"))
         painter.drawText(hud_x + 6, hud_y + text_height - 5, hud_text)
         painter.restore()
+
+    def _emit_hover_info(self, point: Optional[Tuple[int, int]]) -> None:
+        if point is None or self._image is None:
+            self.hover_info_changed.emit(None)
+            return
+        if point[0] < 0 or point[1] < 0 or point[0] >= self._image.width() or point[1] >= self._image.height():
+            self.hover_info_changed.emit(None)
+            return
+        pixel = QColor(self._image.pixel(point[0], point[1]))
+        self.hover_info_changed.emit(
+            {
+                "x": int(point[0]),
+                "y": int(point[1]),
+                "rgba": (
+                    int(pixel.red()),
+                    int(pixel.green()),
+                    int(pixel.blue()),
+                    int(pixel.alpha()),
+                ),
+            }
+        )
 
     def _append_lasso_point(self, point: Tuple[float, float]) -> None:
         if not self._lasso_points:
@@ -659,6 +943,34 @@ class TextureEditorCanvas(QWidget):
 
     def set_floating_bounds(self, bounds: Optional[Tuple[int, int, int, int]]) -> None:
         self._floating_bounds = bounds
+        if bounds is None:
+            self._floating_origin_bounds = None
+            self._floating_offset_x = 0
+            self._floating_offset_y = 0
+            self._floating_scale_x = 1.0
+            self._floating_scale_y = 1.0
+            self._floating_rotation_degrees = 0.0
+            self._transform_drag_mode = ""
+        self.update()
+
+    def set_floating_transform_state(
+        self,
+        *,
+        current_bounds: Optional[Tuple[int, int, int, int]],
+        origin_bounds: Optional[Tuple[int, int, int, int]],
+        offset_x: int,
+        offset_y: int,
+        scale_x: float,
+        scale_y: float,
+        rotation_degrees: float,
+    ) -> None:
+        self._floating_bounds = current_bounds
+        self._floating_origin_bounds = origin_bounds
+        self._floating_offset_x = int(offset_x)
+        self._floating_offset_y = int(offset_y)
+        self._floating_scale_x = float(scale_x)
+        self._floating_scale_y = float(scale_y)
+        self._floating_rotation_degrees = float(rotation_degrees)
         self.update()
 
     def set_quick_mask_overlay(self, overlay: Optional[QImage]) -> None:
@@ -744,6 +1056,142 @@ class TextureEditorCanvas(QWidget):
         pixel = QColor(self._image.pixel(point[0], point[1]))
         return pixel.name().upper()
 
+    def _floating_handle_rects(self) -> Dict[str, QRectF]:
+        if self._floating_bounds is None:
+            return {}
+        x, y, width, height = self._floating_bounds
+        scale = max(0.0001, self._display_scale)
+        widget_x = float(x) * scale
+        widget_y = float(y) * scale
+        widget_w = max(1.0, float(width) * scale)
+        widget_h = max(1.0, float(height) * scale)
+        handle_size = max(10.0, min(16.0, max(10.0, scale * 0.75)))
+        half = handle_size / 2.0
+        left = widget_x
+        right = widget_x + widget_w
+        top = widget_y
+        bottom = widget_y + widget_h
+        center_x = widget_x + (widget_w / 2.0)
+        rotate_y = top - max(18.0, handle_size * 1.6)
+        return {
+            "scale_nw": QRectF(left - half, top - half, handle_size, handle_size),
+            "scale_ne": QRectF(right - half, top - half, handle_size, handle_size),
+            "scale_sw": QRectF(left - half, bottom - half, handle_size, handle_size),
+            "scale_se": QRectF(right - half, bottom - half, handle_size, handle_size),
+            "rotate": QRectF(center_x - half, rotate_y - half, handle_size, handle_size),
+        }
+
+    def _floating_transform_hit(self, pos) -> Optional[str]:
+        if self._floating_bounds is None:
+            return None
+        point = QPoint(int(round(pos.x())), int(round(pos.y())))
+        for name, rect in self._floating_handle_rects().items():
+            if rect.contains(pos):
+                return name
+        scale = max(0.0001, self._display_scale)
+        x, y, width, height = self._floating_bounds
+        widget_rect = QRectF(float(x) * scale, float(y) * scale, max(1.0, float(width) * scale), max(1.0, float(height) * scale))
+        if widget_rect.contains(pos):
+            return "move"
+        return None
+
+    def _cursor_for_floating_hit(self, hit: Optional[str]):
+        if hit == "move":
+            return Qt.SizeAllCursor
+        if hit in {"scale_nw", "scale_se"}:
+            return Qt.SizeFDiagCursor
+        if hit in {"scale_ne", "scale_sw"}:
+            return Qt.SizeBDiagCursor
+        if hit == "rotate":
+            return Qt.CrossCursor
+        return Qt.ArrowCursor
+
+    def _clamped_image_point_float(self, pos) -> Optional[Tuple[float, float]]:
+        if self._image is None:
+            return None
+        precise = self._widget_to_image_point_float(pos)
+        if precise is not None:
+            return precise
+        clamped = self._clamp_widget_point_to_image(pos.toPoint())
+        if clamped is None:
+            return None
+        scale = max(0.0001, self._display_scale)
+        max_x = max(0.0, float(self._image.width()) - 0.001)
+        max_y = max(0.0, float(self._image.height()) - 0.001)
+        return (
+            min(max_x, max(0.0, float(clamped.x()) / scale)),
+            min(max_y, max(0.0, float(clamped.y()) / scale)),
+        )
+
+    def _build_floating_transform_payload(self, current_point: Tuple[float, float], *, commit: bool) -> Optional[Dict[str, object]]:
+        if (
+            not self._transform_drag_mode
+            or self._transform_drag_start_point is None
+            or self._transform_drag_start_bounds is None
+            or self._transform_drag_start_origin_bounds is None
+        ):
+            return None
+        mode = self._transform_drag_mode
+        start_point = self._transform_drag_start_point
+        start_x, start_y, start_w, start_h = self._transform_drag_start_bounds
+        origin_x, origin_y, _origin_w, _origin_h = self._transform_drag_start_origin_bounds
+        payload: Dict[str, object] = {
+            "mode": mode,
+            "commit": bool(commit),
+            "offset_x": int(self._transform_drag_start_offset[0]),
+            "offset_y": int(self._transform_drag_start_offset[1]),
+            "scale_x": float(self._transform_drag_start_scale[0]),
+            "scale_y": float(self._transform_drag_start_scale[1]),
+            "rotation_degrees": float(self._transform_drag_start_rotation),
+        }
+        if mode == "move":
+            payload["offset_x"] = int(round(self._transform_drag_start_offset[0] + (current_point[0] - start_point[0])))
+            payload["offset_y"] = int(round(self._transform_drag_start_offset[1] + (current_point[1] - start_point[1])))
+            return payload
+        if mode.startswith("scale_"):
+            anchor_x = float(start_x)
+            anchor_y = float(start_y)
+            if mode == "scale_nw":
+                anchor_x = float(start_x + start_w)
+                anchor_y = float(start_y + start_h)
+            elif mode == "scale_ne":
+                anchor_x = float(start_x)
+                anchor_y = float(start_y + start_h)
+            elif mode == "scale_sw":
+                anchor_x = float(start_x + start_w)
+                anchor_y = float(start_y)
+            current_width = max(1.0, abs(anchor_x - current_point[0]))
+            current_height = max(1.0, abs(anchor_y - current_point[1]))
+            factor = max(current_width / max(1.0, float(start_w)), current_height / max(1.0, float(start_h)))
+            factor = max(0.05, min(8.0, factor))
+            next_w = max(1.0, float(start_w) * factor)
+            next_h = max(1.0, float(start_h) * factor)
+            if mode == "scale_nw":
+                next_x = anchor_x - next_w
+                next_y = anchor_y - next_h
+            elif mode == "scale_ne":
+                next_x = anchor_x
+                next_y = anchor_y - next_h
+            elif mode == "scale_sw":
+                next_x = anchor_x - next_w
+                next_y = anchor_y
+            else:
+                next_x = anchor_x
+                next_y = anchor_y
+            payload["offset_x"] = int(round(next_x - float(origin_x)))
+            payload["offset_y"] = int(round(next_y - float(origin_y)))
+            payload["scale_x"] = float(self._transform_drag_start_scale[0] * factor)
+            payload["scale_y"] = float(self._transform_drag_start_scale[1] * factor)
+            return payload
+        if mode == "rotate":
+            center_x = float(start_x) + (float(start_w) / 2.0)
+            center_y = float(start_y) + (float(start_h) / 2.0)
+            start_angle = math.degrees(math.atan2(start_point[1] - center_y, start_point[0] - center_x))
+            current_angle = math.degrees(math.atan2(current_point[1] - center_y, current_point[0] - center_x))
+            payload["rotation_degrees"] = float(self._transform_drag_start_rotation + (current_angle - start_angle))
+            return payload
+        return None
+
     def paintEvent(self, event) -> None:  # type: ignore[override]
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#222733"))
@@ -796,6 +1244,26 @@ class TextureEditorCanvas(QWidget):
                     painter.drawLine(0, int(round(y)), target_rect.width(), int(round(y)))
                     y += grid_step
                     line_index += 1
+        if self._guides_enabled:
+            guide_pen = QPen(QColor(116, 193, 255, 165), 1)
+            guide_pen.setStyle(Qt.DashLine)
+            painter.setPen(guide_pen)
+            for guide_x in self._vertical_guides:
+                x = int(round(float(guide_x) * max(0.01, self._display_scale)))
+                painter.drawLine(x, 0, x, target_rect.height())
+            for guide_y in self._horizontal_guides:
+                y = int(round(float(guide_y) * max(0.01, self._display_scale)))
+                painter.drawLine(0, y, target_rect.width(), y)
+        if self._symmetry_mode != "off":
+            symmetry_pen = QPen(QColor(116, 193, 255, 110), 1)
+            symmetry_pen.setStyle(Qt.DashLine)
+            painter.setPen(symmetry_pen)
+            if self._symmetry_mode in {"horizontal", "both"}:
+                guide_x = int(round((self._image.width() * 0.5) * max(0.01, self._display_scale)))
+                painter.drawLine(guide_x, 0, guide_x, target_rect.height())
+            if self._symmetry_mode in {"vertical", "both"}:
+                guide_y = int(round((self._image.height() * 0.5) * max(0.01, self._display_scale)))
+                painter.drawLine(0, guide_y, target_rect.width(), guide_y)
         scale = self._display_scale
         painter.setRenderHint(QPainter.Antialiasing, True)
         selection_pen = QPen(QColor("#69B8FF"))
@@ -900,6 +1368,19 @@ class TextureEditorCanvas(QWidget):
             painter.setPen(QPen(QColor("#F2C14E"), 2, Qt.DashLine))
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(int(round(x * scale)), int(round(y * scale)), int(round(w * scale)), int(round(h * scale)))
+            if self._tool == "move":
+                handle_pen = QPen(QColor("#FFD97A"), 1.2)
+                painter.setPen(handle_pen)
+                painter.setBrush(QColor(38, 45, 58, 220))
+                handle_rects = self._floating_handle_rects()
+                rotate_rect = handle_rects.get("rotate")
+                if rotate_rect is not None:
+                    center_x = int(round((x + (w / 2.0)) * scale))
+                    center_y = int(round(y * scale))
+                    rotate_center = rotate_rect.center()
+                    painter.drawLine(center_x, center_y, int(round(rotate_center.x())), int(round(rotate_center.y())))
+                for rect in handle_rects.values():
+                    painter.drawEllipse(rect)
         hover_point = self._drag_points[-1] if self._drag_points else self._hover_point
         if hover_point is not None and self._tool in self._brush_tools():
             center_x = float(hover_point[0]) * scale
@@ -928,10 +1409,11 @@ class TextureEditorCanvas(QWidget):
         if self._image is None:
             return
         point = self._widget_to_image_point(event.position())
-        if point is None:
-            return
         self._hover_point = point
+        self._emit_hover_info(point)
         if self._sample_target:
+            if point is None:
+                return
             self.color_sampled.emit(f"{self._sample_target}|{self._sample_color(point)}")
             self.set_color_sample_target("")
             return
@@ -947,6 +1429,24 @@ class TextureEditorCanvas(QWidget):
             self.setCursor(Qt.ClosedHandCursor)
             return
         if event.button() != Qt.LeftButton:
+            return
+        if self._tool == "move" and self._floating_bounds is not None:
+            transform_hit = self._floating_transform_hit(event.position())
+            if transform_hit is not None:
+                precise_point = self._clamped_image_point_float(event.position())
+                if precise_point is None:
+                    return
+                self._transform_drag_mode = transform_hit
+                self._transform_drag_start_point = precise_point
+                self._transform_drag_start_bounds = self._floating_bounds
+                self._transform_drag_start_origin_bounds = self._floating_origin_bounds or self._floating_bounds
+                self._transform_drag_start_offset = (int(self._floating_offset_x), int(self._floating_offset_y))
+                self._transform_drag_start_scale = (float(self._floating_scale_x), float(self._floating_scale_y))
+                self._transform_drag_start_rotation = float(self._floating_rotation_degrees)
+                self.setCursor(self._cursor_for_floating_hit(transform_hit))
+                self.update()
+                return
+        if point is None:
             return
         if (event.modifiers() & Qt.AltModifier) and self._tool in {"paint", "fill"}:
             self.color_sampled.emit(f"paint|{self._sample_color(point)}")
@@ -978,9 +1478,20 @@ class TextureEditorCanvas(QWidget):
             self._scroll_area.horizontalScrollBar().setValue(start_x - delta.x())
             self._scroll_area.verticalScrollBar().setValue(start_y - delta.y())
             return
+        if self._transform_drag_mode:
+            precise_point = self._clamped_image_point_float(event.position())
+            if precise_point is None:
+                return
+            payload = self._build_floating_transform_payload(precise_point, commit=False)
+            if payload is not None:
+                self.floating_transform_requested.emit(payload)
+            return
         point = self._widget_to_image_point(event.position())
         self._hover_point = point
+        self._emit_hover_info(point)
         if not self._dragging:
+            if self._tool == "move" and self._sample_target == "":
+                self.setCursor(self._cursor_for_floating_hit(self._floating_transform_hit(event.position())))
             self.update()
             return
         if self._tool == "lasso":
@@ -998,6 +1509,18 @@ class TextureEditorCanvas(QWidget):
         if self._pan_start is not None and event.button() in {Qt.MiddleButton, Qt.RightButton}:
             self._pan_start = None
             self.setCursor(Qt.ArrowCursor)
+            return
+        if self._transform_drag_mode and event.button() == Qt.LeftButton:
+            precise_point = self._clamped_image_point_float(event.position())
+            payload = None if precise_point is None else self._build_floating_transform_payload(precise_point, commit=True)
+            self._transform_drag_mode = ""
+            self._transform_drag_start_point = None
+            self._transform_drag_start_bounds = None
+            self._transform_drag_start_origin_bounds = None
+            self.setCursor(Qt.ArrowCursor)
+            if payload is not None:
+                self.floating_transform_requested.emit(payload)
+            self.update()
             return
         if not self._dragging or event.button() != Qt.LeftButton:
             return
@@ -1020,6 +1543,9 @@ class TextureEditorCanvas(QWidget):
 
     def leaveEvent(self, event) -> None:  # type: ignore[override]
         self._hover_point = None
+        self._emit_hover_info(None)
+        if self._pan_start is None and not self._transform_drag_mode and not self._sample_target:
+            self.setCursor(Qt.ArrowCursor)
         self.update()
         super().leaveEvent(event)
 
@@ -1083,9 +1609,14 @@ class TextureEditorTab(QWidget):
         self._adjustment_property_dirty = False
         self._pending_adjustment_before_document: Optional[TextureEditorDocument] = None
         self._refreshing_adjustments = False
+        self._refreshing_layers_list = False
         self._editing_mask_target = False
+        self._floating_transform_before_document: Optional[TextureEditorDocument] = None
+        self._floating_transform_before_floating_pixels: Optional[np.ndarray] = None
+        self._floating_transform_label = ""
         self.layer_clipboard: Optional[Tuple[np.ndarray, str, int, int, str]] = None
         self.selection_clipboard: Optional[Tuple[np.ndarray, str, int, int]] = None
+        self.channel_clipboard: Optional[Tuple[np.ndarray, str]] = None
         self._sessions: List[_TextureEditorSession] = []
         self._active_session_index = -1
         self._switching_session = False
@@ -1105,6 +1636,11 @@ class TextureEditorTab(QWidget):
         self._settings_ready = False
         self._last_open_dir = str(base_dir)
         self._last_save_dir = str(base_dir)
+        self._hover_pixel_info: Optional[Dict[str, object]] = None
+        self._show_rulers = True
+        self._show_guides = False
+        self._vertical_guides: Tuple[int, ...] = ()
+        self._horizontal_guides: Tuple[int, ...] = ()
         self._tool_setting_rows: Dict[str, Tuple[Optional[QWidget], QWidget]] = {}
         self.setStyleSheet(
             """
@@ -1448,7 +1984,22 @@ class TextureEditorTab(QWidget):
         self.canvas_scroll.setAlignment(Qt.AlignCenter)
         self.canvas_scroll.setWidget(self.canvas)
         self.canvas.attach_scroll_area(self.canvas_scroll)
-        canvas_layout.addWidget(self.canvas_scroll, stretch=1)
+        self.ruler_corner = QFrame()
+        self.ruler_corner.setFixedSize(22, 22)
+        self.ruler_corner.setObjectName("EditorRulerCorner")
+        self.top_ruler = TextureEditorRuler(Qt.Horizontal)
+        self.left_ruler = TextureEditorRuler(Qt.Vertical)
+        canvas_view_grid = QGridLayout()
+        canvas_view_grid.setContentsMargins(0, 0, 0, 0)
+        canvas_view_grid.setHorizontalSpacing(0)
+        canvas_view_grid.setVerticalSpacing(0)
+        canvas_view_grid.addWidget(self.ruler_corner, 0, 0)
+        canvas_view_grid.addWidget(self.top_ruler, 0, 1)
+        canvas_view_grid.addWidget(self.left_ruler, 1, 0)
+        canvas_view_grid.addWidget(self.canvas_scroll, 1, 1)
+        canvas_view_grid.setColumnStretch(1, 1)
+        canvas_view_grid.setRowStretch(1, 1)
+        canvas_layout.addLayout(canvas_view_grid, stretch=1)
         self.canvas_status_strip = QFrame()
         self.canvas_status_strip.setObjectName("EditorActionPane")
         canvas_status_layout = QHBoxLayout(self.canvas_status_strip)
@@ -1460,6 +2011,7 @@ class TextureEditorTab(QWidget):
         self.canvas_status_selection_label = QLabel("No selection")
         self.canvas_status_state_label = QLabel("Ready")
         self.canvas_status_document_label = QLabel("No document")
+        self.canvas_status_pixel_label = QLabel("XY -, -  RGBA -")
         self.canvas_status_source_label = QLabel("")
         self.canvas_status_source_label.setObjectName("HintLabel")
         for label_widget in (
@@ -1469,6 +2021,7 @@ class TextureEditorTab(QWidget):
             self.canvas_status_selection_label,
             self.canvas_status_state_label,
             self.canvas_status_document_label,
+            self.canvas_status_pixel_label,
         ):
             label_widget.setObjectName("HintLabel")
             canvas_status_layout.addWidget(label_widget)
@@ -1498,6 +2051,38 @@ class TextureEditorTab(QWidget):
         metadata_layout.addWidget(self.metadata_browser)
         self.metadata_section = CollapsibleSection("Document", metadata_body, expanded=False)
         right_layout.addWidget(self.metadata_section)
+
+        navigator_body = QFrame()
+        navigator_body.setObjectName("EditorSectionBody")
+        navigator_layout = QVBoxLayout(navigator_body)
+        navigator_layout.setContentsMargins(10, 10, 10, 10)
+        navigator_layout.setSpacing(8)
+        self.navigator_widget = TextureEditorNavigator()
+        navigator_layout.addWidget(self.navigator_widget)
+        self.show_rulers_checkbox = QCheckBox("Show rulers")
+        self.show_rulers_checkbox.setChecked(True)
+        self.show_guides_checkbox = QCheckBox("Show guides")
+        self.show_guides_checkbox.setChecked(False)
+        navigator_layout.addWidget(self.show_rulers_checkbox)
+        navigator_layout.addWidget(self.show_guides_checkbox)
+        navigator_layout.addWidget(QLabel("Vertical guides"))
+        self.vertical_guides_edit = QLineEdit()
+        self.vertical_guides_edit.setPlaceholderText("e.g. 128, 256, 512")
+        navigator_layout.addWidget(self.vertical_guides_edit)
+        navigator_layout.addWidget(QLabel("Horizontal guides"))
+        self.horizontal_guides_edit = QLineEdit()
+        self.horizontal_guides_edit.setPlaceholderText("e.g. 64, 128")
+        navigator_layout.addWidget(self.horizontal_guides_edit)
+        guide_actions = QHBoxLayout()
+        self.apply_guides_button = QPushButton("Apply Guides")
+        self.clear_guides_button = QPushButton("Clear Guides")
+        for button in (self.apply_guides_button, self.clear_guides_button):
+            button.setObjectName("EditorPanelButton")
+        guide_actions.addWidget(self.apply_guides_button)
+        guide_actions.addWidget(self.clear_guides_button)
+        navigator_layout.addLayout(guide_actions)
+        self.navigator_section = CollapsibleSection("Navigator", navigator_body, expanded=True)
+        right_layout.addWidget(self.navigator_section)
 
         tool_settings_body = QFrame()
         tool_settings_body.setObjectName("EditorSectionBody")
@@ -1549,12 +2134,30 @@ class TextureEditorTab(QWidget):
         self.brush_tip_combo.addItem("Square", "square")
         self.brush_tip_combo.addItem("Diamond", "diamond")
         self.brush_tip_combo.addItem("Flat", "flat")
+        self.brush_tip_combo.addItem("Image Stamp", "image_stamp")
         self.brush_pattern_combo = QComboBox()
         self.brush_pattern_combo.addItem("Solid", "solid")
         self.brush_pattern_combo.addItem("Speckle", "speckle")
         self.brush_pattern_combo.addItem("Hatch", "hatch")
         self.brush_pattern_combo.addItem("Crosshatch", "crosshatch")
         self.brush_pattern_combo.addItem("Grain", "grain")
+        self.custom_brush_tip_path_edit = QLineEdit()
+        self.custom_brush_tip_path_edit.setReadOnly(True)
+        self.custom_brush_tip_path_edit.setPlaceholderText("No image stamp loaded")
+        self.load_custom_brush_tip_button = QPushButton("Load...")
+        self.clear_custom_brush_tip_button = QPushButton("Clear")
+        self.custom_brush_tip_row = QWidget()
+        custom_brush_tip_row_layout = QHBoxLayout(self.custom_brush_tip_row)
+        custom_brush_tip_row_layout.setContentsMargins(0, 0, 0, 0)
+        custom_brush_tip_row_layout.setSpacing(6)
+        custom_brush_tip_row_layout.addWidget(self.custom_brush_tip_path_edit, stretch=1)
+        custom_brush_tip_row_layout.addWidget(self.load_custom_brush_tip_button)
+        custom_brush_tip_row_layout.addWidget(self.clear_custom_brush_tip_button)
+        self.symmetry_mode_combo = QComboBox()
+        self.symmetry_mode_combo.addItem("Off", "off")
+        self.symmetry_mode_combo.addItem("Horizontal mirror", "horizontal")
+        self.symmetry_mode_combo.addItem("Vertical mirror", "vertical")
+        self.symmetry_mode_combo.addItem("Both axes", "both")
         self.brush_size_slider = QSlider(Qt.Horizontal)
         self.brush_size_slider.setRange(1, 256)
         self.brush_size_slider.setValue(32)
@@ -1672,7 +2275,9 @@ class TextureEditorTab(QWidget):
         recolor_target_row_layout.addWidget(self.recolor_target_sample_button)
         self._add_tool_setting_row("brush_preset", "Preset", self.brush_preset_row)
         self._add_tool_setting_row("brush_tip", "Brush tip", self.brush_tip_combo)
+        self._add_tool_setting_row("custom_brush_tip", "Stamp", self.custom_brush_tip_row)
         self._add_tool_setting_row("brush_pattern", "Pattern", self.brush_pattern_combo)
+        self._add_tool_setting_row("symmetry_mode", "Symmetry", self.symmetry_mode_combo)
         self._add_tool_setting_row("paint_color", "Color", self.paint_color_row)
         self._add_tool_setting_row("secondary_color", "Secondary", self.secondary_color_row)
         self._add_tool_setting_row("brush_size", "Brush size", self.brush_size_slider)
@@ -1718,7 +2323,7 @@ class TextureEditorTab(QWidget):
         selection_layout.setContentsMargins(10, 10, 10, 10)
         selection_layout.setSpacing(8)
         self.selection_help_label = QLabel(
-            "Selections limit paint, erase, fill, clone, heal, sharpen, soften, and recolor to the selected area."
+            "Selections limit paint, erase, fill, clone, heal, sharpen, soften, and recolor to the selected area. Quick Mask now lets Paint, Erase, and Fill edit the selection directly."
         )
         self.selection_help_label.setWordWrap(True)
         selection_layout.addWidget(self.selection_help_label)
@@ -1753,12 +2358,16 @@ class TextureEditorTab(QWidget):
         self.selection_clear_button = QPushButton("Clear Selection")
         self.selection_grow_button = QPushButton("Grow +4")
         self.selection_shrink_button = QPushButton("Shrink -4")
+        self.selection_to_mask_button = QPushButton("Selection To Mask")
+        self.selection_from_mask_button = QPushButton("Mask To Selection")
         for button in (
             self.selection_copy_layer_button,
             self.selection_select_all_button,
             self.selection_clear_button,
             self.selection_grow_button,
             self.selection_shrink_button,
+            self.selection_to_mask_button,
+            self.selection_from_mask_button,
         ):
             button.setObjectName("EditorPanelButton")
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -1767,6 +2376,8 @@ class TextureEditorTab(QWidget):
         selection_actions.addWidget(self.selection_clear_button, 1, 1)
         selection_actions.addWidget(self.selection_grow_button, 2, 0)
         selection_actions.addWidget(self.selection_shrink_button, 2, 1)
+        selection_actions.addWidget(self.selection_to_mask_button, 3, 0)
+        selection_actions.addWidget(self.selection_from_mask_button, 3, 1)
         selection_layout.addLayout(selection_actions)
         self.selection_section = CollapsibleSection("Selection", selection_body, expanded=False)
         right_layout.addWidget(self.selection_section)
@@ -1812,6 +2423,88 @@ class TextureEditorTab(QWidget):
         channel_actions.addWidget(self.channel_rgb_button, 0, 1)
         channel_actions.addWidget(self.channel_alpha_only_button, 0, 2)
         channels_layout.addLayout(channel_actions)
+        packed_actions = QGridLayout()
+        packed_actions.setHorizontalSpacing(8)
+        packed_actions.setVerticalSpacing(8)
+        self.channel_extract_combo = QComboBox()
+        self.channel_extract_combo.addItem("Extract Red", "red")
+        self.channel_extract_combo.addItem("Extract Green", "green")
+        self.channel_extract_combo.addItem("Extract Blue", "blue")
+        self.channel_extract_combo.addItem("Extract Alpha", "alpha")
+        self.channel_extract_button = QPushButton("Extract To Layer")
+        self.channel_pack_combo = QComboBox()
+        self.channel_pack_combo.addItem("Pack Luma To Red", "red")
+        self.channel_pack_combo.addItem("Pack Luma To Green", "green")
+        self.channel_pack_combo.addItem("Pack Luma To Blue", "blue")
+        self.channel_pack_combo.addItem("Pack Luma To Alpha", "alpha")
+        self.channel_pack_button = QPushButton("Apply")
+        self.channel_selection_combo = QComboBox()
+        self.channel_selection_combo.addItem("Load Red As Selection", "red")
+        self.channel_selection_combo.addItem("Load Green As Selection", "green")
+        self.channel_selection_combo.addItem("Load Blue As Selection", "blue")
+        self.channel_selection_combo.addItem("Load Alpha As Selection", "alpha")
+        self.channel_selection_from_button = QPushButton("From Channel")
+        self.channel_selection_to_combo = QComboBox()
+        self.channel_selection_to_combo.addItem("Write Selection To Red", "red")
+        self.channel_selection_to_combo.addItem("Write Selection To Green", "green")
+        self.channel_selection_to_combo.addItem("Write Selection To Blue", "blue")
+        self.channel_selection_to_combo.addItem("Write Selection To Alpha", "alpha")
+        self.channel_selection_to_button = QPushButton("To Channel")
+        self.channel_copy_combo = QComboBox()
+        self.channel_copy_combo.addItem("Copy Red", "red")
+        self.channel_copy_combo.addItem("Copy Green", "green")
+        self.channel_copy_combo.addItem("Copy Blue", "blue")
+        self.channel_copy_combo.addItem("Copy Alpha", "alpha")
+        self.channel_copy_button = QPushButton("Copy")
+        self.channel_paste_combo = QComboBox()
+        self.channel_paste_combo.addItem("Paste To Red", "red")
+        self.channel_paste_combo.addItem("Paste To Green", "green")
+        self.channel_paste_combo.addItem("Paste To Blue", "blue")
+        self.channel_paste_combo.addItem("Paste To Alpha", "alpha")
+        self.channel_paste_button = QPushButton("Paste")
+        self.channel_swap_a_combo = QComboBox()
+        self.channel_swap_b_combo = QComboBox()
+        for combo in (self.channel_swap_a_combo, self.channel_swap_b_combo):
+            combo.addItem("Red", "red")
+            combo.addItem("Green", "green")
+            combo.addItem("Blue", "blue")
+            combo.addItem("Alpha", "alpha")
+        self.channel_swap_b_combo.setCurrentIndex(2)
+        self.channel_swap_button = QPushButton("Swap")
+        for button in (
+            self.channel_extract_button,
+            self.channel_pack_button,
+            self.channel_selection_from_button,
+            self.channel_selection_to_button,
+            self.channel_copy_button,
+            self.channel_paste_button,
+            self.channel_swap_button,
+        ):
+            button.setObjectName("EditorPanelButton")
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            button.setMinimumWidth(0)
+        packed_actions.addWidget(self.channel_extract_combo, 0, 0)
+        packed_actions.addWidget(self.channel_extract_button, 0, 1)
+        packed_actions.addWidget(self.channel_pack_combo, 1, 0)
+        packed_actions.addWidget(self.channel_pack_button, 1, 1)
+        packed_actions.addWidget(self.channel_selection_combo, 2, 0)
+        packed_actions.addWidget(self.channel_selection_from_button, 2, 1)
+        packed_actions.addWidget(self.channel_selection_to_combo, 3, 0)
+        packed_actions.addWidget(self.channel_selection_to_button, 3, 1)
+        packed_actions.addWidget(self.channel_copy_combo, 4, 0)
+        packed_actions.addWidget(self.channel_copy_button, 4, 1)
+        packed_actions.addWidget(self.channel_paste_combo, 5, 0)
+        packed_actions.addWidget(self.channel_paste_button, 5, 1)
+        swap_row = QWidget()
+        swap_row_layout = QHBoxLayout(swap_row)
+        swap_row_layout.setContentsMargins(0, 0, 0, 0)
+        swap_row_layout.setSpacing(6)
+        swap_row_layout.addWidget(self.channel_swap_a_combo, stretch=1)
+        swap_row_layout.addWidget(QLabel("↔"))
+        swap_row_layout.addWidget(self.channel_swap_b_combo, stretch=1)
+        packed_actions.addWidget(swap_row, 6, 0)
+        packed_actions.addWidget(self.channel_swap_button, 6, 1)
+        channels_layout.addLayout(packed_actions)
         self.channels_section = CollapsibleSection("Channels", channels_body, expanded=False)
         right_layout.addWidget(self.channels_section)
 
@@ -1856,6 +2549,86 @@ class TextureEditorTab(QWidget):
         self.transform_section = CollapsibleSection("Transform", transform_body, expanded=False)
         right_layout.addWidget(self.transform_section)
 
+        image_body = QFrame()
+        image_body.setObjectName("EditorSectionBody")
+        image_layout = QVBoxLayout(image_body)
+        image_layout.setContentsMargins(10, 10, 10, 10)
+        image_layout.setSpacing(8)
+        self.image_help_label = QLabel("Crop, resize, trim, flip, or rotate the current document while keeping layer positions aligned.")
+        self.image_help_label.setWordWrap(True)
+        image_layout.addWidget(self.image_help_label)
+        image_actions = QGridLayout()
+        image_actions.setHorizontalSpacing(8)
+        image_actions.setVerticalSpacing(8)
+        self.image_crop_selection_button = QPushButton("Crop To Selection")
+        self.image_trim_button = QPushButton("Trim Transparent")
+        self.image_resize_button = QPushButton("Image Size...")
+        self.canvas_resize_button = QPushButton("Canvas Size...")
+        self.image_flip_h_button = QPushButton("Flip H")
+        self.image_flip_v_button = QPushButton("Flip V")
+        self.image_rotate_left_button = QPushButton("Rotate -90")
+        self.image_rotate_right_button = QPushButton("Rotate +90")
+        for button in (
+            self.image_crop_selection_button,
+            self.image_trim_button,
+            self.image_resize_button,
+            self.canvas_resize_button,
+            self.image_flip_h_button,
+            self.image_flip_v_button,
+            self.image_rotate_left_button,
+            self.image_rotate_right_button,
+        ):
+            button.setObjectName("EditorPanelButton")
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            button.setMinimumWidth(0)
+        image_actions.addWidget(self.image_crop_selection_button, 0, 0)
+        image_actions.addWidget(self.image_trim_button, 0, 1)
+        image_actions.addWidget(self.image_resize_button, 1, 0)
+        image_actions.addWidget(self.canvas_resize_button, 1, 1)
+        image_actions.addWidget(self.image_flip_h_button, 2, 0)
+        image_actions.addWidget(self.image_flip_v_button, 2, 1)
+        image_actions.addWidget(self.image_rotate_left_button, 3, 0)
+        image_actions.addWidget(self.image_rotate_right_button, 3, 1)
+        image_layout.addLayout(image_actions)
+        self.image_section = CollapsibleSection("Image", image_body, expanded=False)
+        right_layout.addWidget(self.image_section)
+
+        atlas_body = QFrame()
+        atlas_body.setObjectName("EditorSectionBody")
+        atlas_layout = QVBoxLayout(atlas_body)
+        atlas_layout.setContentsMargins(10, 10, 10, 10)
+        atlas_layout.setSpacing(8)
+        self.atlas_help_label = QLabel("Use the current grid size for atlas slicing, or export the current selection as a padded region.")
+        self.atlas_help_label.setWordWrap(True)
+        atlas_layout.addWidget(self.atlas_help_label)
+        atlas_form = QFormLayout()
+        atlas_form.setContentsMargins(0, 0, 0, 0)
+        atlas_form.setHorizontalSpacing(10)
+        atlas_form.setVerticalSpacing(8)
+        self.atlas_padding_spin = QSpinBox()
+        self.atlas_padding_spin.setRange(0, 256)
+        self.atlas_padding_spin.setValue(0)
+        atlas_form.addRow("Padding", self.atlas_padding_spin)
+        atlas_layout.addLayout(atlas_form)
+        self.atlas_trim_checkbox = QCheckBox("Trim transparent bounds on export")
+        self.atlas_skip_empty_checkbox = QCheckBox("Skip empty atlas slices")
+        self.atlas_skip_empty_checkbox.setChecked(True)
+        atlas_layout.addWidget(self.atlas_trim_checkbox)
+        atlas_layout.addWidget(self.atlas_skip_empty_checkbox)
+        atlas_actions = QGridLayout()
+        atlas_actions.setHorizontalSpacing(8)
+        atlas_actions.setVerticalSpacing(8)
+        self.atlas_export_selection_button = QPushButton("Export Selection Region...")
+        self.atlas_export_grid_button = QPushButton("Export Grid Slices...")
+        for button in (self.atlas_export_selection_button, self.atlas_export_grid_button):
+            button.setObjectName("EditorPanelButton")
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        atlas_actions.addWidget(self.atlas_export_selection_button, 0, 0)
+        atlas_actions.addWidget(self.atlas_export_grid_button, 0, 1)
+        atlas_layout.addLayout(atlas_actions)
+        self.atlas_section = CollapsibleSection("Atlas", atlas_body, expanded=False)
+        right_layout.addWidget(self.atlas_section)
+
         layers_body = QFrame()
         layers_body.setObjectName("EditorSectionBody")
         layers_layout = QVBoxLayout(layers_body)
@@ -1864,6 +2637,12 @@ class TextureEditorTab(QWidget):
         self.layers_list.setMinimumHeight(140)
         self.layers_list.setFrameShape(QFrame.NoFrame)
         self.layers_list.setIconSize(QSize(28, 28))
+        self.layers_list.setSelectionMode(QListWidget.SingleSelection)
+        self.layers_list.setDragDropMode(QListWidget.InternalMove)
+        self.layers_list.setDefaultDropAction(Qt.MoveAction)
+        self.layers_list.setDragEnabled(True)
+        self.layers_list.setAcceptDrops(True)
+        self.layers_list.setDropIndicatorShown(True)
         layers_layout.addWidget(self.layers_list)
         layer_actions = QGridLayout()
         layer_actions.setHorizontalSpacing(8)
@@ -1945,6 +2724,11 @@ class TextureEditorTab(QWidget):
         adjustments_actions.setVerticalSpacing(8)
         self.adjustment_add_combo = QComboBox()
         self.adjustment_add_combo.addItem("Hue / Saturation", "hue_saturation")
+        self.adjustment_add_combo.addItem("Brightness / Contrast", "brightness_contrast")
+        self.adjustment_add_combo.addItem("Exposure", "exposure")
+        self.adjustment_add_combo.addItem("Vibrance", "vibrance")
+        self.adjustment_add_combo.addItem("Color Balance", "color_balance")
+        self.adjustment_add_combo.addItem("Selective Color", "selective_color")
         self.adjustment_add_combo.addItem("Levels", "levels")
         self.adjustment_add_combo.addItem("Curves", "curves")
         self.adjustment_add_button = QPushButton("Add")
@@ -1982,6 +2766,19 @@ class TextureEditorTab(QWidget):
         self.adjustment_opacity_slider.setValue(100)
         adjustments_layout.addWidget(QLabel("Adjustment opacity"))
         adjustments_layout.addWidget(self.adjustment_opacity_slider)
+        self.adjustment_mode_label = QLabel("Target")
+        self.adjustment_mode_combo = QComboBox()
+        self.adjustment_mode_combo.addItem("Reds", "reds")
+        self.adjustment_mode_combo.addItem("Greens", "greens")
+        self.adjustment_mode_combo.addItem("Blues", "blues")
+        self.adjustment_mode_combo.addItem("Cyans", "cyans")
+        self.adjustment_mode_combo.addItem("Magentas", "magentas")
+        self.adjustment_mode_combo.addItem("Yellows", "yellows")
+        self.adjustment_mode_combo.addItem("Neutrals", "neutrals")
+        self.adjustment_mode_combo.addItem("Whites", "whites")
+        self.adjustment_mode_combo.addItem("Blacks", "blacks")
+        adjustments_layout.addWidget(self.adjustment_mode_label)
+        adjustments_layout.addWidget(self.adjustment_mode_combo)
         self.adjustment_param_a_label = QLabel("Param A")
         self.adjustment_param_a_slider = QSlider(Qt.Horizontal)
         self.adjustment_param_a_slider.setRange(-100, 100)
@@ -2082,9 +2879,18 @@ class TextureEditorTab(QWidget):
         self.canvas.selection_committed.connect(self._handle_canvas_selection)
         self.canvas.clone_source_picked.connect(self._handle_clone_source_picked)
         self.canvas.color_sampled.connect(self._handle_canvas_color_sampled)
+        self.canvas.hover_info_changed.connect(self._handle_canvas_hover_changed)
         self.canvas.wheel_zoom_requested.connect(self._handle_canvas_wheel_zoom)
+        self.canvas.floating_transform_requested.connect(self._handle_canvas_floating_transform)
         self.canvas_scroll.horizontalScrollBar().valueChanged.connect(self._handle_canvas_viewport_changed)
         self.canvas_scroll.verticalScrollBar().valueChanged.connect(self._handle_canvas_viewport_changed)
+        self.navigator_widget.center_requested.connect(self._handle_navigator_center_requested)
+        self.show_rulers_checkbox.toggled.connect(self._handle_navigation_overlay_changed)
+        self.show_guides_checkbox.toggled.connect(self._handle_navigation_overlay_changed)
+        self.apply_guides_button.clicked.connect(self._handle_navigation_overlay_changed)
+        self.clear_guides_button.clicked.connect(self.clear_guides)
+        self.vertical_guides_edit.editingFinished.connect(self._handle_navigation_overlay_changed)
+        self.horizontal_guides_edit.editingFinished.connect(self._handle_navigation_overlay_changed)
         self.paint_color_button.clicked.connect(lambda: self._pick_color_into(self.paint_color_edit))
         self.paint_color_sample_button.clicked.connect(lambda: self.canvas.set_color_sample_target("paint"))
         self.secondary_color_button.clicked.connect(lambda: self._pick_color_into(self.secondary_color_edit))
@@ -2096,6 +2902,7 @@ class TextureEditorTab(QWidget):
         self.apply_recolor_button.clicked.connect(self.apply_recolor_to_active_layer)
         self.save_brush_preset_button.clicked.connect(self.save_current_brush_preset)
         self.layers_list.currentItemChanged.connect(lambda *_args: self._handle_layer_selection_changed())
+        self.layers_list.model().rowsMoved.connect(self._handle_layers_reordered_by_drag)
         self.add_layer_button.clicked.connect(self.add_layer)
         self.duplicate_layer_button.clicked.connect(self.duplicate_layer)
         self.remove_layer_button.clicked.connect(self.remove_layer)
@@ -2120,9 +2927,13 @@ class TextureEditorTab(QWidget):
         self.selection_select_all_button.clicked.connect(self.select_all_image)
         self.selection_grow_button.clicked.connect(lambda: self.adjust_selection_size(self.selection_refine_spin.value()))
         self.selection_shrink_button.clicked.connect(lambda: self.adjust_selection_size(-self.selection_refine_spin.value()))
+        self.selection_to_mask_button.clicked.connect(self.apply_selection_to_selected_layer_mask)
+        self.selection_from_mask_button.clicked.connect(self.load_selected_layer_mask_as_selection)
         self.selection_refine_spin.valueChanged.connect(self._refresh_selection_button_labels)
         self.selection_invert_checkbox.toggled.connect(self.toggle_selection_invert)
         self.selection_quick_mask_checkbox.toggled.connect(self.toggle_quick_mask)
+        self.load_custom_brush_tip_button.clicked.connect(self.load_custom_brush_tip)
+        self.clear_custom_brush_tip_button.clicked.connect(self.clear_custom_brush_tip)
         self.selection_feather_slider.valueChanged.connect(self.preview_selection_settings)
         self.selection_feather_slider.sliderReleased.connect(self.commit_selection_settings)
         self.channel_red_checkbox.toggled.connect(self._handle_channel_lock_changed)
@@ -2132,6 +2943,13 @@ class TextureEditorTab(QWidget):
         self.channel_all_button.clicked.connect(lambda: self._set_channel_lock_state(True, True, True, True))
         self.channel_rgb_button.clicked.connect(lambda: self._set_channel_lock_state(True, True, True, False))
         self.channel_alpha_only_button.clicked.connect(lambda: self._set_channel_lock_state(False, False, False, True))
+        self.channel_extract_button.clicked.connect(self.extract_active_channel_to_new_layer)
+        self.channel_pack_button.clicked.connect(self.write_active_layer_luma_to_selected_channel)
+        self.channel_selection_from_button.clicked.connect(self.load_selected_channel_as_selection)
+        self.channel_selection_to_button.clicked.connect(self.write_selection_to_selected_channel)
+        self.channel_copy_button.clicked.connect(self.copy_selected_channel)
+        self.channel_paste_button.clicked.connect(self.paste_channel_clipboard)
+        self.channel_swap_button.clicked.connect(self.swap_selected_channels)
         self.transform_float_layer_button.clicked.connect(self.float_active_layer_copy)
         self.transform_apply_button.clicked.connect(self.apply_floating_transform)
         self.transform_flip_h_button.clicked.connect(lambda: self.flip_floating_selection(True, False))
@@ -2140,6 +2958,14 @@ class TextureEditorTab(QWidget):
         self.transform_rotate_right_button.clicked.connect(lambda: self.rotate_floating_selection(90))
         self.transform_commit_button.clicked.connect(self.commit_floating_selection)
         self.transform_cancel_button.clicked.connect(self.cancel_floating_selection)
+        self.image_crop_selection_button.clicked.connect(self.crop_document_to_selection)
+        self.image_trim_button.clicked.connect(self.trim_document_transparent)
+        self.image_resize_button.clicked.connect(self.resize_document_image)
+        self.canvas_resize_button.clicked.connect(self.resize_document_canvas)
+        self.image_flip_h_button.clicked.connect(lambda: self.flip_document(True, False))
+        self.image_flip_v_button.clicked.connect(lambda: self.flip_document(False, True))
+        self.image_rotate_left_button.clicked.connect(lambda: self.rotate_document_90(False))
+        self.image_rotate_right_button.clicked.connect(lambda: self.rotate_document_90(True))
         self.layer_blend_mode_combo.currentIndexChanged.connect(self.preview_selected_layer_properties)
         self.layer_locked_checkbox.toggled.connect(self.commit_selected_layer_flags)
         self.layer_alpha_locked_checkbox.toggled.connect(self.commit_selected_layer_flags)
@@ -2154,6 +2980,7 @@ class TextureEditorTab(QWidget):
         self.adjustment_clear_mask_button.clicked.connect(self.clear_selected_adjustment_mask)
         self.adjustments_list.currentItemChanged.connect(lambda *_args: self._handle_adjustment_selection_changed())
         self.adjustment_enabled_checkbox.toggled.connect(self.commit_selected_adjustment_enabled)
+        self.adjustment_mode_combo.currentIndexChanged.connect(self._schedule_adjustment_preview)
         self.adjustment_opacity_slider.valueChanged.connect(self._schedule_adjustment_preview)
         self.adjustment_opacity_slider.sliderReleased.connect(self.commit_selected_adjustment_properties)
         self.adjustment_param_a_slider.valueChanged.connect(self._schedule_adjustment_preview)
@@ -2162,12 +2989,15 @@ class TextureEditorTab(QWidget):
         self.adjustment_param_b_slider.sliderReleased.connect(self.commit_selected_adjustment_properties)
         self.adjustment_param_c_slider.valueChanged.connect(self._schedule_adjustment_preview)
         self.adjustment_param_c_slider.sliderReleased.connect(self.commit_selected_adjustment_properties)
+        self.atlas_export_selection_button.clicked.connect(self.export_selection_region)
+        self.atlas_export_grid_button.clicked.connect(self.export_grid_slices)
         for widget in (
             self.paint_color_edit,
             self.secondary_color_edit,
             self.brush_preset_combo,
             self.brush_tip_combo,
             self.brush_pattern_combo,
+            self.symmetry_mode_combo,
             self.brush_size_slider,
             self.size_step_mode_combo,
             self.hardness_slider,
@@ -2293,6 +3123,7 @@ class TextureEditorTab(QWidget):
             pattern_index = self.brush_pattern_combo.findData(str(values["pattern"]))
             if pattern_index >= 0:
                 self.brush_pattern_combo.setCurrentIndex(pattern_index)
+            self.custom_brush_tip_path_edit.setText(str(values.get("custom_tip_path", "") or ""))
             size_mode_index = self.size_step_mode_combo.findData(str(values.get("size_step_mode", "normal")))
             if size_mode_index >= 0:
                 self.size_step_mode_combo.setCurrentIndex(size_mode_index)
@@ -2315,6 +3146,7 @@ class TextureEditorTab(QWidget):
             "spacing": int(self.spacing_slider.value()),
             "tip": str(self.brush_tip_combo.currentData() or "round"),
             "pattern": str(self.brush_pattern_combo.currentData() or "solid"),
+            "custom_tip_path": self.custom_brush_tip_path_edit.text().strip(),
             "roundness": int(self.roundness_slider.value()),
             "angle": int(self.angle_slider.value()),
             "smoothing": int(self.smoothing_slider.value()),
@@ -2323,6 +3155,36 @@ class TextureEditorTab(QWidget):
         self._store_custom_brush_presets()
         self._rebuild_brush_preset_combo(preserve_key=preset_name)
         self._set_status(f"Saved brush preset '{preset_name}'.", False)
+
+    def load_custom_brush_tip(self) -> None:
+        path_text, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load brush image stamp",
+            self._last_open_dir,
+            "Image files (*.png *.jpg *.jpeg *.bmp *.tga *.webp);;All files (*.*)",
+        )
+        if not path_text:
+            return
+        resolved = str(Path(path_text).expanduser().resolve())
+        self.custom_brush_tip_path_edit.setText(resolved)
+        image_stamp_index = self.brush_tip_combo.findData("image_stamp")
+        if image_stamp_index >= 0:
+            self.brush_tip_combo.setCurrentIndex(image_stamp_index)
+        self._mark_brush_preset_custom()
+        self._handle_tool_settings_changed()
+        self._set_status("Loaded custom brush image stamp.", False)
+
+    def clear_custom_brush_tip(self) -> None:
+        if not self.custom_brush_tip_path_edit.text().strip():
+            return
+        self.custom_brush_tip_path_edit.clear()
+        if self.brush_tip_combo.currentData() == "image_stamp":
+            round_index = self.brush_tip_combo.findData("round")
+            if round_index >= 0:
+                self.brush_tip_combo.setCurrentIndex(round_index)
+        self._mark_brush_preset_custom()
+        self._handle_tool_settings_changed()
+        self._set_status("Cleared custom brush image stamp.", False)
 
     def _mark_brush_preset_custom(self) -> None:
         if self.brush_preset_combo.currentData() == "custom":
@@ -2349,6 +3211,11 @@ class TextureEditorTab(QWidget):
         brush_pattern_index = self.brush_pattern_combo.findData(brush_pattern)
         if brush_pattern_index >= 0:
             self.brush_pattern_combo.setCurrentIndex(brush_pattern_index)
+        self.custom_brush_tip_path_edit.setText(str(self.settings.value("texture_editor/custom_brush_tip_path", "")))
+        symmetry_mode = str(self.settings.value("texture_editor/symmetry_mode", "off"))
+        symmetry_mode_index = self.symmetry_mode_combo.findData(symmetry_mode)
+        if symmetry_mode_index >= 0:
+            self.symmetry_mode_combo.setCurrentIndex(symmetry_mode_index)
         self.brush_size_slider.setValue(int(self.settings.value("texture_editor/brush_size", 32)))
         size_step_mode = str(self.settings.value("texture_editor/size_step_mode", "normal"))
         size_step_index = self.size_step_mode_combo.findData(size_step_mode)
@@ -2425,6 +3292,8 @@ class TextureEditorTab(QWidget):
         self.settings.setValue("texture_editor/brush_preset", self.brush_preset_combo.currentData())
         self.settings.setValue("texture_editor/brush_tip", self.brush_tip_combo.currentData())
         self.settings.setValue("texture_editor/brush_pattern", self.brush_pattern_combo.currentData())
+        self.settings.setValue("texture_editor/custom_brush_tip_path", self.custom_brush_tip_path_edit.text())
+        self.settings.setValue("texture_editor/symmetry_mode", self.symmetry_mode_combo.currentData())
         self.settings.setValue("texture_editor/brush_size", self.brush_size_slider.value())
         self.settings.setValue("texture_editor/size_step_mode", self.size_step_mode_combo.currentData())
         self.settings.setValue("texture_editor/hardness", self.hardness_slider.value())
@@ -2671,6 +3540,8 @@ class TextureEditorTab(QWidget):
             brush_preset=str(self.brush_preset_combo.currentData() or "custom"),
             brush_tip=str(self.brush_tip_combo.currentData() or "round"),
             brush_pattern=str(self.brush_pattern_combo.currentData() or "solid"),
+            custom_brush_tip_path=self.custom_brush_tip_path_edit.text().strip(),
+            symmetry_mode=str(self.symmetry_mode_combo.currentData() or "off"),
             size=float(self.brush_size_slider.value()),
             size_step_mode=str(self.size_step_mode_combo.currentData() or "normal"),
             hardness=self.hardness_slider.value(),
@@ -2713,6 +3584,7 @@ class TextureEditorTab(QWidget):
             angle_degrees=self.current_tool_settings.angle_degrees,
             pattern=self.current_tool_settings.brush_pattern,
         )
+        self.canvas.set_symmetry_mode(self.current_tool_settings.symmetry_mode)
         self._save_settings()
         self._refresh_tool_visibility()
 
@@ -2759,7 +3631,7 @@ class TextureEditorTab(QWidget):
         if tool_key == "fill":
             return "Fill tool active. Click to flood-fill the active layer using the current color, tolerance, and blend mode. Alt+click samples a color into the paint swatch."
         if tool_key == "paint":
-            return "Paint tool active. Brush presets, tips, and patterns are available here. Alt+click samples a color into the paint swatch."
+            return "Paint tool active. Brush presets, image stamps, patterns, and symmetry are available here. Alt+click samples a color into the paint swatch."
         return f"{tool_key.replace('_', ' ').title()} tool active."
 
     def _refresh_tool_visibility(self) -> None:
@@ -2767,7 +3639,9 @@ class TextureEditorTab(QWidget):
         visible_keys = {
             "brush_preset": tool in {"paint", "erase", "clone", "heal", "sharpen", "soften", "smudge", "dodge_burn"},
             "brush_tip": tool in {"paint", "erase", "clone", "heal", "sharpen", "soften", "smudge", "dodge_burn"},
+            "custom_brush_tip": tool in {"paint", "erase", "clone", "heal", "smudge", "dodge_burn"} and str(self.brush_tip_combo.currentData() or "round") == "image_stamp",
             "brush_pattern": tool in {"paint", "erase", "clone", "heal", "smudge", "dodge_burn"},
+            "symmetry_mode": tool in {"paint", "erase", "sharpen", "soften", "smudge", "dodge_burn"},
             "paint_color": tool in {"paint", "fill", "gradient"},
             "secondary_color": tool == "gradient",
             "brush_size": tool in {"paint", "erase", "clone", "heal", "sharpen", "soften", "smudge", "dodge_burn"},
@@ -2864,6 +3738,133 @@ class TextureEditorTab(QWidget):
             return ""
         return self.document.project_path.as_posix() if self.document.project_path is not None else self.document.title
 
+    def _parse_guides_text(self, text: str) -> Tuple[int, ...]:
+        values: List[int] = []
+        for raw in (text or "").replace(";", ",").split(","):
+            token = raw.strip()
+            if not token:
+                continue
+            try:
+                values.append(max(0, int(round(float(token)))))
+            except Exception:
+                continue
+        return tuple(sorted(dict.fromkeys(values)))
+
+    def _guides_text(self, values: Sequence[int]) -> str:
+        return ", ".join(str(max(0, int(value))) for value in values)
+
+    def _refresh_navigation_overlays(self) -> None:
+        has_doc = self.document is not None
+        show_rulers = bool(self._show_rulers and has_doc)
+        self.top_ruler.setVisible(show_rulers)
+        self.left_ruler.setVisible(show_rulers)
+        self.ruler_corner.setVisible(show_rulers)
+        vertical_guides = self._vertical_guides if has_doc else ()
+        horizontal_guides = self._horizontal_guides if has_doc else ()
+        self.canvas.set_guide_state(
+            enabled=bool(self._show_guides and has_doc),
+            vertical_guides=vertical_guides,
+            horizontal_guides=horizontal_guides,
+        )
+        if not has_doc:
+            self.top_ruler.set_state(
+                image_length=0,
+                other_length=0,
+                display_scale=1.0,
+                scroll_value=0,
+                hover_position=None,
+                guides=(),
+            )
+            self.left_ruler.set_state(
+                image_length=0,
+                other_length=0,
+                display_scale=1.0,
+                scroll_value=0,
+                hover_position=None,
+                guides=(),
+            )
+            self.navigator_widget.set_state(None, image_width=0, image_height=0, viewport_rect=None)
+            return
+        scale = max(0.0001, self.canvas.current_display_scale())
+        scroll_x = int(self.canvas_scroll.horizontalScrollBar().value())
+        scroll_y = int(self.canvas_scroll.verticalScrollBar().value())
+        hover_x = None if self._hover_pixel_info is None else int(self._hover_pixel_info.get("x", 0))
+        hover_y = None if self._hover_pixel_info is None else int(self._hover_pixel_info.get("y", 0))
+        self.top_ruler.set_state(
+            image_length=int(self.document.width),
+            other_length=int(self.document.height),
+            display_scale=scale,
+            scroll_value=scroll_x,
+            hover_position=hover_x,
+            guides=vertical_guides,
+        )
+        self.left_ruler.set_state(
+            image_length=int(self.document.height),
+            other_length=int(self.document.width),
+            display_scale=scale,
+            scroll_value=scroll_y,
+            hover_position=hover_y,
+            guides=horizontal_guides,
+        )
+        display_image = getattr(self.canvas, "_display_image", None) or getattr(self.canvas, "_image", None)
+        viewport = self.canvas_scroll.viewport().size()
+        visible_w = min(float(self.document.width), max(1.0, float(viewport.width()) / scale))
+        visible_h = min(float(self.document.height), max(1.0, float(viewport.height()) / scale))
+        viewport_rect = (
+            max(0.0, float(scroll_x) / scale),
+            max(0.0, float(scroll_y) / scale),
+            visible_w,
+            visible_h,
+        )
+        self.navigator_widget.set_state(
+            display_image,
+            image_width=int(self.document.width),
+            image_height=int(self.document.height),
+            viewport_rect=viewport_rect,
+        )
+
+    def _handle_navigation_overlay_changed(self, *_args) -> None:
+        self._show_rulers = bool(self.show_rulers_checkbox.isChecked())
+        self._show_guides = bool(self.show_guides_checkbox.isChecked())
+        self._vertical_guides = self._parse_guides_text(self.vertical_guides_edit.text())
+        self._horizontal_guides = self._parse_guides_text(self.horizontal_guides_edit.text())
+        self.vertical_guides_edit.blockSignals(True)
+        self.horizontal_guides_edit.blockSignals(True)
+        self.vertical_guides_edit.setText(self._guides_text(self._vertical_guides))
+        self.horizontal_guides_edit.setText(self._guides_text(self._horizontal_guides))
+        self.vertical_guides_edit.blockSignals(False)
+        self.horizontal_guides_edit.blockSignals(False)
+        self._refresh_navigation_overlays()
+        document_key = self._active_document_key()
+        if document_key:
+            self.workspace.document_view_state[document_key] = self._capture_view_state()
+
+    def clear_guides(self) -> None:
+        self.vertical_guides_edit.setText("")
+        self.horizontal_guides_edit.setText("")
+        self._handle_navigation_overlay_changed()
+        self._set_status("Texture Editor guides cleared.", False)
+
+    def _handle_canvas_hover_changed(self, payload: object) -> None:
+        self._hover_pixel_info = payload if isinstance(payload, dict) else None
+        self._refresh_canvas_status_strip()
+        self._refresh_navigation_overlays()
+
+    def _handle_navigator_center_requested(self, image_x: float, image_y: float) -> None:
+        if self.document is None:
+            return
+        scale = max(0.0001, self.canvas.current_display_scale())
+        viewport = self.canvas_scroll.viewport().size()
+        target_x = int(round((float(image_x) * scale) - (float(viewport.width()) / 2.0)))
+        target_y = int(round((float(image_y) * scale) - (float(viewport.height()) / 2.0)))
+        hbar = self.canvas_scroll.horizontalScrollBar()
+        vbar = self.canvas_scroll.verticalScrollBar()
+        hbar.setValue(max(hbar.minimum(), min(hbar.maximum(), target_x)))
+        vbar.setValue(max(vbar.minimum(), min(vbar.maximum(), target_y)))
+        document_key = self._active_document_key()
+        if document_key:
+            self.workspace.document_view_state[document_key] = self._capture_view_state()
+
     def _capture_view_state(self) -> Dict[str, object]:
         return {
             "zoom_factor": float(self.canvas.current_display_scale()),
@@ -2872,16 +3873,33 @@ class TextureEditorTab(QWidget):
             "compare_split": int(self.compare_split_slider.value()),
             "grid_enabled": bool(self.grid_checkbox.isChecked()),
             "grid_size": int(self.grid_size_spin.value()),
+            "show_rulers": bool(self._show_rulers),
+            "show_guides": bool(self._show_guides),
+            "vertical_guides": list(self._vertical_guides),
+            "horizontal_guides": list(self._horizontal_guides),
             "scroll_x": int(self.canvas_scroll.horizontalScrollBar().value()),
             "scroll_y": int(self.canvas_scroll.verticalScrollBar().value()),
         }
 
     def _apply_view_state(self, state: Optional[Dict[str, object]]) -> None:
         if not state:
+            self.show_rulers_checkbox.blockSignals(True)
+            self.show_guides_checkbox.blockSignals(True)
+            self.show_rulers_checkbox.setChecked(True)
+            self.show_guides_checkbox.setChecked(False)
+            self.show_rulers_checkbox.blockSignals(False)
+            self.show_guides_checkbox.blockSignals(False)
+            self._show_rulers = True
+            self._show_guides = False
+            self._vertical_guides = ()
+            self._horizontal_guides = ()
+            self.vertical_guides_edit.setText("")
+            self.horizontal_guides_edit.setText("")
             self.canvas.set_zoom_factor(1.0)
             self.canvas_scroll.horizontalScrollBar().setValue(0)
             self.canvas_scroll.verticalScrollBar().setValue(0)
             self._refresh_zoom_indicators()
+            self._refresh_navigation_overlays()
             return
         view_mode = str(state.get("view_mode", "edited"))
         index = self.view_mode_combo.findData(view_mode)
@@ -2898,6 +3916,20 @@ class TextureEditorTab(QWidget):
         self.grid_size_spin.blockSignals(True)
         self.grid_size_spin.setValue(int(state.get("grid_size", self.grid_size_spin.value())))
         self.grid_size_spin.blockSignals(False)
+        self.show_rulers_checkbox.blockSignals(True)
+        self.show_guides_checkbox.blockSignals(True)
+        self.show_rulers_checkbox.setChecked(bool(state.get("show_rulers", True)))
+        self.show_guides_checkbox.setChecked(bool(state.get("show_guides", False)))
+        self.show_rulers_checkbox.blockSignals(False)
+        self.show_guides_checkbox.blockSignals(False)
+        vertical_guides = state.get("vertical_guides") or []
+        horizontal_guides = state.get("horizontal_guides") or []
+        self._show_rulers = bool(self.show_rulers_checkbox.isChecked())
+        self._show_guides = bool(self.show_guides_checkbox.isChecked())
+        self._vertical_guides = tuple(int(value) for value in vertical_guides if isinstance(value, (int, float)))
+        self._horizontal_guides = tuple(int(value) for value in horizontal_guides if isinstance(value, (int, float)))
+        self.vertical_guides_edit.setText(self._guides_text(self._vertical_guides))
+        self.horizontal_guides_edit.setText(self._guides_text(self._horizontal_guides))
         if bool(state.get("fit_to_view", True)):
             self.canvas.set_fit_to_view(True)
         else:
@@ -2905,6 +3937,7 @@ class TextureEditorTab(QWidget):
             self.canvas_scroll.horizontalScrollBar().setValue(int(state.get("scroll_x", 0)))
             self.canvas_scroll.verticalScrollBar().setValue(int(state.get("scroll_y", 0)))
         self._refresh_zoom_indicators()
+        self._refresh_navigation_overlays()
 
     def _run_async_task(
         self,
@@ -3247,6 +4280,329 @@ class TextureEditorTab(QWidget):
             False,
         )
 
+    def extract_active_channel_to_new_layer(self) -> None:
+        if self.document is None:
+            return
+        layer_id = self._current_layer_id() or self.document.active_layer_id
+        if not layer_id or layer_id not in self.layer_pixels:
+            return
+        layer = next((candidate for candidate in self.document.layers if candidate.layer_id == layer_id), None)
+        if layer is None:
+            return
+        channel_key = str(self.channel_extract_combo.currentData() or "alpha")
+        before_document = dataclasses.replace(self.document)
+        before_layer_pixels = dict(self.layer_pixels)
+        extracted = extract_texture_editor_layer_channel_to_rgba(self.layer_pixels[layer_id], channel_key)
+        self.document, self.layer_pixels, new_id = add_texture_editor_layer(
+            self.document,
+            self.layer_pixels,
+            name=f"{layer.name} {channel_key.title()}",
+            initial_pixels=extracted,
+            offset_x=int(layer.offset_x),
+            offset_y=int(layer.offset_y),
+        )
+        self._record_history_change(
+            f"Extract {channel_key.title()} Channel",
+            before_document=before_document,
+            before_layer_pixels=before_layer_pixels,
+            kind="channel_extract",
+            tracked_layer_ids=[layer_id, new_id],
+            force_checkpoint=True,
+        )
+        self._refresh_ui()
+        for row in range(self.layers_list.count()):
+            item = self.layers_list.item(row)
+            if item is not None and item.data(Qt.UserRole) == new_id:
+                self.layers_list.setCurrentItem(item)
+                break
+        self._set_status(f"Extracted the {channel_key.title()} channel into a new layer.", False)
+
+    def write_active_layer_luma_to_selected_channel(self) -> None:
+        if self.document is None:
+            return
+        layer_id = self._current_layer_id() or self.document.active_layer_id
+        if not layer_id or layer_id not in self.layer_pixels:
+            return
+        layer = next((candidate for candidate in self.document.layers if candidate.layer_id == layer_id), None)
+        if layer is None:
+            return
+        channel_key = str(self.channel_pack_combo.currentData() or "alpha")
+        before_document = dataclasses.replace(self.document)
+        before_layer_pixels = {layer_id: self.layer_pixels[layer_id].copy()}
+        updated = write_texture_editor_layer_luma_to_channel(self.layer_pixels[layer_id], channel_key)
+        if layer.alpha_locked and channel_key == "alpha":
+            self._set_status("Unlock alpha before packing luminance into the alpha channel.", True)
+            return
+        self.layer_pixels[layer_id] = updated
+        self.document = bump_texture_editor_layer_revision(self.document, layer_id)
+        self._invalidate_layer_thumbnail(layer_id)
+        self._invalidate_composite_cache()
+        self._record_history_change(
+            f"Pack Luma To {channel_key.title()}",
+            before_document=before_document,
+            before_layer_pixels=before_layer_pixels,
+            kind="channel_pack",
+            tracked_layer_ids=[layer_id],
+        )
+        self._refresh_ui()
+        self._set_status(f"Packed active-layer luminance into the {channel_key.title()} channel.", False)
+
+    def load_selected_channel_as_selection(self) -> None:
+        if self.document is None:
+            return
+        layer_id = self._current_layer_id() or self.document.active_layer_id
+        if not layer_id or layer_id not in self.layer_pixels:
+            return
+        layer = next((candidate for candidate in self.document.layers if candidate.layer_id == layer_id), None)
+        if layer is None:
+            return
+        channel_key = str(self.channel_selection_combo.currentData() or "alpha")
+        before_document = dataclasses.replace(self.document)
+        self.document = load_texture_editor_layer_channel_as_selection(
+            self.document,
+            layer,
+            self.layer_pixels[layer_id],
+            channel_key,
+            mask_pixels=self.layer_pixels.get(layer.mask_layer_id) if layer.mask_layer_id else None,
+            combine_mode=str(self.selection_mode_combo.currentData() or "replace"),
+        )
+        self._record_history_change(
+            f"Load {channel_key.title()} Channel As Selection",
+            before_document=before_document,
+            before_layer_pixels={},
+            kind="selection_update",
+            tracked_layer_ids=[],
+        )
+        self._refresh_ui()
+        self._set_status(f"Loaded the {channel_key.title()} channel as a selection.", False)
+
+    def write_selection_to_selected_channel(self) -> None:
+        if self.document is None or self.document.selection.mode == "none":
+            self._set_status("Create a selection first, then write it to a channel.", True)
+            return
+        layer_id = self._current_layer_id() or self.document.active_layer_id
+        if not layer_id or layer_id not in self.layer_pixels:
+            return
+        layer = next((candidate for candidate in self.document.layers if candidate.layer_id == layer_id), None)
+        if layer is None:
+            return
+        channel_key = str(self.channel_selection_to_combo.currentData() or "alpha")
+        if layer.alpha_locked and channel_key == "alpha":
+            self._set_status("Unlock alpha before writing the selection into the alpha channel.", True)
+            return
+        before_document = dataclasses.replace(self.document)
+        before_layer_pixels = {layer_id: self.layer_pixels[layer_id].copy()}
+        updated = write_texture_editor_selection_to_layer_channel(
+            self.document,
+            layer,
+            self.layer_pixels[layer_id],
+            channel_key,
+        )
+        self.layer_pixels[layer_id] = updated
+        self.document = bump_texture_editor_layer_revision(self.document, layer_id)
+        self._invalidate_layer_thumbnail(layer_id)
+        self._invalidate_composite_cache()
+        self._record_history_change(
+            f"Write Selection To {channel_key.title()}",
+            before_document=before_document,
+            before_layer_pixels=before_layer_pixels,
+            kind="channel_pack",
+            tracked_layer_ids=[layer_id],
+        )
+        self._refresh_ui()
+        self._set_status(f"Wrote the current selection into the {channel_key.title()} channel.", False)
+
+    def copy_selected_channel(self) -> None:
+        if self.document is None:
+            return
+        layer_id = self._current_layer_id() or self.document.active_layer_id
+        if not layer_id or layer_id not in self.layer_pixels:
+            return
+        channel_key = str(self.channel_copy_combo.currentData() or "alpha")
+        self.channel_clipboard = (
+            copy_texture_editor_layer_channel(self.layer_pixels[layer_id], channel_key),
+            channel_key,
+        )
+        self._refresh_channel_controls()
+        self._set_status(f"Copied the {channel_key.title()} channel to the editor clipboard.", False)
+
+    def paste_channel_clipboard(self) -> None:
+        if self.document is None or self.channel_clipboard is None:
+            return
+        layer_id = self._current_layer_id() or self.document.active_layer_id
+        if not layer_id or layer_id not in self.layer_pixels:
+            return
+        layer = next((candidate for candidate in self.document.layers if candidate.layer_id == layer_id), None)
+        if layer is None:
+            return
+        channel_key = str(self.channel_paste_combo.currentData() or "alpha")
+        if layer.alpha_locked and channel_key == "alpha":
+            self._set_status("Unlock alpha before pasting into the alpha channel.", True)
+            return
+        before_document = dataclasses.replace(self.document)
+        before_layer_pixels = {layer_id: self.layer_pixels[layer_id].copy()}
+        channel_data, _source_key = self.channel_clipboard
+        self.layer_pixels[layer_id] = paste_texture_editor_channel_into_layer(
+            self.layer_pixels[layer_id],
+            channel_key,
+            channel_data,
+        )
+        self.document = bump_texture_editor_layer_revision(self.document, layer_id)
+        self._invalidate_layer_thumbnail(layer_id)
+        self._invalidate_composite_cache()
+        self._record_history_change(
+            f"Paste Channel To {channel_key.title()}",
+            before_document=before_document,
+            before_layer_pixels=before_layer_pixels,
+            kind="channel_pack",
+            tracked_layer_ids=[layer_id],
+        )
+        self._refresh_ui()
+        self._set_status(f"Pasted the channel clipboard into the {channel_key.title()} channel.", False)
+
+    def swap_selected_channels(self) -> None:
+        if self.document is None:
+            return
+        layer_id = self._current_layer_id() or self.document.active_layer_id
+        if not layer_id or layer_id not in self.layer_pixels:
+            return
+        layer = next((candidate for candidate in self.document.layers if candidate.layer_id == layer_id), None)
+        if layer is None:
+            return
+        channel_a = str(self.channel_swap_a_combo.currentData() or "red")
+        channel_b = str(self.channel_swap_b_combo.currentData() or "blue")
+        if channel_a == channel_b:
+            self._set_status("Choose two different channels to swap.", True)
+            return
+        if layer.alpha_locked and "alpha" in {channel_a, channel_b}:
+            self._set_status("Unlock alpha before swapping with the alpha channel.", True)
+            return
+        before_document = dataclasses.replace(self.document)
+        before_layer_pixels = {layer_id: self.layer_pixels[layer_id].copy()}
+        self.layer_pixels[layer_id] = swap_texture_editor_layer_channels(
+            self.layer_pixels[layer_id],
+            channel_a,
+            channel_b,
+        )
+        self.document = bump_texture_editor_layer_revision(self.document, layer_id)
+        self._invalidate_layer_thumbnail(layer_id)
+        self._invalidate_composite_cache()
+        self._record_history_change(
+            f"Swap {channel_a.title()} / {channel_b.title()}",
+            before_document=before_document,
+            before_layer_pixels=before_layer_pixels,
+            kind="channel_pack",
+            tracked_layer_ids=[layer_id],
+        )
+        self._refresh_ui()
+        self._set_status(f"Swapped the {channel_a.title()} and {channel_b.title()} channels.", False)
+
+    def _prompt_document_dimensions(
+        self,
+        *,
+        title: str,
+        width: int,
+        height: int,
+        allow_anchor: bool = False,
+        keep_aspect_default: bool = False,
+    ) -> Optional[Tuple[int, int, str]]:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+        width_spin = QSpinBox(dialog)
+        width_spin.setRange(1, 16384)
+        width_spin.setValue(max(1, int(width)))
+        height_spin = QSpinBox(dialog)
+        height_spin.setRange(1, 16384)
+        height_spin.setValue(max(1, int(height)))
+        form.addRow("Width", width_spin)
+        form.addRow("Height", height_spin)
+        keep_aspect_checkbox: Optional[QCheckBox] = None
+        if not allow_anchor:
+            keep_aspect_checkbox = QCheckBox("Keep aspect ratio", dialog)
+            keep_aspect_checkbox.setChecked(bool(keep_aspect_default))
+            form.addRow("", keep_aspect_checkbox)
+            base_ratio = float(max(1, int(width))) / float(max(1, int(height)))
+            updating = {"active": False}
+
+            def _sync_from_width(value: int) -> None:
+                if keep_aspect_checkbox is None or not keep_aspect_checkbox.isChecked() or updating["active"]:
+                    return
+                updating["active"] = True
+                try:
+                    height_spin.setValue(max(1, int(round(float(value) / max(base_ratio, 1e-6)))))
+                finally:
+                    updating["active"] = False
+
+            def _sync_from_height(value: int) -> None:
+                if keep_aspect_checkbox is None or not keep_aspect_checkbox.isChecked() or updating["active"]:
+                    return
+                updating["active"] = True
+                try:
+                    width_spin.setValue(max(1, int(round(float(value) * base_ratio))))
+                finally:
+                    updating["active"] = False
+
+            width_spin.valueChanged.connect(_sync_from_width)
+            height_spin.valueChanged.connect(_sync_from_height)
+        anchor_combo: Optional[QComboBox] = None
+        if allow_anchor:
+            anchor_combo = QComboBox(dialog)
+            anchor_combo.addItem("Top Left", "top_left")
+            anchor_combo.addItem("Center", "center")
+            form.addRow("Anchor", anchor_combo)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dialog)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        anchor_value = str(anchor_combo.currentData() or "top_left") if anchor_combo is not None else "top_left"
+        return (int(width_spin.value()), int(height_spin.value()), anchor_value)
+
+    def resize_document_image(self) -> None:
+        if self.document is None:
+            return
+        result = self._prompt_document_dimensions(
+            title="Image Size",
+            width=self.document.width,
+            height=self.document.height,
+            allow_anchor=False,
+            keep_aspect_default=True,
+        )
+        if result is None:
+            return
+        new_width, new_height, _anchor = result
+        self._apply_document_pixels_change(
+            "Image Size",
+            lambda: resize_texture_editor_document_image(self.document, self.layer_pixels, new_width, new_height),
+        )
+
+    def resize_document_canvas(self) -> None:
+        if self.document is None:
+            return
+        result = self._prompt_document_dimensions(
+            title="Canvas Size",
+            width=self.document.width,
+            height=self.document.height,
+            allow_anchor=True,
+        )
+        if result is None:
+            return
+        new_width, new_height, anchor = result
+        self._apply_document_pixels_change(
+            "Canvas Size",
+            lambda: resize_texture_editor_document_canvas(
+                self.document,
+                self.layer_pixels,
+                new_width,
+                new_height,
+                anchor=anchor,
+            ),
+        )
+
     def _adjust_zoom(self, step: int) -> None:
         current = self.canvas.current_display_scale()
         factor = current * (1.15 if step > 0 else 0.87)
@@ -3289,6 +4645,7 @@ class TextureEditorTab(QWidget):
     def _set_fit_mode(self, fit_to_view: bool) -> None:
         self.canvas.set_fit_to_view(fit_to_view)
         self._refresh_zoom_indicators()
+        self._refresh_navigation_overlays()
         document_key = self._active_document_key()
         if document_key:
             self.workspace.document_view_state[document_key] = self._capture_view_state()
@@ -3296,6 +4653,7 @@ class TextureEditorTab(QWidget):
     def _set_zoom(self, factor: float) -> None:
         self.canvas.set_zoom_factor(factor)
         self._refresh_zoom_indicators()
+        self._refresh_navigation_overlays()
         document_key = self._active_document_key()
         if document_key:
             self.workspace.document_view_state[document_key] = self._capture_view_state()
@@ -3304,6 +4662,7 @@ class TextureEditorTab(QWidget):
         mode = str(self.view_mode_combo.currentData() or "edited")
         self.compare_split_slider.setVisible(mode == "split")
         self.canvas.set_view_mode(mode)
+        self._refresh_navigation_overlays()
         document_key = self._active_document_key()
         if document_key:
             self.workspace.document_view_state[document_key] = self._capture_view_state()
@@ -3311,6 +4670,7 @@ class TextureEditorTab(QWidget):
 
     def _handle_compare_split_changed(self, value: int) -> None:
         self.canvas.set_compare_split_percent(value)
+        self._refresh_navigation_overlays()
         document_key = self._active_document_key()
         if document_key:
             self.workspace.document_view_state[document_key] = self._capture_view_state()
@@ -3321,6 +4681,7 @@ class TextureEditorTab(QWidget):
             enabled=self.grid_checkbox.isChecked(),
             grid_size=self.grid_size_spin.value(),
         )
+        self._refresh_navigation_overlays()
         document_key = self._active_document_key()
         if document_key:
             self.workspace.document_view_state[document_key] = self._capture_view_state()
@@ -3328,6 +4689,7 @@ class TextureEditorTab(QWidget):
 
     def _handle_canvas_viewport_changed(self, *_args) -> None:
         self._refresh_zoom_indicators()
+        self._refresh_navigation_overlays()
         document_key = self._active_document_key()
         if document_key:
             self.workspace.document_view_state[document_key] = self._capture_view_state()
@@ -3347,6 +4709,90 @@ class TextureEditorTab(QWidget):
         elif decoded.shape[2] == 3:
             decoded = cv2.cvtColor(decoded, cv2.COLOR_BGR2BGRA)
         return np.asarray(cv2.cvtColor(decoded, cv2.COLOR_BGRA2RGBA), dtype=np.uint8).copy()
+
+    def _history_layer_canvas_offset(self, document: TextureEditorDocument, layer_id: str) -> Tuple[int, int]:
+        for layer in document.layers:
+            if layer.layer_id == layer_id or layer.mask_layer_id == layer_id:
+                return (int(layer.offset_x), int(layer.offset_y))
+        return (0, 0)
+
+    def _encode_history_layer_state(
+        self,
+        document: TextureEditorDocument,
+        layer_id: str,
+        pixels: Optional[np.ndarray],
+        *,
+        dirty_bounds: Optional[Tuple[int, int, int, int]],
+        previous_pixels: Optional[np.ndarray] = None,
+    ) -> Optional[object]:
+        if pixels is None:
+            return None
+        if dirty_bounds is None or previous_pixels is None or previous_pixels.shape != pixels.shape:
+            return self._encode_rgba_blob(pixels)
+        offset_x, offset_y = self._history_layer_canvas_offset(document, layer_id)
+        dirty_x, dirty_y, dirty_w, dirty_h = dirty_bounds
+        gx0 = max(int(offset_x), int(dirty_x))
+        gy0 = max(int(offset_y), int(dirty_y))
+        gx1 = min(int(offset_x + pixels.shape[1]), int(dirty_x + dirty_w))
+        gy1 = min(int(offset_y + pixels.shape[0]), int(dirty_y + dirty_h))
+        if gx1 <= gx0 or gy1 <= gy0:
+            return None
+        lx0 = int(gx0 - offset_x)
+        ly0 = int(gy0 - offset_y)
+        lw = int(gx1 - gx0)
+        lh = int(gy1 - gy0)
+        if lw <= 0 or lh <= 0:
+            return None
+        patch_area = lw * lh
+        full_area = max(1, int(pixels.shape[0]) * int(pixels.shape[1]))
+        if patch_area >= int(full_area * 0.6):
+            return self._encode_rgba_blob(pixels)
+        patch = pixels[ly0:ly0 + lh, lx0:lx0 + lw]
+        return {
+            "mode": "patch",
+            "shape": [int(pixels.shape[0]), int(pixels.shape[1])],
+            "local_bounds": [lx0, ly0, lw, lh],
+            "blob": self._encode_rgba_blob(patch),
+        }
+
+    def _decode_history_layer_state(
+        self,
+        current_pixels: Optional[np.ndarray],
+        payload: object,
+    ) -> Optional[np.ndarray]:
+        if payload is None:
+            return None
+        if isinstance(payload, (bytes, bytearray)):
+            return self._decode_rgba_blob(bytes(payload))
+        if not isinstance(payload, dict):
+            return None
+        mode = str(payload.get("mode", "") or "")
+        if mode != "patch":
+            blob = payload.get("blob")
+            return self._decode_rgba_blob(blob if isinstance(blob, (bytes, bytearray)) else None)
+        shape_raw = payload.get("shape")
+        bounds_raw = payload.get("local_bounds")
+        blob = payload.get("blob")
+        if not (
+            isinstance(shape_raw, list)
+            and len(shape_raw) == 2
+            and isinstance(bounds_raw, list)
+            and len(bounds_raw) == 4
+            and isinstance(blob, (bytes, bytearray))
+        ):
+            return None
+        target_h = max(1, int(shape_raw[0]))
+        target_w = max(1, int(shape_raw[1]))
+        lx0, ly0, lw, lh = (max(0, int(value)) for value in bounds_raw)
+        patch = self._decode_rgba_blob(bytes(blob))
+        if patch is None:
+            return None
+        if current_pixels is not None and current_pixels.shape == (target_h, target_w, 4):
+            restored = current_pixels.copy()
+        else:
+            restored = np.zeros((target_h, target_w, 4), dtype=np.uint8)
+        restored[ly0:ly0 + min(lh, patch.shape[0]), lx0:lx0 + min(lw, patch.shape[1])] = patch[:lh, :lw]
+        return restored
 
     def _history_auxiliary_layer_ids(self, document: TextureEditorDocument) -> set[str]:
         aux_ids: set[str] = set()
@@ -3393,13 +4839,31 @@ class TextureEditorTab(QWidget):
                 tracked_ids.update(layer.layer_id for layer in self.document.layers)
                 tracked_ids.update(self._history_auxiliary_layer_ids(before_document))
                 tracked_ids.update(self._history_auxiliary_layer_ids(self.document))
-            before_blobs: Dict[str, Optional[bytes]] = {}
-            after_blobs: Dict[str, Optional[bytes]] = {}
+            before_blobs: Dict[str, object] = {}
+            after_blobs: Dict[str, object] = {}
             for layer_id in tracked_ids:
                 before_pixels = before_layer_pixels.get(layer_id)
                 after_pixels = self.layer_pixels.get(layer_id)
-                before_blobs[layer_id] = None if before_pixels is None else self._encode_rgba_blob(before_pixels)
-                after_blobs[layer_id] = None if after_pixels is None else self._encode_rgba_blob(after_pixels)
+                if before_pixels is not None and after_pixels is not None and before_pixels.shape == after_pixels.shape and np.array_equal(before_pixels, after_pixels):
+                    continue
+                before_payload = self._encode_history_layer_state(
+                    before_document,
+                    layer_id,
+                    before_pixels,
+                    dirty_bounds=dirty_bounds,
+                    previous_pixels=after_pixels,
+                )
+                after_payload = self._encode_history_layer_state(
+                    self.document,
+                    layer_id,
+                    after_pixels,
+                    dirty_bounds=dirty_bounds,
+                    previous_pixels=before_pixels,
+                )
+                if before_payload is None and after_payload is None:
+                    continue
+                before_blobs[layer_id] = before_payload
+                after_blobs[layer_id] = after_payload
             command = TextureEditorCommand(
                 kind=kind,
                 label=label,
@@ -3437,7 +4901,7 @@ class TextureEditorTab(QWidget):
     def _apply_history_document_state(
         self,
         document: TextureEditorDocument,
-        layer_blobs: Dict[str, Optional[bytes]],
+        layer_blobs: Dict[str, object],
     ) -> None:
         current_pixels = dict(self.layer_pixels)
         target_ids = {layer.layer_id for layer in document.layers}
@@ -3450,7 +4914,7 @@ class TextureEditorTab(QWidget):
             if blob is None:
                 new_pixels.pop(layer_id, None)
                 continue
-            decoded = self._decode_rgba_blob(blob)
+            decoded = self._decode_history_layer_state(new_pixels.get(layer_id), blob)
             if decoded is not None:
                 new_pixels[layer_id] = decoded
         self.document = document
@@ -3595,6 +5059,32 @@ class TextureEditorTab(QWidget):
             return layer_id
         return layer.mask_layer_id
 
+    def _layer_canvas_bounds(self, layer_id: str) -> Optional[Tuple[int, int, int, int]]:
+        if self.document is None or layer_id not in self.layer_pixels:
+            return None
+        pixels = self.layer_pixels[layer_id]
+        offset_x, offset_y = self._history_layer_canvas_offset(self.document, layer_id)
+        return (int(offset_x), int(offset_y), int(pixels.shape[1]), int(pixels.shape[0]))
+
+    def _estimated_brush_dirty_bounds(
+        self,
+        points: Sequence[Tuple[int, int]],
+        *,
+        padding: Optional[int] = None,
+    ) -> Optional[Tuple[int, int, int, int]]:
+        if self.document is None or not points:
+            return None
+        brush_padding = padding if padding is not None else int(math.ceil(max(1.0, float(self.current_tool_settings.size)) * 0.75)) + 4
+        xs = [int(point[0]) for point in points]
+        ys = [int(point[1]) for point in points]
+        x0 = max(0, min(xs) - brush_padding)
+        y0 = max(0, min(ys) - brush_padding)
+        x1 = min(int(self.document.width), max(xs) + brush_padding + 1)
+        y1 = min(int(self.document.height), max(ys) + brush_padding + 1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return (x0, y0, x1 - x0, y1 - y0)
+
     def float_active_layer_copy(self) -> None:
         if self.document is None:
             return
@@ -3725,6 +5215,166 @@ class TextureEditorTab(QWidget):
         )
         self._refresh_ui()
 
+    def _current_floating_canvas_bounds(self) -> Optional[Tuple[int, int, int, int]]:
+        if self.document is None or self.document.floating_selection is None or self._floating_pixels is None:
+            return None
+        transformed = self._transformed_floating_pixels()
+        if transformed is None:
+            return None
+        floating = self.document.floating_selection
+        return (
+            int(floating.bounds[0] + floating.offset_x),
+            int(floating.bounds[1] + floating.offset_y),
+            int(transformed.shape[1]),
+            int(transformed.shape[0]),
+        )
+
+    def _handle_canvas_floating_transform(self, payload: object) -> None:
+        if self.document is None or self.document.floating_selection is None or not isinstance(payload, dict):
+            return
+        floating = self.document.floating_selection
+        next_offset_x = int(payload.get("offset_x", floating.offset_x))
+        next_offset_y = int(payload.get("offset_y", floating.offset_y))
+        next_scale_x = max(0.05, float(payload.get("scale_x", floating.scale_x)))
+        next_scale_y = max(0.05, float(payload.get("scale_y", floating.scale_y)))
+        next_rotation = float(payload.get("rotation_degrees", floating.rotation_degrees))
+        commit = bool(payload.get("commit", False))
+        mode = str(payload.get("mode", "move") or "move")
+        if (
+            next_offset_x == int(floating.offset_x)
+            and next_offset_y == int(floating.offset_y)
+            and abs(next_scale_x - float(floating.scale_x)) < 1e-6
+            and abs(next_scale_y - float(floating.scale_y)) < 1e-6
+            and abs(next_rotation - float(floating.rotation_degrees)) < 1e-6
+        ):
+            if commit:
+                self._floating_transform_before_document = None
+                self._floating_transform_before_floating_pixels = None
+                self._floating_transform_label = ""
+            return
+        if self._floating_transform_before_document is None:
+            self._floating_transform_before_document = dataclasses.replace(self.document)
+            self._floating_transform_before_floating_pixels = self._snapshot_floating_pixels()
+            self._floating_transform_label = {
+                "move": "Move Floating Selection",
+                "rotate": "Rotate Floating Selection",
+                "scale_nw": "Scale Floating Selection",
+                "scale_ne": "Scale Floating Selection",
+                "scale_sw": "Scale Floating Selection",
+                "scale_se": "Scale Floating Selection",
+            }.get(mode, "Transform Floating Selection")
+        before_bounds = self._current_floating_canvas_bounds()
+        self.document = dataclasses.replace(
+            self.document,
+            floating_selection=dataclasses.replace(
+                floating,
+                offset_x=next_offset_x,
+                offset_y=next_offset_y,
+                scale_x=next_scale_x,
+                scale_y=next_scale_y,
+                rotation_degrees=next_rotation,
+                committed=False,
+            ),
+        )
+        after_bounds = self._current_floating_canvas_bounds()
+        dirty_bounds = None
+        if before_bounds is not None and after_bounds is not None:
+            x0 = min(before_bounds[0], after_bounds[0])
+            y0 = min(before_bounds[1], after_bounds[1])
+            x1 = max(before_bounds[0] + before_bounds[2], after_bounds[0] + after_bounds[2])
+            y1 = max(before_bounds[1] + before_bounds[3], after_bounds[1] + after_bounds[3])
+            dirty_bounds = (int(x0), int(y0), max(1, int(x1 - x0)), max(1, int(y1 - y0)))
+        self._invalidate_composite_cache(dirty_bounds)
+        if commit and self._floating_transform_before_document is not None:
+            self._record_history_change(
+                self._floating_transform_label or "Transform Floating Selection",
+                before_document=self._floating_transform_before_document,
+                before_layer_pixels={},
+                kind="floating_transform",
+                tracked_layer_ids=[],
+                dirty_bounds=dirty_bounds,
+                before_floating_pixels=self._floating_transform_before_floating_pixels,
+            )
+            self._floating_transform_before_document = None
+            self._floating_transform_before_floating_pixels = None
+            self._floating_transform_label = ""
+            self._set_status("Updated floating selection on the canvas.", False)
+            self._refresh_editor_views(
+                canvas=True,
+                history=True,
+                transform=True,
+                status=True,
+                tool_visibility=False,
+            )
+        else:
+            self._refresh_editor_views(
+                canvas=True,
+                transform=True,
+                status=True,
+                tool_visibility=False,
+            )
+
+    def _apply_document_pixels_change(
+        self,
+        label: str,
+        apply_change: Callable[[], Tuple[TextureEditorDocument, Dict[str, np.ndarray]]],
+    ) -> None:
+        if self.document is None:
+            return
+        if self.document.floating_selection is not None:
+            self._set_status("Commit or cancel the floating selection before changing the whole document.", True)
+            return
+        before_document = dataclasses.replace(self.document)
+        before_layer_pixels = {key: value.copy() for key, value in self.layer_pixels.items()}
+        updated_document, updated_pixels = apply_change()
+        if updated_document is self.document and updated_pixels is self.layer_pixels:
+            return
+        self.document = updated_document
+        self.layer_pixels = updated_pixels
+        self._thumbnail_cache = {}
+        self._invalidate_composite_cache()
+        self._record_history_change(
+            label,
+            before_document=before_document,
+            before_layer_pixels=before_layer_pixels,
+            kind="document_transform",
+            tracked_layer_ids=[],
+            force_checkpoint=True,
+        )
+        self._refresh_ui()
+        self._set_status(f"{label} applied.", False)
+
+    def crop_document_to_selection(self) -> None:
+        if self.document is None or self.document.selection.mode == "none":
+            self._set_status("Create a selection first, then use Crop To Selection.", True)
+            return
+        self._apply_document_pixels_change(
+            "Crop To Selection",
+            lambda: crop_texture_editor_document_to_selection(self.document, self.layer_pixels),
+        )
+
+    def trim_document_transparent(self) -> None:
+        self._apply_document_pixels_change(
+            "Trim Transparent",
+            lambda: trim_texture_editor_document_transparent_bounds(self.document, self.layer_pixels),
+        )
+
+    def flip_document(self, horizontal: bool, vertical: bool) -> None:
+        if not horizontal and not vertical:
+            return
+        label = "Flip Horizontal" if horizontal else "Flip Vertical"
+        self._apply_document_pixels_change(
+            label,
+            lambda: flip_texture_editor_document(self.document, self.layer_pixels, horizontal=horizontal, vertical=vertical),
+        )
+
+    def rotate_document_90(self, clockwise: bool) -> None:
+        label = "Rotate 90 CW" if clockwise else "Rotate 90 CCW"
+        self._apply_document_pixels_change(
+            label,
+            lambda: rotate_texture_editor_document_90(self.document, self.layer_pixels, clockwise=clockwise),
+        )
+
     def add_mask_to_selected_layer(self) -> None:
         if self.document is None:
             return
@@ -3834,6 +5484,11 @@ class TextureEditorTab(QWidget):
         before_document = dataclasses.replace(self.document)
         display_names = {
             "hue_saturation": "Hue / Saturation",
+            "vibrance": "Vibrance",
+            "selective_color": "Selective Color",
+            "brightness_contrast": "Brightness / Contrast",
+            "exposure": "Exposure",
+            "color_balance": "Color Balance",
             "levels": "Levels",
             "curves": "Curves",
         }
@@ -3855,10 +5510,25 @@ class TextureEditorTab(QWidget):
         if self.document.adjustment_layers:
             self._refresh_adjustments(preserve_selection_id=self.document.adjustment_layers[-1].layer_id)
 
-    def _default_adjustment_parameters(self, adjustment_type: str) -> Dict[str, float]:
+    def _default_adjustment_parameters(self, adjustment_type: str) -> Dict[str, object]:
         adjustment_key = (adjustment_type or "levels").strip().lower()
         if adjustment_key == "hue_saturation":
             return {"hue": 0.0, "saturation": 0.0, "lightness": 0.0}
+        if adjustment_key == "vibrance":
+            return {"vibrance": 0.0, "saturation": 0.0, "lightness": 0.0}
+        if adjustment_key == "selective_color":
+            return {
+                "target_range": "neutrals",
+                "red_cyan": 0.0,
+                "green_magenta": 0.0,
+                "blue_yellow": 0.0,
+            }
+        if adjustment_key == "brightness_contrast":
+            return {"brightness": 0.0, "contrast": 0.0, "saturation": 0.0}
+        if adjustment_key == "exposure":
+            return {"exposure": 0.0, "offset": 0.0, "gamma": 1.0}
+        if adjustment_key == "color_balance":
+            return {"red_cyan": 0.0, "green_magenta": 0.0, "blue_yellow": 0.0}
         if adjustment_key == "curves":
             return {"shadows": 0.0, "midtones": 0.0, "highlights": 0.0}
         return {"black": 0.0, "gamma": 1.0, "white": 255.0, "output_black": 0.0, "output_white": 255.0}
@@ -3871,6 +5541,32 @@ class TextureEditorTab(QWidget):
             sat = int(round(float(adjustment.parameters.get("saturation", 0.0))))
             light = int(round(float(adjustment.parameters.get("lightness", 0.0))))
             return f"{prefix} {adjustment.name}{mask_suffix}  H:{hue:+d} S:{sat:+d} L:{light:+d}"
+        if adjustment.adjustment_type == "vibrance":
+            vibrance = int(round(float(adjustment.parameters.get("vibrance", 0.0))))
+            sat = int(round(float(adjustment.parameters.get("saturation", 0.0))))
+            light = int(round(float(adjustment.parameters.get("lightness", 0.0))))
+            return f"{prefix} {adjustment.name}{mask_suffix}  Vib:{vibrance:+d} S:{sat:+d} L:{light:+d}"
+        if adjustment.adjustment_type == "selective_color":
+            target = str(adjustment.parameters.get("target_range", "neutrals") or "neutrals").title()
+            red = int(round(float(adjustment.parameters.get("red_cyan", 0.0))))
+            green = int(round(float(adjustment.parameters.get("green_magenta", 0.0))))
+            blue = int(round(float(adjustment.parameters.get("blue_yellow", 0.0))))
+            return f"{prefix} {adjustment.name}{mask_suffix}  {target}  R:{red:+d} G:{green:+d} B:{blue:+d}"
+        if adjustment.adjustment_type == "brightness_contrast":
+            brightness = int(round(float(adjustment.parameters.get("brightness", 0.0))))
+            contrast = int(round(float(adjustment.parameters.get("contrast", 0.0))))
+            saturation = int(round(float(adjustment.parameters.get("saturation", 0.0))))
+            return f"{prefix} {adjustment.name}{mask_suffix}  Br:{brightness:+d} Ct:{contrast:+d} Sat:{saturation:+d}"
+        if adjustment.adjustment_type == "exposure":
+            exposure = int(round(float(adjustment.parameters.get("exposure", 0.0))))
+            offset = int(round(float(adjustment.parameters.get("offset", 0.0))))
+            gamma = float(adjustment.parameters.get("gamma", 1.0))
+            return f"{prefix} {adjustment.name}{mask_suffix}  Exp:{exposure:+d} Off:{offset:+d} G:{gamma:.2f}"
+        if adjustment.adjustment_type == "color_balance":
+            red = int(round(float(adjustment.parameters.get("red_cyan", 0.0))))
+            green = int(round(float(adjustment.parameters.get("green_magenta", 0.0))))
+            blue = int(round(float(adjustment.parameters.get("blue_yellow", 0.0))))
+            return f"{prefix} {adjustment.name}{mask_suffix}  R:{red:+d} G:{green:+d} B:{blue:+d}"
         if adjustment.adjustment_type == "curves":
             shadows = int(round(float(adjustment.parameters.get("shadows", 0.0))))
             mids = int(round(float(adjustment.parameters.get("midtones", 0.0))))
@@ -4114,12 +5810,16 @@ class TextureEditorTab(QWidget):
         has_adjustment = adjustment is not None
         self.adjustment_enabled_checkbox.blockSignals(True)
         self.adjustment_opacity_slider.blockSignals(True)
+        self.adjustment_mode_combo.blockSignals(True)
         self.adjustment_param_a_slider.blockSignals(True)
         self.adjustment_param_b_slider.blockSignals(True)
         self.adjustment_param_c_slider.blockSignals(True)
         if adjustment is None:
+            self.adjustment_mode_label.setVisible(False)
+            self.adjustment_mode_combo.setVisible(False)
             self.adjustment_enabled_checkbox.setChecked(False)
             self.adjustment_opacity_slider.setValue(100)
+            self.adjustment_mode_combo.setCurrentIndex(max(0, self.adjustment_mode_combo.findData("neutrals")))
             self.adjustment_param_a_slider.setValue(0)
             self.adjustment_param_b_slider.setValue(0)
             self.adjustment_param_c_slider.setValue(0)
@@ -4127,6 +5827,8 @@ class TextureEditorTab(QWidget):
             self.adjustment_enabled_checkbox.setChecked(adjustment.enabled)
             self.adjustment_opacity_slider.setValue(adjustment.opacity)
             if adjustment.adjustment_type == "hue_saturation":
+                self.adjustment_mode_label.setVisible(False)
+                self.adjustment_mode_combo.setVisible(False)
                 self.adjustment_param_a_label.setText("Hue")
                 self.adjustment_param_b_label.setText("Saturation")
                 self.adjustment_param_c_label.setText("Lightness")
@@ -4136,7 +5838,73 @@ class TextureEditorTab(QWidget):
                 self.adjustment_param_a_slider.setValue(int(round(adjustment.parameters.get("hue", 0.0))))
                 self.adjustment_param_b_slider.setValue(int(round(adjustment.parameters.get("saturation", 0.0))))
                 self.adjustment_param_c_slider.setValue(int(round(adjustment.parameters.get("lightness", 0.0))))
+            elif adjustment.adjustment_type == "vibrance":
+                self.adjustment_mode_label.setVisible(False)
+                self.adjustment_mode_combo.setVisible(False)
+                self.adjustment_param_a_label.setText("Vibrance")
+                self.adjustment_param_b_label.setText("Saturation")
+                self.adjustment_param_c_label.setText("Lightness")
+                self.adjustment_param_a_slider.setRange(-100, 100)
+                self.adjustment_param_b_slider.setRange(-100, 100)
+                self.adjustment_param_c_slider.setRange(-100, 100)
+                self.adjustment_param_a_slider.setValue(int(round(adjustment.parameters.get("vibrance", 0.0))))
+                self.adjustment_param_b_slider.setValue(int(round(adjustment.parameters.get("saturation", 0.0))))
+                self.adjustment_param_c_slider.setValue(int(round(adjustment.parameters.get("lightness", 0.0))))
+            elif adjustment.adjustment_type == "selective_color":
+                self.adjustment_mode_label.setVisible(True)
+                self.adjustment_mode_combo.setVisible(True)
+                target_range = str(adjustment.parameters.get("target_range", "neutrals") or "neutrals")
+                mode_index = self.adjustment_mode_combo.findData(target_range)
+                if mode_index >= 0:
+                    self.adjustment_mode_combo.setCurrentIndex(mode_index)
+                self.adjustment_param_a_label.setText("Red / Cyan")
+                self.adjustment_param_b_label.setText("Green / Magenta")
+                self.adjustment_param_c_label.setText("Blue / Yellow")
+                self.adjustment_param_a_slider.setRange(-100, 100)
+                self.adjustment_param_b_slider.setRange(-100, 100)
+                self.adjustment_param_c_slider.setRange(-100, 100)
+                self.adjustment_param_a_slider.setValue(int(round(adjustment.parameters.get("red_cyan", 0.0))))
+                self.adjustment_param_b_slider.setValue(int(round(adjustment.parameters.get("green_magenta", 0.0))))
+                self.adjustment_param_c_slider.setValue(int(round(adjustment.parameters.get("blue_yellow", 0.0))))
+            elif adjustment.adjustment_type == "brightness_contrast":
+                self.adjustment_mode_label.setVisible(False)
+                self.adjustment_mode_combo.setVisible(False)
+                self.adjustment_param_a_label.setText("Brightness")
+                self.adjustment_param_b_label.setText("Contrast")
+                self.adjustment_param_c_label.setText("Saturation")
+                self.adjustment_param_a_slider.setRange(-100, 100)
+                self.adjustment_param_b_slider.setRange(-100, 100)
+                self.adjustment_param_c_slider.setRange(-100, 100)
+                self.adjustment_param_a_slider.setValue(int(round(adjustment.parameters.get("brightness", 0.0))))
+                self.adjustment_param_b_slider.setValue(int(round(adjustment.parameters.get("contrast", 0.0))))
+                self.adjustment_param_c_slider.setValue(int(round(adjustment.parameters.get("saturation", 0.0))))
+            elif adjustment.adjustment_type == "exposure":
+                self.adjustment_mode_label.setVisible(False)
+                self.adjustment_mode_combo.setVisible(False)
+                self.adjustment_param_a_label.setText("Exposure")
+                self.adjustment_param_b_label.setText("Offset")
+                self.adjustment_param_c_label.setText("Gamma x100")
+                self.adjustment_param_a_slider.setRange(-100, 100)
+                self.adjustment_param_b_slider.setRange(-100, 100)
+                self.adjustment_param_c_slider.setRange(10, 300)
+                self.adjustment_param_a_slider.setValue(int(round(adjustment.parameters.get("exposure", 0.0))))
+                self.adjustment_param_b_slider.setValue(int(round(adjustment.parameters.get("offset", 0.0))))
+                self.adjustment_param_c_slider.setValue(int(round(adjustment.parameters.get("gamma", 1.0) * 100.0)))
+            elif adjustment.adjustment_type == "color_balance":
+                self.adjustment_mode_label.setVisible(False)
+                self.adjustment_mode_combo.setVisible(False)
+                self.adjustment_param_a_label.setText("Red / Cyan")
+                self.adjustment_param_b_label.setText("Green / Magenta")
+                self.adjustment_param_c_label.setText("Blue / Yellow")
+                self.adjustment_param_a_slider.setRange(-100, 100)
+                self.adjustment_param_b_slider.setRange(-100, 100)
+                self.adjustment_param_c_slider.setRange(-100, 100)
+                self.adjustment_param_a_slider.setValue(int(round(adjustment.parameters.get("red_cyan", 0.0))))
+                self.adjustment_param_b_slider.setValue(int(round(adjustment.parameters.get("green_magenta", 0.0))))
+                self.adjustment_param_c_slider.setValue(int(round(adjustment.parameters.get("blue_yellow", 0.0))))
             elif adjustment.adjustment_type == "curves":
+                self.adjustment_mode_label.setVisible(False)
+                self.adjustment_mode_combo.setVisible(False)
                 self.adjustment_param_a_label.setText("Shadows")
                 self.adjustment_param_b_label.setText("Midtones")
                 self.adjustment_param_c_label.setText("Highlights")
@@ -4147,6 +5915,8 @@ class TextureEditorTab(QWidget):
                 self.adjustment_param_b_slider.setValue(int(round(adjustment.parameters.get("midtones", 0.0))))
                 self.adjustment_param_c_slider.setValue(int(round(adjustment.parameters.get("highlights", 0.0))))
             else:
+                self.adjustment_mode_label.setVisible(False)
+                self.adjustment_mode_combo.setVisible(False)
                 self.adjustment_param_a_label.setText("Black")
                 self.adjustment_param_b_label.setText("Gamma x100")
                 self.adjustment_param_c_label.setText("White")
@@ -4158,11 +5928,14 @@ class TextureEditorTab(QWidget):
                 self.adjustment_param_c_slider.setValue(int(round(adjustment.parameters.get("white", 255.0))))
         self.adjustment_enabled_checkbox.blockSignals(False)
         self.adjustment_opacity_slider.blockSignals(False)
+        self.adjustment_mode_combo.blockSignals(False)
         self.adjustment_param_a_slider.blockSignals(False)
         self.adjustment_param_b_slider.blockSignals(False)
         self.adjustment_param_c_slider.blockSignals(False)
         self.adjustment_enabled_checkbox.setEnabled(has_adjustment)
         self.adjustment_opacity_slider.setEnabled(has_adjustment)
+        self.adjustment_mode_label.setEnabled(has_adjustment)
+        self.adjustment_mode_combo.setEnabled(has_adjustment and adjustment is not None and adjustment.adjustment_type == "selective_color")
         self.adjustment_param_a_slider.setEnabled(has_adjustment)
         self.adjustment_param_b_slider.setEnabled(has_adjustment)
         self.adjustment_param_c_slider.setEnabled(has_adjustment)
@@ -4186,6 +5959,37 @@ class TextureEditorTab(QWidget):
                 "hue": float(self.adjustment_param_a_slider.value()),
                 "saturation": float(self.adjustment_param_b_slider.value()),
                 "lightness": float(self.adjustment_param_c_slider.value()),
+            }
+        elif adjustment.adjustment_type == "vibrance":
+            parameters = {
+                "vibrance": float(self.adjustment_param_a_slider.value()),
+                "saturation": float(self.adjustment_param_b_slider.value()),
+                "lightness": float(self.adjustment_param_c_slider.value()),
+            }
+        elif adjustment.adjustment_type == "selective_color":
+            parameters = {
+                "target_range": str(self.adjustment_mode_combo.currentData() or "neutrals"),
+                "red_cyan": float(self.adjustment_param_a_slider.value()),
+                "green_magenta": float(self.adjustment_param_b_slider.value()),
+                "blue_yellow": float(self.adjustment_param_c_slider.value()),
+            }
+        elif adjustment.adjustment_type == "brightness_contrast":
+            parameters = {
+                "brightness": float(self.adjustment_param_a_slider.value()),
+                "contrast": float(self.adjustment_param_b_slider.value()),
+                "saturation": float(self.adjustment_param_c_slider.value()),
+            }
+        elif adjustment.adjustment_type == "exposure":
+            parameters = {
+                "exposure": float(self.adjustment_param_a_slider.value()),
+                "offset": float(self.adjustment_param_b_slider.value()),
+                "gamma": float(self.adjustment_param_c_slider.value()) / 100.0,
+            }
+        elif adjustment.adjustment_type == "color_balance":
+            parameters = {
+                "red_cyan": float(self.adjustment_param_a_slider.value()),
+                "green_magenta": float(self.adjustment_param_b_slider.value()),
+                "blue_yellow": float(self.adjustment_param_c_slider.value()),
             }
         elif adjustment.adjustment_type == "curves":
             parameters = {
@@ -4372,12 +6176,64 @@ class TextureEditorTab(QWidget):
         )
         return composed
 
+    def _compose_floating_selection_region(
+        self,
+        base_region: np.ndarray,
+        bounds: Tuple[int, int, int, int],
+    ) -> np.ndarray:
+        if self.document is None or self.document.floating_selection is None:
+            return base_region
+        floating_pixels = self._transformed_floating_pixels()
+        if floating_pixels is None or floating_pixels.size == 0:
+            return base_region
+        region_x, region_y, region_w, region_h = bounds
+        floating = self.document.floating_selection
+        x = int(floating.bounds[0] + floating.offset_x)
+        y = int(floating.bounds[1] + floating.offset_y)
+        h, w = floating_pixels.shape[:2]
+        dx0 = max(region_x, x)
+        dy0 = max(region_y, y)
+        dx1 = min(region_x + region_w, x + w)
+        dy1 = min(region_y + region_h, y + h)
+        if dx1 <= dx0 or dy1 <= dy0:
+            return base_region
+        sx0 = dx0 - x
+        sy0 = dy0 - y
+        sx1 = sx0 + (dx1 - dx0)
+        sy1 = sy0 + (dy1 - dy0)
+        local_x0 = dx0 - region_x
+        local_y0 = dy0 - region_y
+        composed = base_region.copy()
+        composed[local_y0:local_y0 + (dy1 - dy0), local_x0:local_x0 + (dx1 - dx0)] = _blend_layer_region(
+            composed[local_y0:local_y0 + (dy1 - dy0), local_x0:local_x0 + (dx1 - dx0)],
+            floating_pixels[sy0:sy1, sx0:sx1],
+            opacity=100,
+            mode="normal",
+        )
+        return composed
+
     def _current_composite_rgba(self) -> Optional[np.ndarray]:
         if self.document is None:
             return None
         revision = self._document_composite_revision()
         if self._composite_cache is not None and revision == self._composite_cache_revision:
             return self._composite_cache
+        if self._composite_cache is not None and self._composite_dirty_bounds is not None:
+            dirty_x, dirty_y, dirty_w, dirty_h = self._composite_dirty_bounds
+            x0 = max(0, int(dirty_x))
+            y0 = max(0, int(dirty_y))
+            x1 = min(int(self.document.width), x0 + max(0, int(dirty_w)))
+            y1 = min(int(self.document.height), y0 + max(0, int(dirty_h)))
+            if x1 > x0 and y1 > y0:
+                bounds = (x0, y0, x1 - x0, y1 - y0)
+                base_region = flatten_texture_editor_layers_region(self.document, self.layer_pixels, bounds)
+                composed_region = self._compose_floating_selection_region(base_region, bounds)
+                composed = self._composite_cache.copy()
+                composed[y0:y1, x0:x1] = composed_region
+                self._composite_cache = composed
+                self._composite_cache_revision = revision
+                self._composite_dirty_bounds = None
+                return composed
         base = flatten_texture_editor_layers(self.document, self.layer_pixels)
         composed = self._compose_floating_selection(base)
         self._composite_cache = composed
@@ -4389,7 +6245,9 @@ class TextureEditorTab(QWidget):
         if self.document is None:
             self.canvas.set_image(None)
             self.canvas.set_quick_mask_overlay(None)
+            self.canvas.set_symmetry_mode("off")
             self._refresh_zoom_indicators()
+            self._refresh_navigation_overlays()
             return
         flattened = self._current_composite_rgba()
         original_flattened = None
@@ -4414,19 +6272,48 @@ class TextureEditorTab(QWidget):
             transformed = self._transformed_floating_pixels()
             if transformed is not None:
                 floating = self.document.floating_selection
-                self.canvas.set_floating_bounds(
-                    (
-                        int(floating.bounds[0] + floating.offset_x),
-                        int(floating.bounds[1] + floating.offset_y),
-                        int(transformed.shape[1]),
-                        int(transformed.shape[0]),
-                    )
+                current_bounds = (
+                    int(floating.bounds[0] + floating.offset_x),
+                    int(floating.bounds[1] + floating.offset_y),
+                    int(transformed.shape[1]),
+                    int(transformed.shape[0]),
+                )
+                self.canvas.set_floating_transform_state(
+                    current_bounds=current_bounds,
+                    origin_bounds=(
+                        int(floating.bounds[0]),
+                        int(floating.bounds[1]),
+                        int(floating.bounds[2]),
+                        int(floating.bounds[3]),
+                    ),
+                    offset_x=int(floating.offset_x),
+                    offset_y=int(floating.offset_y),
+                    scale_x=float(floating.scale_x),
+                    scale_y=float(floating.scale_y),
+                    rotation_degrees=float(floating.rotation_degrees),
                 )
             else:
-                self.canvas.set_floating_bounds(None)
+                self.canvas.set_floating_transform_state(
+                    current_bounds=None,
+                    origin_bounds=None,
+                    offset_x=0,
+                    offset_y=0,
+                    scale_x=1.0,
+                    scale_y=1.0,
+                    rotation_degrees=0.0,
+                )
         else:
-            self.canvas.set_floating_bounds(None)
+            self.canvas.set_floating_transform_state(
+                current_bounds=None,
+                origin_bounds=None,
+                offset_x=0,
+                offset_y=0,
+                scale_x=1.0,
+                scale_y=1.0,
+                rotation_degrees=0.0,
+            )
         self.canvas.set_clone_source_point(self.current_tool_settings.clone_source_point)
+        self.canvas.set_symmetry_mode(self.current_tool_settings.symmetry_mode)
         self.canvas.set_view_mode(str(self.view_mode_combo.currentData() or "edited"))
         self.canvas.set_compare_split_percent(self.compare_split_slider.value())
         self.canvas.set_grid_state(
@@ -4434,6 +6321,7 @@ class TextureEditorTab(QWidget):
             grid_size=self.grid_size_spin.value(),
         )
         self._refresh_zoom_indicators()
+        self._refresh_navigation_overlays()
 
     def _refresh_metadata(self) -> None:
         if self.document is None:
@@ -4544,8 +6432,10 @@ class TextureEditorTab(QWidget):
 
     def _refresh_layers(self) -> None:
         current_layer_id = self._current_layer_id()
+        self._refreshing_layers_list = True
         self.layers_list.clear()
         if self.document is None:
+            self._refreshing_layers_list = False
             return
         for layer in reversed(self.document.layers):
             prefix = "[Visible]" if layer.visible else "[Hidden]"
@@ -4559,10 +6449,12 @@ class TextureEditorTab(QWidget):
             self.layers_list.addItem(item)
             if layer.layer_id == current_layer_id or (current_layer_id is None and layer.layer_id == self.document.active_layer_id):
                 self.layers_list.setCurrentItem(item)
+        self._refreshing_layers_list = False
         self._handle_layer_selection_changed()
 
     def _refresh_selection_controls(self) -> None:
         has_doc = self.document is not None
+        busy = self._busy()
         has_selection = has_doc and self.document.selection.mode != "none"
         self.selection_help_label.setText(
             "Selections limit paint, erase, fill, gradient, clone, heal, patch, smudge, sharpen, soften, dodge/burn, and recolor to the selected area."
@@ -4587,16 +6479,20 @@ class TextureEditorTab(QWidget):
         self.selection_mode_combo.blockSignals(False)
         self.selection_quick_mask_checkbox.blockSignals(False)
         self._refresh_selection_button_labels()
-        self.selection_copy_layer_button.setEnabled(bool(has_selection))
-        self.selection_select_all_button.setEnabled(bool(has_doc))
-        self.selection_clear_button.setEnabled(bool(has_doc and (has_selection or self.document.quick_mask_enabled)))
-        self.selection_grow_button.setEnabled(bool(has_selection))
-        self.selection_shrink_button.setEnabled(bool(has_selection))
-        self.selection_invert_checkbox.setEnabled(bool(has_selection))
-        self.selection_feather_slider.setEnabled(bool(has_selection))
-        self.selection_mode_combo.setEnabled(bool(has_doc))
-        self.selection_refine_spin.setEnabled(bool(has_selection))
-        self.selection_quick_mask_checkbox.setEnabled(bool(has_doc))
+        self.selection_copy_layer_button.setEnabled(bool(has_selection and not busy))
+        self.selection_select_all_button.setEnabled(bool(has_doc and not busy))
+        self.selection_clear_button.setEnabled(bool(has_doc and not busy and (has_selection or self.document.quick_mask_enabled)))
+        self.selection_grow_button.setEnabled(bool(has_selection and not busy))
+        self.selection_shrink_button.setEnabled(bool(has_selection and not busy))
+        selected_layer = None if not has_doc else next((candidate for candidate in self.document.layers if candidate.layer_id == (self._current_layer_id() or self.document.active_layer_id)), None)
+        has_mask = bool(selected_layer and selected_layer.mask_layer_id and selected_layer.mask_layer_id in self.layer_pixels)
+        self.selection_to_mask_button.setEnabled(bool(has_selection and selected_layer and not busy))
+        self.selection_from_mask_button.setEnabled(bool(has_doc and has_mask and not busy))
+        self.selection_invert_checkbox.setEnabled(bool(has_selection and not busy))
+        self.selection_feather_slider.setEnabled(bool(has_selection and not busy))
+        self.selection_mode_combo.setEnabled(bool(has_doc and not busy))
+        self.selection_refine_spin.setEnabled(bool(has_selection and not busy))
+        self.selection_quick_mask_checkbox.setEnabled(bool(has_doc and not busy))
 
     def _refresh_adjustments(
         self,
@@ -4665,6 +6561,7 @@ class TextureEditorTab(QWidget):
             self.canvas_status_selection_label.setText("No selection")
             self.canvas_status_state_label.setText("No state")
             self.canvas_status_document_label.setText("No document")
+            self.canvas_status_pixel_label.setText("XY -, -  RGBA -")
             self.canvas_status_source_label.setText("")
             return
         active_layer = next(
@@ -4699,6 +6596,8 @@ class TextureEditorTab(QWidget):
             if enabled
         ) or "None"
         state_bits.append(f"Ch {channel_bits}")
+        if self.current_tool_settings.symmetry_mode != "off":
+            state_bits.append(f"Sym {self.current_tool_settings.symmetry_mode.title()}")
         state_text = " | ".join(state_bits) if state_bits else "Ready"
         self._refresh_zoom_indicators()
         self.canvas_status_tool_label.setText(f"Tool {self.current_tool_settings.tool.replace('_', ' ').title()}")
@@ -4706,6 +6605,16 @@ class TextureEditorTab(QWidget):
         self.canvas_status_selection_label.setText(selection_text)
         self.canvas_status_state_label.setText(state_text)
         self.canvas_status_document_label.setText(f"{self.document.width}x{self.document.height}")
+        if self._hover_pixel_info is None:
+            self.canvas_status_pixel_label.setText("XY -, -  RGBA -")
+        else:
+            rgba = self._hover_pixel_info.get("rgba", ())
+            if isinstance(rgba, tuple) and len(rgba) == 4:
+                self.canvas_status_pixel_label.setText(
+                    f"XY {int(self._hover_pixel_info.get('x', 0))}, {int(self._hover_pixel_info.get('y', 0))}  RGBA {int(rgba[0])}, {int(rgba[1])}, {int(rgba[2])}, {int(rgba[3])}"
+                )
+            else:
+                self.canvas_status_pixel_label.setText("XY -, -  RGBA -")
         source_summary = self.document.source_binding.relative_path or self.document.source_binding.archive_relative_path or self.document.source_binding.source_path
         self.canvas_status_source_label.setText(source_summary)
 
@@ -4772,8 +6681,24 @@ class TextureEditorTab(QWidget):
             self.layer_up_button,
             self.layer_down_button,
             self.history_clear_button,
+            self.image_crop_selection_button,
+            self.image_trim_button,
+            self.image_resize_button,
+            self.canvas_resize_button,
+            self.image_flip_h_button,
+            self.image_flip_v_button,
+            self.image_rotate_left_button,
+            self.image_rotate_right_button,
         ):
             button.setEnabled((has_doc if button not in {self.open_file_button, self.open_archive_button, self.open_project_button} else True) and not busy)
+        self.image_crop_selection_button.setEnabled(bool(has_doc and not busy and self.document.selection.mode != "none" and self.document.floating_selection is None))
+        self.image_trim_button.setEnabled(bool(has_doc and not busy and self.document.floating_selection is None))
+        self.image_resize_button.setEnabled(bool(has_doc and not busy and self.document.floating_selection is None))
+        self.canvas_resize_button.setEnabled(bool(has_doc and not busy and self.document.floating_selection is None))
+        self.image_flip_h_button.setEnabled(bool(has_doc and not busy and self.document.floating_selection is None))
+        self.image_flip_v_button.setEnabled(bool(has_doc and not busy and self.document.floating_selection is None))
+        self.image_rotate_left_button.setEnabled(bool(has_doc and not busy and self.document.floating_selection is None))
+        self.image_rotate_right_button.setEnabled(bool(has_doc and not busy and self.document.floating_selection is None))
         self.undo_button.setEnabled(has_doc and not busy and self.history_index > 0)
         self.redo_button.setEnabled(has_doc and not busy and self.history_index < len(self.history_snapshots) - 1)
         self.shortcuts_button.setEnabled(not busy)
@@ -4792,6 +6717,13 @@ class TextureEditorTab(QWidget):
         self.compare_split_slider.setEnabled(has_doc and not busy and str(self.view_mode_combo.currentData() or "edited") == "split")
         self.grid_checkbox.setEnabled(has_doc and not busy)
         self.grid_size_spin.setEnabled(has_doc and not busy and self.grid_checkbox.isChecked())
+        self.navigator_widget.setEnabled(has_doc and not busy)
+        self.show_rulers_checkbox.setEnabled(has_doc and not busy)
+        self.show_guides_checkbox.setEnabled(has_doc and not busy)
+        self.vertical_guides_edit.setEnabled(has_doc and not busy and self.show_guides_checkbox.isChecked())
+        self.horizontal_guides_edit.setEnabled(has_doc and not busy and self.show_guides_checkbox.isChecked())
+        self.apply_guides_button.setEnabled(has_doc and not busy)
+        self.clear_guides_button.setEnabled(has_doc and not busy and (bool(self._vertical_guides) or bool(self._horizontal_guides)))
         self.canvas.setEnabled(has_doc and not busy)
         self.document_tab_bar.setEnabled(not busy)
         for button in self.tool_buttons.values():
@@ -4807,6 +6739,10 @@ class TextureEditorTab(QWidget):
             self.save_brush_preset_button,
             self.brush_tip_combo,
             self.brush_pattern_combo,
+            self.custom_brush_tip_path_edit,
+            self.load_custom_brush_tip_button,
+            self.clear_custom_brush_tip_button,
+            self.symmetry_mode_combo,
             self.brush_size_slider,
             self.size_step_mode_combo,
             self.hardness_slider,
@@ -4861,17 +6797,34 @@ class TextureEditorTab(QWidget):
             self.channel_all_button,
             self.channel_rgb_button,
             self.channel_alpha_only_button,
+            self.channel_extract_combo,
+            self.channel_extract_button,
+            self.channel_pack_combo,
+            self.channel_pack_button,
+            self.channel_selection_combo,
+            self.channel_selection_from_button,
+            self.channel_selection_to_combo,
+            self.channel_selection_to_button,
+            self.channel_copy_combo,
+            self.channel_copy_button,
+            self.channel_paste_combo,
+            self.channel_paste_button,
+            self.channel_swap_a_combo,
+            self.channel_swap_b_combo,
+            self.channel_swap_button,
         ):
             widget.setEnabled(has_doc and not busy)
         self.clear_clone_source_button.setEnabled(
             has_doc and not busy and self.current_tool_settings.clone_source_point is not None
         )
         self.channels_section.setVisible(has_doc)
+        self.image_section.setVisible(has_doc)
         self.transform_float_layer_button.setEnabled(has_doc and not busy and self.document is not None and bool(self.document.active_layer_id))
         self.transform_section.setVisible(has_doc)
         self.adjustments_section.setVisible(has_doc)
         self.adjustment_add_combo.setEnabled(has_doc and not busy)
         self.adjustment_add_button.setEnabled(has_doc and not busy)
+        self.adjustment_mode_label.setVisible(has_doc)
         has_adjustment_item = self.adjustments_list.currentItem() is not None
         self.adjustment_duplicate_button.setEnabled(has_doc and not busy and has_adjustment_item)
         self.adjustment_remove_button.setEnabled(has_doc and not busy and has_adjustment_item)
@@ -4892,6 +6845,12 @@ class TextureEditorTab(QWidget):
             has_doc and not busy and selected_adjustment is not None and bool(selected_adjustment.mask_layer_id)
         )
         self.adjustments_list.setEnabled(has_doc and not busy)
+        self.atlas_section.setVisible(has_doc)
+        self.atlas_padding_spin.setEnabled(has_doc and not busy)
+        self.atlas_trim_checkbox.setEnabled(has_doc and not busy)
+        self.atlas_skip_empty_checkbox.setEnabled(has_doc and not busy)
+        self.atlas_export_selection_button.setEnabled(has_doc and not busy and self._current_selection_bounds() is not None)
+        self.atlas_export_grid_button.setEnabled(has_doc and not busy)
         self.history_list.setEnabled(has_doc and not busy)
         self._update_history_action_state()
         self._refresh_tool_visibility()
@@ -4934,6 +6893,50 @@ class TextureEditorTab(QWidget):
         self.layer_edit_mask_checkbox.setEnabled(has_mask)
         self.layer_invert_mask_button.setEnabled(has_mask)
         self.layer_delete_mask_button.setEnabled(has_mask)
+
+    def _handle_layers_reordered_by_drag(self, *_args) -> None:
+        if self.document is None or self._refreshing_layers_list or self._busy():
+            return
+        display_ids: List[str] = []
+        for row in range(self.layers_list.count()):
+            item = self.layers_list.item(row)
+            if item is None:
+                continue
+            value = item.data(Qt.UserRole)
+            if value:
+                display_ids.append(str(value))
+        if len(display_ids) != len(self.document.layers):
+            return
+        desired_document_order = tuple(reversed(display_ids))
+        current_document_order = tuple(layer.layer_id for layer in self.document.layers)
+        if desired_document_order == current_document_order:
+            return
+        layers_by_id = {layer.layer_id: layer for layer in self.document.layers}
+        if set(desired_document_order) != set(layers_by_id.keys()):
+            return
+        before_document = dataclasses.replace(self.document)
+        updated_layers = tuple(
+            dataclasses.replace(
+                layers_by_id[layer_id],
+                revision=int(layers_by_id[layer_id].revision) + 1,
+            )
+            for layer_id in desired_document_order
+        )
+        self.document = dataclasses.replace(
+            self.document,
+            layers=updated_layers,
+            composite_revision=int(self.document.composite_revision) + 1,
+        )
+        self._invalidate_composite_cache()
+        self._record_history_change(
+            "Reorder Layer",
+            before_document=before_document,
+            before_layer_pixels={},
+            kind="layer_reorder",
+            tracked_layer_ids=[],
+        )
+        self._refresh_ui()
+        self._set_status("Reordered layers.", False)
 
     def rename_selected_layer(self) -> None:
         if self.document is None:
@@ -5197,6 +7200,7 @@ class TextureEditorTab(QWidget):
 
     def _refresh_channel_controls(self) -> None:
         values = (True, True, True, True)
+        busy = self._busy()
         if self.document is not None:
             values = (
                 bool(self.document.edit_red_channel),
@@ -5213,6 +7217,24 @@ class TextureEditorTab(QWidget):
             checkbox.blockSignals(True)
             checkbox.setChecked(value)
             checkbox.blockSignals(False)
+        has_doc = self.document is not None
+        has_layer = bool(has_doc and (self._current_layer_id() or self.document.active_layer_id))
+        self.channel_extract_button.setEnabled(has_layer and not busy)
+        self.channel_extract_combo.setEnabled(has_layer and not busy)
+        self.channel_pack_button.setEnabled(has_layer and not busy)
+        self.channel_pack_combo.setEnabled(has_layer and not busy)
+        has_selection = bool(has_doc and self.document.selection.mode != "none")
+        self.channel_selection_combo.setEnabled(has_layer and not busy)
+        self.channel_selection_from_button.setEnabled(has_layer and not busy)
+        self.channel_selection_to_combo.setEnabled(has_layer and not busy and has_selection)
+        self.channel_selection_to_button.setEnabled(has_layer and not busy and has_selection)
+        self.channel_copy_combo.setEnabled(has_layer and not busy)
+        self.channel_copy_button.setEnabled(has_layer and not busy)
+        self.channel_paste_combo.setEnabled(has_layer and not busy and self.channel_clipboard is not None)
+        self.channel_paste_button.setEnabled(has_layer and not busy and self.channel_clipboard is not None)
+        self.channel_swap_a_combo.setEnabled(has_layer and not busy)
+        self.channel_swap_b_combo.setEnabled(has_layer and not busy)
+        self.channel_swap_button.setEnabled(has_layer and not busy)
 
     def adjust_selection_size(self, delta: int) -> None:
         if self.document is None or self.document.selection.mode == "none":
@@ -5294,6 +7316,155 @@ class TextureEditorTab(QWidget):
             tracked_layer_ids=[],
         )
         self._refresh_ui()
+
+    def apply_selection_to_selected_layer_mask(self) -> None:
+        if self.document is None:
+            return
+        layer_id = self._current_layer_id() or self.document.active_layer_id
+        if not layer_id:
+            return
+        before_document = dataclasses.replace(self.document)
+        before_layer_pixels = dict(self.layer_pixels)
+        self.document, self.layer_pixels, mask_id = apply_texture_editor_selection_to_layer_mask(
+            self.document,
+            self.layer_pixels,
+            layer_id,
+        )
+        if not mask_id:
+            self._set_status("Create a selection first, then use Selection To Mask.", True)
+            return
+        self._invalidate_layer_thumbnail(layer_id)
+        self._invalidate_composite_cache()
+        self._record_history_change(
+            "Selection To Mask",
+            before_document=before_document,
+            before_layer_pixels=before_layer_pixels,
+            kind="mask_update",
+            tracked_layer_ids=[layer_id, mask_id],
+            force_checkpoint=True,
+        )
+        self._editing_mask_target = True
+        self._refresh_ui()
+        self._set_status("Converted the current selection into the active layer mask.", False)
+
+    def load_selected_layer_mask_as_selection(self) -> None:
+        if self.document is None:
+            return
+        layer_id = self._current_layer_id() or self.document.active_layer_id
+        if not layer_id:
+            return
+        before_document = dataclasses.replace(self.document)
+        updated_document = load_texture_editor_layer_mask_as_selection(
+            self.document,
+            self.layer_pixels,
+            layer_id,
+            combine_mode=self.current_tool_settings.selection_combine_mode,
+        )
+        if updated_document is self.document:
+            self._set_status("The active layer does not have a mask to load as a selection.", True)
+            return
+        self.document = updated_document
+        self._record_history_change(
+            "Mask To Selection",
+            before_document=before_document,
+            before_layer_pixels={},
+            kind="selection_update",
+            tracked_layer_ids=[],
+        )
+        self._refresh_ui()
+        self._set_status("Loaded the active layer mask into the current selection.", False)
+
+    def _current_selection_bounds(self) -> Optional[Tuple[int, int, int, int]]:
+        if self.document is None:
+            return None
+        if self.document.selection.mode == "none":
+            return None
+        mask = build_texture_editor_selection_mask(self.document.width, self.document.height, self.document.selection)
+        if mask is None:
+            return None
+        ys, xs = np.where(mask > 0)
+        if xs.size == 0 or ys.size == 0:
+            return None
+        x0 = int(xs.min())
+        y0 = int(ys.min())
+        x1 = int(xs.max()) + 1
+        y1 = int(ys.max()) + 1
+        return (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+
+    def export_selection_region(self) -> None:
+        if self.document is None:
+            return
+        bounds = self._current_selection_bounds()
+        if bounds is None:
+            self._set_status("Create a selection first, then use Export Selection Region.", True)
+            return
+        default_name = f"{self.document.title}_selection.png"
+        output_path_text, _selected = QFileDialog.getSaveFileName(
+            self,
+            "Export selection region",
+            str((Path(self._last_save_dir) / default_name).resolve()),
+            "PNG files (*.png)",
+        )
+        if not output_path_text:
+            return
+        output_path = Path(output_path_text).expanduser().resolve()
+        self._last_save_dir = str(output_path.parent)
+        try:
+            export_texture_editor_region_png(
+                self.document,
+                self.layer_pixels,
+                output_path,
+                bounds,
+                padding=int(self.atlas_padding_spin.value()),
+                trim_transparent=bool(self.atlas_trim_checkbox.isChecked()),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, APP_TITLE, f"Could not export the selected region.\n\n{exc}")
+            self._set_status("Selection region export failed.", True)
+            return
+        self._set_status(f"Exported selection region to {output_path.name}.", False)
+
+    def export_grid_slices(self) -> None:
+        if self.document is None:
+            return
+        output_dir_text = QFileDialog.getExistingDirectory(
+            self,
+            "Export grid slices",
+            self._last_save_dir,
+        )
+        if not output_dir_text:
+            return
+        output_dir = Path(output_dir_text).expanduser().resolve()
+        self._last_save_dir = str(output_dir)
+        document = dataclasses.replace(self.document)
+        layer_pixels = {key: value.copy() for key, value in self.layer_pixels.items()}
+        cell_size = int(self.grid_size_spin.value())
+        padding = int(self.atlas_padding_spin.value())
+        trim_transparent = bool(self.atlas_trim_checkbox.isChecked())
+        skip_empty = bool(self.atlas_skip_empty_checkbox.isChecked())
+
+        def _task() -> object:
+            return export_texture_editor_grid_slices(
+                document,
+                layer_pixels,
+                output_dir,
+                cell_width=cell_size,
+                cell_height=cell_size,
+                padding=padding,
+                trim_transparent=trim_transparent,
+                skip_empty=skip_empty,
+            )
+
+        def _on_success(result: object) -> None:
+            exported = result if isinstance(result, list) else []
+            count = len(exported)
+            self._set_status(f"Exported {count} grid slice(s) to {output_dir.name}.", False)
+
+        self._run_async_task(
+            label="Exporting atlas grid slices...",
+            task=_task,
+            on_success=_on_success,
+        )
 
     def _simplify_lasso_points(self, points: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
         if len(points) < 3:
@@ -5460,6 +7631,9 @@ class TextureEditorTab(QWidget):
     ) -> None:
         if self.document is None:
             return
+        self._floating_transform_before_document = None
+        self._floating_transform_before_floating_pixels = None
+        self._floating_transform_label = ""
         self._floating_pixels = np.asarray(pixels, dtype=np.uint8).copy()
         self._floating_mask = self._floating_pixels[..., 3].copy()
         self.document = dataclasses.replace(
@@ -5480,6 +7654,9 @@ class TextureEditorTab(QWidget):
     def _clear_floating_selection(self) -> None:
         if self.document is None:
             return
+        self._floating_transform_before_document = None
+        self._floating_transform_before_floating_pixels = None
+        self._floating_transform_label = ""
         self._floating_pixels = None
         self._floating_mask = None
         if self.document.floating_selection is not None:
@@ -5818,6 +7995,39 @@ class TextureEditorTab(QWidget):
             )
             return
         tool_settings = dataclasses.replace(self.current_tool_settings, tool=tool)
+        if self.document.quick_mask_enabled:
+            if tool not in {"paint", "erase", "fill"}:
+                self._set_status("Quick Mask editing currently supports Paint, Erase, and Fill.", True)
+                return
+            before_document = dataclasses.replace(self.document)
+            if tool == "fill":
+                self.document = apply_texture_editor_selection_fill(
+                    self.document,
+                    tool_settings,
+                    tuple(int(value) for value in points[-1]),
+                )
+            else:
+                self.document = apply_texture_editor_selection_stroke(
+                    self.document,
+                    tool_settings,
+                    points,
+                )
+            self._invalidate_composite_cache()
+            self._record_history_change(
+                f"Quick Mask {tool.title()}",
+                before_document=before_document,
+                before_layer_pixels={},
+                kind="selection_update",
+                tracked_layer_ids=[],
+            )
+            self._refresh_editor_views(
+                canvas=True,
+                history=True,
+                selection=True,
+                status=True,
+                tool_visibility=False,
+            )
+            return
         source_snapshot = None
         if tool in {"clone", "heal"}:
             if tool_settings.clone_source_point is None:
@@ -5841,6 +8051,7 @@ class TextureEditorTab(QWidget):
             return
         working_document = self.document if layer_id == self.document.active_layer_id else dataclasses.replace(self.document, active_layer_id=layer_id)
         before_layer_pixels = {layer_id: self.layer_pixels[layer_id].copy()}
+        dirty_bounds: Optional[Tuple[int, int, int, int]] = None
         if tool == "fill":
             self.layer_pixels = apply_texture_editor_fill(
                 working_document,
@@ -5849,6 +8060,7 @@ class TextureEditorTab(QWidget):
                 tuple(int(value) for value in points[-1]),
                 source_snapshot=source_snapshot,
             )
+            dirty_bounds = self._current_selection_bounds() or self._layer_canvas_bounds(layer_id)
         elif tool == "gradient":
             self.layer_pixels = apply_texture_editor_gradient(
                 working_document,
@@ -5857,6 +8069,7 @@ class TextureEditorTab(QWidget):
                 tuple(int(value) for value in points[0]),
                 tuple(int(value) for value in points[-1]),
             )
+            dirty_bounds = self._current_selection_bounds() or self._layer_canvas_bounds(layer_id)
         elif tool == "patch":
             if self.document.selection.mode == "none":
                 self._set_status("Create a selection first, then drag with Patch to choose the repair source.", True)
@@ -5871,6 +8084,7 @@ class TextureEditorTab(QWidget):
                 delta_y=int(end_y - start_y),
                 source_snapshot=source_snapshot,
             )
+            dirty_bounds = self._current_selection_bounds() or self._estimated_brush_dirty_bounds(points)
         else:
             self.layer_pixels = apply_texture_editor_stroke(
                 working_document,
@@ -5879,17 +8093,19 @@ class TextureEditorTab(QWidget):
                 points,
                 source_snapshot=source_snapshot,
             )
+            dirty_bounds = self._estimated_brush_dirty_bounds(points)
         active_layer_id = self.document.active_layer_id
         self.document = bump_texture_editor_layer_revision(self.document, active_layer_id if self._editing_mask_target and active_layer_id else layer_id)
         if active_layer_id:
             self._invalidate_layer_thumbnail(active_layer_id)
-        self._invalidate_composite_cache()
+        self._invalidate_composite_cache(dirty_bounds)
         self._record_history_change(
             f"{tool.replace('_', ' ').title()}{' Mask' if self._editing_mask_target else ''}",
             before_document=before_document,
             before_layer_pixels=before_layer_pixels,
             kind=f"{tool}_stroke",
             tracked_layer_ids=[layer_id],
+            dirty_bounds=dirty_bounds,
         )
         self._refresh_editor_views(
             canvas=True,
@@ -5938,13 +8154,15 @@ class TextureEditorTab(QWidget):
         self.layer_pixels[layer_id] = recolored
         self.document = bump_texture_editor_layer_revision(self.document, layer_id)
         self._invalidate_layer_thumbnail(layer_id)
-        self._invalidate_composite_cache()
+        dirty_bounds = self._current_selection_bounds() or self._layer_canvas_bounds(layer_id)
+        self._invalidate_composite_cache(dirty_bounds)
         self._record_history_change(
             "Recolor Layer",
             before_document=before_document,
             before_layer_pixels=before_layer_pixels,
             kind="recolor_stroke",
             tracked_layer_ids=[layer_id],
+            dirty_bounds=dirty_bounds,
         )
         self._refresh_editor_views(
             canvas=True,

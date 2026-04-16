@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Callable, Dict, Optional, Tuple
 
-from PySide6.QtCore import QRect, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -17,12 +17,16 @@ from PySide6.QtGui import (
     QTextFormat,
 )
 from PySide6.QtWidgets import (
+    QApplication,
+    QAbstractSpinBox,
+    QComboBox,
     QDialog,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSlider,
     QSizePolicy,
     QTextBrowser,
     QTextEdit,
@@ -33,6 +37,35 @@ from PySide6.QtWidgets import (
 )
 
 from crimson_texture_forge.ui.themes import get_theme
+
+
+class NonIntrusiveWheelGuard(QObject):
+    """Prevents accidental wheel changes on setting widgets while scrolling containers."""
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
+        if event.type() != QEvent.Wheel:
+            return False
+        if isinstance(watched, QComboBox):
+            event.ignore()
+            return True
+        if isinstance(watched, QAbstractSpinBox):
+            event.ignore()
+            return True
+        if isinstance(watched, QSlider):
+            event.ignore()
+            return True
+        return False
+
+
+_wheel_guard: Optional[NonIntrusiveWheelGuard] = None
+
+
+def ensure_app_wheel_guard(app: Optional[QApplication]) -> None:
+    global _wheel_guard
+    if app is None or _wheel_guard is not None:
+        return
+    _wheel_guard = NonIntrusiveWheelGuard(app)
+    app.installEventFilter(_wheel_guard)
 
 
 class PreviewLabel(QLabel):

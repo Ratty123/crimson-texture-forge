@@ -47,13 +47,12 @@ from crimson_texture_forge.ui.themes import get_theme
 from crimson_texture_forge.ui.widgets import CodePreviewEditor, LogHighlighter
 
 
-def _shutdown_thread(thread: Optional[QThread], *, grace_ms: int = 250, force_ms: int = 150) -> None:
+def _shutdown_thread(thread: Optional[QThread], *, grace_ms: int = 2000, force_ms: int = 2000) -> None:
     if thread is None:
         return
     thread.quit()
     if thread.wait(grace_ms):
         return
-    thread.terminate()
     thread.wait(force_ms)
 
 
@@ -187,6 +186,7 @@ class TextSearchTab(QWidget):
     status_message_requested = Signal(str, bool)
     SYNTAX_HIGHLIGHT_CHAR_LIMIT = 2_000_000
     AUTO_PREVIEW_RESULT_LIMIT = 4000
+    RESULT_POPULATION_BATCH_SIZE = 300
 
     def __init__(
         self,
@@ -213,6 +213,9 @@ class TextSearchTab(QWidget):
         self.scheduled_preview_result: Optional[TextSearchResult] = None
         self.search_results: List[TextSearchResult] = []
         self.current_preview_result: Optional[TextSearchResult] = None
+        self._pending_result_items: List[QTreeWidgetItem] = []
+        self._pending_result_total = 0
+        self._pending_auto_preview_enabled = False
         self.last_search_query = ""
         self.last_search_case_sensitive = False
         self.last_search_regex_enabled = False
@@ -229,6 +232,10 @@ class TextSearchTab(QWidget):
         self._preview_debounce_timer.setSingleShot(True)
         self._preview_debounce_timer.setInterval(90)
         self._preview_debounce_timer.timeout.connect(self._flush_scheduled_preview_request)
+        self._results_population_timer = QTimer(self)
+        self._results_population_timer.setSingleShot(True)
+        self._results_population_timer.setInterval(0)
+        self._results_population_timer.timeout.connect(self._flush_result_population_batch)
 
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(10, 10, 10, 10)
@@ -574,6 +581,7 @@ class TextSearchTab(QWidget):
     def shutdown(self) -> None:
         self.flush_settings_save()
         self._preview_debounce_timer.stop()
+        self._clear_pending_result_population()
         if self.search_worker is not None:
             self.search_worker.stop()
         if self.preview_worker is not None:
@@ -771,6 +779,7 @@ class TextSearchTab(QWidget):
                 return
 
         self.search_results = []
+        self._clear_pending_result_population()
         self.results_tree.clear()
         self.current_preview_result = None
         self.last_search_stats = TextSearchRunStats(source_kind=source_kind, candidate_count=0, searched_count=0)
@@ -825,6 +834,12 @@ class TextSearchTab(QWidget):
         if self.search_worker is not None:
             self.search_worker.stop()
 
+    def _clear_pending_result_population(self) -> None:
+        self._results_population_timer.stop()
+        self._pending_result_items = []
+        self._pending_result_total = 0
+        self._pending_auto_preview_enabled = False
+
     def _handle_progress(self, current: int, total: int, detail: str) -> None:
         self.search_progress_label.setText(detail)
         if total > 0:
@@ -838,40 +853,13 @@ class TextSearchTab(QWidget):
         self.status_message_requested.emit(detail, False)
 
     def _handle_search_complete(self, payload: object) -> None:
+        self._clear_pending_result_population()
         data = payload if isinstance(payload, dict) else {}
         self.search_results = data.get("results", []) if isinstance(data.get("results"), list) else []
         stats = data.get("stats")
         self.last_search_stats = stats if isinstance(stats, TextSearchRunStats) else TextSearchRunStats(source_kind="archive", candidate_count=0, searched_count=0)
         auto_preview_enabled = len(self.search_results) <= self.AUTO_PREVIEW_RESULT_LIMIT
-        self.results_tree.blockSignals(True)
-        self.results_tree.setUpdatesEnabled(False)
         self.results_tree.clear()
-        new_items: List[QTreeWidgetItem] = []
-        for index, result in enumerate(self.search_results):
-            new_items.append(self._build_result_item(index, result))
-        if new_items:
-            self.results_tree.addTopLevelItems(new_items)
-        self.results_tree.setUpdatesEnabled(True)
-        self.results_tree.blockSignals(False)
-        if self.search_results and auto_preview_enabled:
-            self.results_tree.setCurrentItem(self.results_tree.topLevelItem(0))
-        else:
-            if self.search_results:
-                self.preview_title_label.setText("Large result set")
-                self.preview_meta_label.setText("Select a file to preview. Auto-preview is disabled for large result sets to keep the UI responsive.")
-                self.preview_detail_label.setText("")
-            else:
-                self.preview_title_label.setText("No matches")
-                self.preview_meta_label.setText("No matching file was found for the current query.")
-                self.preview_detail_label.setText("")
-            self.preview_detail_label.setText("")
-            self.preview_text_edit.setPlainText("")
-            self.preview_text_edit.set_match_selections([])
-            self.preview_text_cache = ""
-            self.preview_search_spans = []
-            self.preview_find_spans = []
-            self.preview_find_active_index = -1
-            self.preview_find_status_label.setText("No preview loaded.")
         summary = (
             f"Scanned {self.last_search_stats.candidate_count:,} candidate file(s). "
             f"Searched {self.last_search_stats.searched_count:,} readable file(s). "
@@ -884,12 +872,64 @@ class TextSearchTab(QWidget):
         if self.search_results and not auto_preview_enabled:
             summary += " Auto-preview was skipped because the result set is very large."
         self.results_summary_label.setText(summary)
+        self._pending_result_items = [self._build_result_item(index, result) for index, result in enumerate(self.search_results)]
+        self._pending_result_total = len(self._pending_result_items)
+        self._pending_auto_preview_enabled = auto_preview_enabled
+        if self._pending_result_total:
+            self.search_progress_label.setText(f"Populating results... 0 / {self._pending_result_total}")
+            self.search_progress_bar.setRange(0, self._pending_result_total)
+            self.search_progress_bar.setValue(0)
+            self.search_progress_bar.setFormat(f"0 / {self._pending_result_total}")
+            self._results_population_timer.start()
+        else:
+            self._finalize_result_population()
+        self.append_log(summary)
+        self.status_message_requested.emit(summary, False)
+
+    def _finalize_result_population(self) -> None:
+        if self.search_results and self._pending_auto_preview_enabled:
+            first_item = self.results_tree.topLevelItem(0)
+            if first_item is not None:
+                self.results_tree.setCurrentItem(first_item)
+        else:
+            if self.search_results:
+                self.preview_title_label.setText("Large result set")
+                self.preview_meta_label.setText("Select a file to preview. Auto-preview is disabled for large result sets to keep the UI responsive.")
+            else:
+                self.preview_title_label.setText("No matches")
+                self.preview_meta_label.setText("No matching file was found for the current query.")
+            self.preview_detail_label.setText("")
+            self.preview_text_edit.setPlainText("")
+            self.preview_text_edit.set_match_selections([])
+            self.preview_text_cache = ""
+            self.preview_search_spans = []
+            self.preview_find_spans = []
+            self.preview_find_active_index = -1
+            self.preview_find_status_label.setText("No preview loaded.")
         self.search_progress_label.setText("Search complete.")
         self.search_progress_bar.setRange(0, 1)
         self.search_progress_bar.setValue(1)
         self.search_progress_bar.setFormat("Ready")
-        self.append_log(summary)
-        self.status_message_requested.emit(summary, False)
+        self._clear_pending_result_population()
+
+    def _flush_result_population_batch(self) -> None:
+        if not self._pending_result_items:
+            self._finalize_result_population()
+            return
+        batch = self._pending_result_items[: self.RESULT_POPULATION_BATCH_SIZE]
+        del self._pending_result_items[: self.RESULT_POPULATION_BATCH_SIZE]
+        self.results_tree.setUpdatesEnabled(False)
+        self.results_tree.addTopLevelItems(batch)
+        self.results_tree.setUpdatesEnabled(True)
+        populated = self._pending_result_total - len(self._pending_result_items)
+        self.search_progress_label.setText(f"Populating results... {populated} / {self._pending_result_total}")
+        self.search_progress_bar.setRange(0, max(1, self._pending_result_total))
+        self.search_progress_bar.setValue(populated)
+        self.search_progress_bar.setFormat(f"{populated} / {self._pending_result_total}")
+        if self._pending_result_items:
+            self._results_population_timer.start()
+            return
+        self._finalize_result_population()
 
     def _build_result_item(self, index: int, result: TextSearchResult) -> QTreeWidgetItem:
         file_name = PurePosixPath(result.relative_path).name or result.relative_path
@@ -910,6 +950,7 @@ class TextSearchTab(QWidget):
         return item
 
     def _handle_search_cancelled(self, message: str) -> None:
+        self._clear_pending_result_population()
         self.search_progress_label.setText(message)
         self.search_progress_bar.setRange(0, 1)
         self.search_progress_bar.setValue(0)
@@ -918,6 +959,7 @@ class TextSearchTab(QWidget):
         self.status_message_requested.emit(message, True)
 
     def _handle_search_error(self, message: str) -> None:
+        self._clear_pending_result_population()
         self.search_progress_label.setText(message)
         self.search_progress_bar.setRange(0, 1)
         self.search_progress_bar.setValue(0)

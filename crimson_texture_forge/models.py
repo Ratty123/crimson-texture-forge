@@ -522,6 +522,7 @@ class TextureEditorSelection:
     rect: Optional[Tuple[int, int, int, int]] = None
     polygon_points: Tuple[Tuple[float, float], ...] = ()
     mask_polygons: Tuple[Tuple[Tuple[float, float], ...], ...] = ()
+    mask_png_blob: bytes = b""
     inverted: bool = False
     feather_radius: int = 0
 
@@ -550,6 +551,8 @@ class TextureEditorToolSettings:
     brush_preset: str = "custom"
     brush_tip: str = "round"
     brush_pattern: str = "solid"
+    custom_brush_tip_path: str = ""
+    symmetry_mode: str = "off"
     size_step_mode: str = "normal"
     paint_blend_mode: str = "normal"
     size: float = 32.0

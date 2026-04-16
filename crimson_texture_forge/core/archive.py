@@ -2115,10 +2115,13 @@ def iter_archive_loose_file_candidates(
 def build_loose_archive_preview_assets(
     texconv_path: Optional[Path],
     loose_path: Path,
+    *,
+    stop_event: Optional[threading.Event] = None,
 ) -> Tuple[str, str, str]:
     resolved_path = loose_path.expanduser().resolve()
     suffix = resolved_path.suffix.lower()
     detail = f"Loose file preview from: {resolved_path}"
+    raise_if_cancelled(stop_event)
 
     if suffix == ".dds":
         dds_info = None
@@ -2135,7 +2138,12 @@ def build_loose_archive_preview_assets(
         if texconv_path is None:
             extra = f"\nDDS metadata unavailable: {parse_error}" if parse_error is not None else ""
             return "", metadata_summary, detail + extra + "\nSet texconv.exe to enable DDS loose-file previews."
-        preview_png = ensure_dds_display_preview_png(texconv_path.resolve(), resolved_path, dds_info=dds_info)
+        preview_png = ensure_dds_display_preview_png(
+            texconv_path.resolve(),
+            resolved_path,
+            dds_info=dds_info,
+            stop_event=stop_event,
+        )
         if parse_error is not None:
             detail += f"\nDDS metadata unavailable: {parse_error}"
         return str(preview_png), metadata_summary, detail
@@ -2215,7 +2223,11 @@ def build_archive_preview_result(
                     loose_preview_image_path,
                     loose_preview_metadata_summary,
                     loose_preview_detail_text,
-                ) = build_loose_archive_preview_assets(texconv_path, loose_candidate)
+                ) = build_loose_archive_preview_assets(
+                    texconv_path,
+                    loose_candidate,
+                    stop_event=stop_event,
+                )
             except Exception as exc:
                 loose_preview_metadata_summary = f"Loose file | {loose_candidate.name}"
                 loose_preview_detail_text = (
