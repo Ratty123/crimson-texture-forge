@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-Crimson Texture Forge uses or interoperates with several third-party projects and tools.
+Crimson Forge Toolkit uses or interoperates with several third-party projects and tools.
 
 This file is a practical notice list for repository and release packaging. For authoritative license text, copyright ownership, and redistribution terms, always refer to the upstream project itself.
 
@@ -37,7 +37,7 @@ This file is a practical notice list for repository and release packaging. For a
 - Purpose: DDS preview conversion, DDS staging, and final DDS rebuild
 - Upstream: https://github.com/microsoft/DirectXTex
 - Release assets: https://github.com/microsoft/DirectXTex/releases
-- Notes: Crimson Texture Forge links to the official `texconv.exe` release page, but the tool remains a separate upstream project
+- Notes: Crimson Forge Toolkit links to the official `texconv.exe` release page, but the tool remains a separate upstream project
 
 ### chaiNNer
 
@@ -45,7 +45,7 @@ This file is a practical notice list for repository and release packaging. For a
 - Upstream: https://chainner.app/
 - Download page: https://chainner.app/download/
 - CLI documentation: https://github.com/chaiNNer-org/chaiNNer/wiki/05--CLI
-- Notes: Crimson Texture Forge can open the official chaiNNer download page, launch chaiNNer, inspect `.chn` chains, and pass override JSON, but chaiNNer remains a separate upstream application with its own dependencies and licenses
+- Notes: Crimson Forge Toolkit can open the official chaiNNer download page, launch chaiNNer, inspect `.chn` chains, and pass override JSON, but chaiNNer remains a separate upstream application with its own dependencies and licenses
 
 ## Archive Format References And Compatibility Validation
 
@@ -62,6 +62,6 @@ This file is a practical notice list for repository and release packaging. For a
 
 ## Redistribution Notes
  
-- Crimson Texture Forge does not write back to `.pamt` or `.paz` archives.
+- Crimson Forge Toolkit does not write back to `.pamt` or `.paz` archives.
 - External tools such as `texconv.exe` and `chaiNNer.exe` remain separate projects and should be distributed in accordance with their upstream terms.
 - If you publish releases of this app, review the upstream licenses of any bundled or redistributed third-party components before shipping them.

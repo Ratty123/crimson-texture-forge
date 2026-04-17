@@ -15,7 +15,7 @@ Project guidelines:
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 - [SECURITY.md](SECURITY.md)
 
-Crimson Texture Forge is built for modders who want one place to:
+Crimson Forge Toolkit is built for modders who want one place to:
 
 - browse and extract files from `.pamt` / `.paz` archives
 - scan loose DDS files and rebuild controlled DDS output with `texconv`
@@ -67,7 +67,7 @@ The app is intentionally focused on **read-only archive access** and **loose-fil
 
 If you want the safest starting point, use this path first:
 
-1. Run `CrimsonTextureForge-<version>-windows-portable.exe`.
+1. Run `CrimsonForgeToolkit-<version>-windows-portable.exe`.
 2. In `Texture Workflow > Setup`, click `Init Workspace`.
 3. Configure `texconv.exe` or open its official download page from `Setup`.
 4. Set `Original DDS root`, `PNG root`, and `Output root`.
@@ -131,7 +131,7 @@ Use this when you already have:
 Important:
 
 - `chaiNNer` remains the source of truth for its own chain behavior
-- direct NCNN controls in Crimson Texture Forge do **not** override the chain
+- direct NCNN controls in Crimson Forge Toolkit do **not** override the chain
 
 ## Texture Policy And Safety
 
@@ -357,7 +357,7 @@ The app stores its portable local state beside the EXE.
 
 Main local files and folders include:
 
-- `CrimsonTextureForge.cfg`
+- `CrimsonForgeToolkit.cfg`
 - `archive_cache`
 - research notes / related local support files
 
@@ -368,7 +368,7 @@ The app also supports:
 
 ## Privacy And Network Behavior
 
-Crimson Texture Forge does **not** include built-in telemetry, analytics, auto-update checks, background network calls for normal offline use, or in-app file downloads for external tools/models.
+Crimson Forge Toolkit does **not** include built-in telemetry, analytics, auto-update checks, background network calls for normal offline use, or in-app file downloads for external tools/models.
 
 It only opens external pages in your browser when you explicitly trigger actions such as:
 

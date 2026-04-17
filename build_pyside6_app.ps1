@@ -5,9 +5,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
-$appName = "CrimsonTextureForge"
+$appName = "CrimsonForgeToolkit"
 $legacyAppName = "DDSRebuildApp"
-$iconPath = Join-Path $PSScriptRoot "assets\crimson_texture_forge.ico"
+$previousAppName = "CrimsonTextureForge"
+$iconPath = Join-Path $PSScriptRoot "assets\crimson_forge_toolkit.ico"
+$customHookDir = Join-Path $PSScriptRoot "pyinstaller_hooks"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
@@ -118,14 +120,14 @@ if (-not (Test-Path $pythonExe)) {
     $pythonExe = "python"
 }
 
-$appVersion = (& $pythonExe -c "from crimson_texture_forge.constants import APP_VERSION; print(APP_VERSION)").Trim()
+$appVersion = (& $pythonExe -c "from crimson_forge_toolkit.constants import APP_VERSION; print(APP_VERSION)").Trim()
 if (-not $appVersion) {
-    throw "Could not determine app version from crimson_texture_forge.constants.APP_VERSION"
+    throw "Could not determine app version from crimson_forge_toolkit.constants.APP_VERSION"
 }
 $oneFileOutputName = "$appName-$appVersion-windows-portable.exe"
 $oneDirOutputName = "$appName-$appVersion-windows"
 
-Stop-AppProcesses -NamePrefixes @($appName, $legacyAppName)
+Stop-AppProcesses -NamePrefixes @($appName, $previousAppName, $legacyAppName)
 
 $pyInstallerArgs = @(
     "-m",
@@ -142,10 +144,14 @@ $pyInstallerArgs = @(
     $appName
 )
 
+if (Test-Path $customHookDir) {
+    $pyInstallerArgs += @("--additional-hooks-dir", $customHookDir)
+}
+
 if (Test-Path $iconPath) {
     $pyInstallerArgs += @("--icon", $iconPath)
     $pyInstallerArgs += @("--add-data", "$iconPath;assets")
-    $pngIconPath = Join-Path $PSScriptRoot "assets\crimson_texture_forge.png"
+    $pngIconPath = Join-Path $PSScriptRoot "assets\crimson_forge_toolkit.png"
     if (Test-Path $pngIconPath) {
         $pyInstallerArgs += @("--add-data", "$pngIconPath;assets")
     }
@@ -154,7 +160,8 @@ if (Test-Path $iconPath) {
 $pyInstallerArgs += @(
     "--collect-all", "numpy",
     "--collect-all", "cv2",
-    "--collect-all", "PIL"
+    "--exclude-module", "PIL.AvifImagePlugin",
+    "--exclude-module", "PIL._avif"
 )
 
 if ($Mode -eq "onefile") {
@@ -166,11 +173,12 @@ if ($Mode -eq "onefile") {
 New-Item -ItemType Directory -Path $stableDistDir -Force | Out-Null
 New-Item -ItemType Directory -Path $stableBuildDir -Force | Out-Null
 Remove-PathWithRetries -LiteralPath (Join-Path $stableBuildDir $appName) -Recurse
+Remove-PathWithRetries -LiteralPath (Join-Path $stableBuildDir $previousAppName) -Recurse
 Remove-PathWithRetries -LiteralPath (Join-Path $stableBuildDir $legacyAppName) -Recurse
 Remove-PathWithRetries -LiteralPath $pyInstallerDistDir -Recurse
 Remove-PathWithRetries -LiteralPath $pyInstallerWorkDir -Recurse
 
-$pyInstallerArgs += "crimson_texture_forge_app.py"
+$pyInstallerArgs += "crimson_forge_toolkit_app.py"
 
 Write-Host "Building $appName in $Mode mode..."
 & $pythonExe @pyInstallerArgs
@@ -188,6 +196,9 @@ if ($Mode -eq "onefile") {
     Remove-PathWithRetries -LiteralPath (Join-Path $stableDistDir "$appName") -Recurse
     Remove-PathWithRetries -LiteralPath (Join-Path $stableDistDir "$appName.exe")
     Remove-PathWithRetries -LiteralPath $versionedExe
+    Remove-PathWithRetries -LiteralPath (Join-Path $stableDistDir "$previousAppName") -Recurse
+    Remove-PathWithRetries -LiteralPath (Join-Path $stableDistDir "$previousAppName.exe")
+    Remove-PathWithRetries -LiteralPath (Join-Path $stableDistDir "$previousAppName-$appVersion-windows-portable.exe")
     Remove-PathWithRetries -LiteralPath (Join-Path $stableDistDir "$legacyAppName") -Recurse
     Remove-PathWithRetries -LiteralPath (Join-Path $stableDistDir "$legacyAppName.exe")
     Move-PathWithRetries -SourcePath $builtExe -DestinationPath $versionedExe
@@ -199,6 +210,8 @@ if ($Mode -eq "onefile") {
     }
     Remove-PathWithRetries -LiteralPath (Join-Path $stableDistDir "$appName.exe")
     Remove-PathWithRetries -LiteralPath (Join-Path $stableDistDir $oneFileOutputName)
+    Remove-PathWithRetries -LiteralPath (Join-Path $stableDistDir "$previousAppName.exe")
+    Remove-PathWithRetries -LiteralPath (Join-Path $stableDistDir "$previousAppName-$appVersion-windows-portable.exe")
     Remove-PathWithRetries -LiteralPath (Join-Path $stableDistDir "$legacyAppName.exe")
     Remove-PathWithRetries -LiteralPath $versionedDir -Recurse
     Move-PathWithRetries -SourcePath $builtDir -DestinationPath $versionedDir

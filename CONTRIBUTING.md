@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve Crimson Texture Forge.
+Thanks for helping improve Crimson Forge Toolkit.
 
 ## Before You Open An Issue
 
@@ -49,7 +49,7 @@ Please try to:
 
 ## Project Scope
 
-Crimson Texture Forge is intentionally centered on:
+Crimson Forge Toolkit is intentionally centered on:
 
 - read-only archive browsing
 - loose-file DDS and PNG workflows
