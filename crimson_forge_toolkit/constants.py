@@ -142,9 +142,32 @@ APP_ORGANIZATION = "Ratrider"
 APP_NAME = "CrimsonForgeToolkit"
 APP_TITLE = "Crimson Forge Toolkit"
 LEGACY_APP_NAMES = ("CrimsonTextureForge", "DDSRebuildApp")
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.6.5"
 CRIMSON_DESERT_STEAM_APP_ID = "3321460"
 DEFAULT_UI_THEME = "graphite"
+DEFAULT_UI_FONT_FAMILY = "Segoe UI"
+DEFAULT_UI_FONT_SIZE = 10
+DEFAULT_UI_DATA_FONT_SIZE = 10
+UI_FONT_SIZE_MIN = 8
+UI_FONT_SIZE_MAX = 15
+DEFAULT_UI_DENSITY = "compact"
+DEFAULT_UI_LOG_FONT_FAMILY = "Consolas"
+DEFAULT_UI_LOG_FONT_SIZE = 8
+DEFAULT_UI_LOG_FONT_BOLD = False
+UI_FONT_FAMILY_OPTIONS = (
+    "Segoe UI",
+    "Aptos",
+    "Calibri",
+    "Verdana",
+    "Tahoma",
+)
+LOG_FONT_FAMILY_OPTIONS = (
+    "Consolas",
+    "Cascadia Mono",
+    "Cascadia Code",
+    "Lucida Console",
+    "Courier New",
+)
 CHAINNER_SETTLE_SECONDS = 2.0
 CHAINNER_ENV_VARS_TO_REMOVE = ("ELECTRON_RUN_AS_NODE",)
 CHAINNER_PROGRESS_RE = re.compile(r"Executed\s+(\d+)\s*/\s*(\d+)\s+nodes", re.IGNORECASE)

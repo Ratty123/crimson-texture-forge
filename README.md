@@ -4,11 +4,11 @@ Windows desktop tool for **Crimson Desert texture workflows**, **read-only archi
 
 Project changelog: [CHANGELOG.md](CHANGELOG.md)
 
-Latest release: `0.6.0`
+Latest release: `0.6.5`
 
-- expanded `Texture Editor` with deeper packed-channel tools, navigator/rulers/guides, atlas helpers, and more advanced adjustments
-- added stronger transform, mask, brush, and document-editing workflows for real in-app texture modification
-- improved editor stability, DDS preview behavior, text-search/research responsiveness, and heavier-session performance
+- added broader appearance/font controls, denser UI tuning, and cleaner cross-tab panel/layout behavior
+- expanded archive-side inspection with richer DDS metadata and in-place archive preview/details inside `Research`
+- improved workflow handoff, matching, classification clarity, preview stability, and overall app responsiveness
 
 Project guidelines:
 
@@ -39,9 +39,9 @@ The app is intentionally focused on **read-only archive access** and **loose-fil
 - `Replace Assistant`: import edited `PNG` / `DDS`, match them to the original game texture, optionally upscale with direct `NCNN`, rebuild corrected DDS output, and write a mod-ready loose package
 - `Texture Editor`: open visible textures from loose files, Archive Browser, Compare, or Replace Assistant, edit them in layers with selections, masks, adjustments, channel-aware brush/retouch tools, and custom brush presets, then save/export the flattened PNG back into the rebuild pipeline
 - `Archive Browser`: scan archives, filter entries, preview supported assets, and extract files to normal folders
-- `Research`: group related textures, resolve references, inspect DDS QA results, export analysis reports, and store notes
+- `Research`: group related textures, resolve references, inspect DDS QA results, preview archive files, export analysis reports, and store notes
 - `Text Search`: search archive or loose text-like files, preview results with syntax colors, and export matched files
-- `Settings`: persistent theme, startup, layout, and safety preferences
+- `Settings`: persistent theme, font, density, startup, layout, log/code, and safety preferences
 
 ### Main workflow features
 
@@ -58,10 +58,10 @@ The app is intentionally focused on **read-only archive access** and **loose-fil
 - optional `NCNN extra args` for advanced direct `Real-ESRGAN NCNN` flags such as `-dn 0.2`
 - `Preview Policy` to inspect the planned per-texture action before `Start`
 - compare view with shared preview-size presets, per-side zoom, mouse-wheel zoom, drag pan, `Sync Pan`, and focused compare layout
-- `Research` tools for shared classifier output, grouped texture sets, sidecar/reference discovery, `Classification Review` preview/review/approval, texture analysis, heatmap views, and local notes
+- `Research` tools for shared classifier output, grouped texture sets, sidecar/reference discovery, `Classification Review` preview/review/approval, texture analysis, heatmap views, archive file preview, and local notes
 - text search with archive/loose search, regex, local find, wrap toggle, line numbers, and export
 - `Replace Assistant` for edited-texture replacement workflows that use the original DDS as authority for rebuild metadata and mod package paths
-- `Texture Editor` for in-app visible-texture editing, layered projects, masks, adjustment layers, floating selections/transforms, clone/heal/smudge/patch work, brush presets/tips/patterns, channel locks, and exporting flattened PNGs back into `Replace Assistant` or `Texture Workflow`
+- `Texture Editor` for in-app visible-texture editing, layered projects, masks, adjustment layers, floating selections/transforms, clone/heal/smudge/patch work, brush presets/tips/patterns, channel locks, configurable grids, and exporting flattened PNGs back into `Replace Assistant` or `Texture Workflow`
 
 ## Recommended First Run
 
@@ -379,53 +379,37 @@ It only opens external pages in your browser when you explicitly trigger actions
 
 ## Screenshots
 
+### Texture Workflow
+
+![Texture Workflow](<docs/screenshots/cft-texture-workflow.png>)
+
 ### Archive Browser
 
-![Archive Browser](docs/screenshots/archive_browser.png)
-
-### Texture Workflow: DDS To PNG / DDS Rebuild
-
-![Workflow PNG to DDS](docs/screenshots/workflow_png_to_dds.png)
-
-### Texture Workflow: Upscaling Running
-
-![Workflow Upscaling Running](docs/screenshots/workflow_upscalingrunning.png)
-
-### Texture Workflow: NCNN Model Catalog
-
-![Workflow Catalog](docs/screenshots/workflow_catalog.png)
-
-### Compare View
-
-![Workflow Compare](docs/screenshots/workflow_compare.png)
-
-### Compare View: Alternate Example
-
-![Workflow Compare 2](docs/screenshots/workflow_compare2.png)
+![Archive Browser](<docs/screenshots/cft-archive-browser.png>)
 
 ### Texture Editor
 
-![Texture Editor](docs/screenshots/CTF_texture_editor_prototype.png)
+![Texture Editor](<docs/screenshots/cft-texture-editor.png>)
 
-### Research: Archive Insights
+### Replace Assistant
 
-![Research Archive Insights](docs/screenshots/research_archive_insights.png)
+![Replace Assistant](<docs/screenshots/cft-replace-assistant.png>)
 
 ### Research: References
 
-![Research References](docs/screenshots/research_references.png)
+![Research References](<docs/screenshots/cft-research-references.png>)
 
 ### Research: Classification Review
 
-![Research Classification Review](docs/screenshots/research_classification_review.png)
-
-### Research: Texture Analysis
-
-![Research Texture Analysis](docs/screenshots/research_textureanalysis.png)
+![Research Classification Review](<docs/screenshots/cft-research-classification-review.png>)
 
 ### Text Search
 
-![Text Search](docs/screenshots/TextSearcher.png)
+![Text Search](<docs/screenshots/cft-text-search.png>)
+
+### Settings
+
+![Settings](<docs/screenshots/cft-settings.png>)
 
 ## Dependencies
 

@@ -208,9 +208,28 @@ def _candidate_relative_keys(
         rel = PurePosixPath(*parts[index:]).as_posix().lower()
         if rel:
             candidates.append(rel)
-    if source_path.suffix.lower() == ".dds":
-        candidates.append(source_path.with_suffix(".dds").name.lower())
-    return [candidate for candidate in dict.fromkeys(candidates) if candidate]
+    basename_candidate = (
+        source_path.name.lower()
+        if source_path.suffix.lower() == ".dds"
+        else source_path.with_suffix(".dds").name.lower()
+    )
+    if basename_candidate:
+        candidates.append(basename_candidate)
+
+    normalized_candidates: List[str] = []
+    for candidate in candidates:
+        normalized_candidate = str(candidate or "").strip().lower()
+        if not normalized_candidate:
+            continue
+        normalized_candidates.append(normalized_candidate)
+        if source_path.suffix.lower() != ".dds":
+            try:
+                candidate_path = PurePosixPath(normalized_candidate)
+                if candidate_path.suffix:
+                    normalized_candidates.append(candidate_path.with_suffix(".dds").as_posix().lower())
+            except Exception:
+                pass
+    return [candidate for candidate in dict.fromkeys(normalized_candidates) if candidate]
 
 
 def match_replace_assistant_original(

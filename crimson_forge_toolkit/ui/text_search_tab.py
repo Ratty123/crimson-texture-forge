@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSplitter,
+    QSizePolicy,
     QTextEdit,
     QTreeWidget,
     QTreeWidgetItem,
@@ -44,7 +45,13 @@ from crimson_forge_toolkit.core.text_search import (
 )
 from crimson_forge_toolkit.models import ArchiveEntry, RunCancelled
 from crimson_forge_toolkit.ui.themes import get_theme
-from crimson_forge_toolkit.ui.widgets import CodePreviewEditor, LogHighlighter
+from crimson_forge_toolkit.ui.widgets import (
+    CodePreviewEditor,
+    FlatSectionPanel,
+    LogHighlighter,
+    build_responsive_splitter_sizes,
+    clamp_splitter_sizes,
+)
 
 
 def _shutdown_thread(thread: Optional[QThread], *, grace_ms: int = 2000, force_ms: int = 2000) -> None:
@@ -246,9 +253,8 @@ class TextSearchTab(QWidget):
         self.main_splitter.setHandleWidth(8)
         root_layout.addWidget(self.main_splitter, stretch=1)
 
-        controls_group = QGroupBox("Text Search")
-        controls_layout = QVBoxLayout(controls_group)
-        controls_layout.setContentsMargins(10, 12, 10, 10)
+        controls_group = FlatSectionPanel("Text Search")
+        controls_layout = controls_group.body_layout
         controls_layout.setSpacing(8)
 
         summary_label = QLabel(
@@ -315,20 +321,28 @@ class TextSearchTab(QWidget):
         grid.setColumnStretch(3, 1)
         controls_layout.addLayout(grid)
 
-        button_row = QHBoxLayout()
-        button_row.setSpacing(8)
+        button_row = QGridLayout()
+        button_row.setHorizontalSpacing(8)
+        button_row.setVerticalSpacing(8)
         self.search_button = QPushButton("Search")
         self.stop_button = QPushButton("Stop")
         self.stop_button.setEnabled(False)
         self.export_selected_button = QPushButton("Export Selected")
         self.export_all_button = QPushButton("Export Results")
         self.clear_log_button = QPushButton("Clear Log")
-        button_row.addWidget(self.search_button)
-        button_row.addWidget(self.stop_button)
-        button_row.addWidget(self.export_selected_button)
-        button_row.addWidget(self.export_all_button)
-        button_row.addStretch(1)
-        button_row.addWidget(self.clear_log_button)
+        for button in (
+            self.search_button,
+            self.stop_button,
+            self.export_selected_button,
+            self.export_all_button,
+            self.clear_log_button,
+        ):
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        button_row.addWidget(self.search_button, 0, 0)
+        button_row.addWidget(self.stop_button, 0, 1)
+        button_row.addWidget(self.export_selected_button, 0, 2)
+        button_row.addWidget(self.export_all_button, 1, 0, 1, 2)
+        button_row.addWidget(self.clear_log_button, 1, 2)
         controls_layout.addLayout(button_row)
 
         self.results_summary_label = QLabel("No text search has been run yet.")
@@ -343,9 +357,8 @@ class TextSearchTab(QWidget):
         controls_layout.addWidget(self.search_progress_label)
         controls_layout.addWidget(self.search_progress_bar)
         controls_layout.addSpacing(8)
-        log_group = QGroupBox("Search Log")
-        log_layout = QVBoxLayout(log_group)
-        log_layout.setContentsMargins(10, 12, 10, 10)
+        log_group = FlatSectionPanel("Search Log")
+        log_layout = log_group.body_layout
         log_layout.setSpacing(8)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
@@ -354,9 +367,8 @@ class TextSearchTab(QWidget):
         controls_layout.addWidget(log_group, stretch=1)
         self.main_splitter.addWidget(controls_group)
 
-        results_group = QGroupBox("Results")
-        results_layout = QVBoxLayout(results_group)
-        results_layout.setContentsMargins(10, 12, 10, 10)
+        results_group = FlatSectionPanel("Results")
+        results_layout = results_group.body_layout
         results_layout.setSpacing(8)
         self.results_tree = QTreeWidget()
         self.results_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -375,9 +387,8 @@ class TextSearchTab(QWidget):
         results_layout.addWidget(self.results_tree, stretch=1)
         self.main_splitter.addWidget(results_group)
 
-        preview_group = QGroupBox("Preview")
-        preview_layout = QVBoxLayout(preview_group)
-        preview_layout.setContentsMargins(10, 12, 10, 10)
+        preview_group = FlatSectionPanel("Preview")
+        preview_layout = preview_group.body_layout
         preview_layout.setSpacing(8)
         self.preview_title_label = QLabel("Select a matching file")
         self.preview_title_label.setWordWrap(True)
@@ -430,18 +441,21 @@ class TextSearchTab(QWidget):
         preview_layout.addLayout(preview_toolbar)
         preview_layout.addWidget(self.preview_text_edit, stretch=1)
         self.main_splitter.addWidget(preview_group)
-        controls_group.setMinimumWidth(360)
-        results_group.setMinimumWidth(300)
-        preview_group.setMinimumWidth(420)
+        controls_group.setMinimumWidth(300)
+        results_group.setMinimumWidth(260)
+        preview_group.setMinimumWidth(360)
         self.main_splitter.setStretchFactor(0, 2)
         self.main_splitter.setStretchFactor(1, 2)
         self.main_splitter.setStretchFactor(2, 4)
-        self.main_splitter.setSizes([430, 380, 860])
+        self.main_splitter.setSizes(build_responsive_splitter_sizes(1670, [26, 22, 52], [300, 260, 360]))
 
         self.log_highlighter = LogHighlighter(self.log_view.document(), theme_key)
         log_font = QFont("Consolas")
         if not log_font.exactMatch():
             log_font = QFont("Courier New")
+        inherited_size = self.font().pointSize()
+        if inherited_size > 0:
+            log_font.setPointSize(inherited_size)
         self.log_view.setFont(log_font)
 
         self.loose_root_browse_button.clicked.connect(self._browse_loose_root)
@@ -492,10 +506,47 @@ class TextSearchTab(QWidget):
 
     def set_splitter_sizes(self, sizes: Sequence[int]) -> None:
         if sizes:
-            self.main_splitter.setSizes([int(value) for value in sizes])
+            total_width = max(self.width() - 32, sum([300, 260, 360]))
+            self.main_splitter.setSizes(
+                clamp_splitter_sizes(total_width, sizes, [300, 260, 360], fallback_weights=[26, 22, 52])
+            )
 
     def splitter_sizes(self) -> List[int]:
         return self.main_splitter.sizes()
+
+    def apply_responsive_splitter_sizes(self, total_width: Optional[int] = None) -> None:
+        available_width = total_width or max(self.width() - 32, sum([300, 260, 360]))
+        self.main_splitter.setSizes(
+            build_responsive_splitter_sizes(available_width, [26, 22, 52], [300, 260, 360])
+        )
+
+    def auto_fit_columns(self) -> None:
+        header = self.results_tree.header()
+        if header is None or self.results_tree.columnCount() <= 0:
+            return
+        viewport_width = max(self.results_tree.viewport().width(), self.results_tree.width() - 24, 0)
+        if viewport_width <= 0:
+            return
+        minimums = {
+            0: 220,
+            1: 74,
+            2: 96,
+            3: 280,
+            4: 60,
+        }
+        self.results_tree.setUpdatesEnabled(False)
+        try:
+            for column in (1, 2, 4):
+                self.results_tree.resizeColumnToContents(column)
+                header.resizeSection(column, max(minimums[column], header.sectionSize(column)))
+            reserved = sum(header.sectionSize(column) for column in (1, 2, 4))
+            remaining = max(0, viewport_width - reserved - 12)
+            file_width = max(minimums[0], int(remaining * 0.38))
+            path_width = max(minimums[3], remaining - file_width)
+            header.resizeSection(0, file_width)
+            header.resizeSection(3, path_width)
+        finally:
+            self.results_tree.setUpdatesEnabled(True)
 
     def set_external_busy(self, busy: bool) -> None:
         self.external_busy = busy

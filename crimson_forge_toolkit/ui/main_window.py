@@ -82,6 +82,9 @@ def run_gui() -> int:
     from crimson_forge_toolkit.ui.themes import UI_THEME_SCHEMES, build_app_palette, build_app_stylesheet
     from crimson_forge_toolkit.ui.widgets import (
         AboutDialog,
+        FlatSectionPanel,
+        build_responsive_splitter_sizes,
+        clamp_splitter_sizes,
         CollapsibleSection,
         ensure_app_wheel_guard,
         LogHighlighter,
@@ -259,11 +262,82 @@ def run_gui() -> int:
         except Exception:
             pass
 
-    def apply_app_theme(app: QApplication, theme_key: str) -> str:
+    def _read_int_setting(settings: QSettings, key: str, default: int) -> int:
+        try:
+            return int(settings.value(key, default))
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _read_bool_setting(settings: QSettings, key: str, default: bool) -> bool:
+        value = settings.value(key, default)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def apply_app_theme(app: QApplication, settings: QSettings, theme_key: str) -> str:
         resolved_theme = theme_key if theme_key in UI_THEME_SCHEMES else DEFAULT_UI_THEME
+        ui_font_family = str(settings.value("appearance/ui_font_family", DEFAULT_UI_FONT_FAMILY) or DEFAULT_UI_FONT_FAMILY)
+        base_font_size = max(
+            UI_FONT_SIZE_MIN,
+            min(UI_FONT_SIZE_MAX, _read_int_setting(settings, "appearance/ui_font_size", DEFAULT_UI_FONT_SIZE)),
+        )
+        data_font_size = max(
+            UI_FONT_SIZE_MIN,
+            min(UI_FONT_SIZE_MAX, _read_int_setting(settings, "appearance/data_font_size", DEFAULT_UI_DATA_FONT_SIZE)),
+        )
+        density_key = str(settings.value("appearance/ui_density", DEFAULT_UI_DENSITY) or DEFAULT_UI_DENSITY)
+        app_font = QFont(app.font())
+        app_font.setFamily(ui_font_family)
+        app_font.setPointSize(base_font_size)
+        app.setFont(app_font)
         app.setPalette(build_app_palette(resolved_theme))
-        app.setStyleSheet(build_app_stylesheet(resolved_theme))
+        app.setStyleSheet(
+            build_app_stylesheet(
+                resolved_theme,
+                base_font_size=base_font_size,
+                data_font_size=data_font_size,
+                density_key=density_key,
+            )
+        )
         return resolved_theme
+
+    def build_monospace_font(settings: QSettings) -> QFont:
+        point_size = _read_int_setting(settings, "appearance/log_font_size", DEFAULT_UI_LOG_FONT_SIZE)
+        selected_family = str(
+            settings.value("appearance/log_font_family", DEFAULT_UI_LOG_FONT_FAMILY) or DEFAULT_UI_LOG_FONT_FAMILY
+        )
+        bold_enabled = _read_bool_setting(settings, "appearance/log_font_bold", DEFAULT_UI_LOG_FONT_BOLD)
+        fallback_order = [selected_family] + [family for family in LOG_FONT_FAMILY_OPTIONS if family != selected_family]
+        font = QFont(fallback_order[0])
+        for family in fallback_order:
+            candidate = QFont(family)
+            if candidate.exactMatch():
+                font = candidate
+                break
+        font.setStyleHint(QFont.Monospace)
+        font.setPointSize(point_size)
+        font.setBold(bold_enabled)
+        return font
+
+    def apply_window_data_fonts(window: "MainWindow") -> None:
+        log_font = build_monospace_font(window.settings)
+        window.log_view.setFont(log_font)
+        window.log_view.document().setDefaultFont(log_font)
+        window.archive_log_view.setFont(log_font)
+        window.archive_log_view.document().setDefaultFont(log_font)
+        window.archive_preview_text_edit.setFont(log_font)
+        window.archive_preview_text_edit.document().setDefaultFont(log_font)
+        window.text_search_tab.log_view.setFont(log_font)
+        window.text_search_tab.log_view.document().setDefaultFont(log_font)
+        window.text_search_tab.preview_text_edit.apply_font_preferences(log_font, preserve_size=True)
+        window.replace_assistant_tab.log_view.setFont(log_font)
+        window.replace_assistant_tab.log_view.document().setDefaultFont(log_font)
+        window.replace_assistant_tab.preview_details_edit.setFont(log_font)
+        window.replace_assistant_tab.preview_details_edit.document().setDefaultFont(log_font)
+        bold_enabled = _read_bool_setting(window.settings, "appearance/log_font_bold", DEFAULT_UI_LOG_FONT_BOLD)
+        window.log_highlighter.set_bold_enabled(bold_enabled)
+        window.archive_log_highlighter.set_bold_enabled(bold_enabled)
+        window.text_search_tab.log_highlighter.set_bold_enabled(bold_enabled)
 
     class ScanWorker(QObject):
         log_message = Signal(str)
@@ -613,6 +687,10 @@ def run_gui() -> int:
             self._settings_save_timer.setSingleShot(True)
             self._settings_save_timer.setInterval(250)
             self._settings_save_timer.timeout.connect(self._save_settings)
+            self._column_autofit_timer = QTimer(self)
+            self._column_autofit_timer.setSingleShot(True)
+            self._column_autofit_timer.setInterval(90)
+            self._column_autofit_timer.timeout.connect(self._apply_column_autofit)
             self._chainner_analysis_timer = QTimer(self)
             self._chainner_analysis_timer.setSingleShot(True)
             self._chainner_analysis_timer.setInterval(250)
@@ -691,7 +769,7 @@ def run_gui() -> int:
             workflow_layout.addWidget(self.workflow_splitter, stretch=1)
 
             self.left_panel = QWidget()
-            self.left_panel.setMinimumWidth(380)
+            self.left_panel.setMinimumWidth(320)
             left_layout = QVBoxLayout(self.left_panel)
             left_layout.setContentsMargins(0, 0, 0, 0)
             left_layout.setSpacing(10)
@@ -699,11 +777,11 @@ def run_gui() -> int:
             self.left_scroll_area = QScrollArea()
             self.left_scroll_area.setWidgetResizable(True)
             self.left_scroll_area.setFrameShape(QFrame.NoFrame)
-            self.left_scroll_area.setMinimumWidth(380)
+            self.left_scroll_area.setMinimumWidth(320)
             self.left_scroll_area.setWidget(self.left_panel)
 
             self.right_panel = QWidget()
-            self.right_panel.setMinimumWidth(380)
+            self.right_panel.setMinimumWidth(320)
             right_layout = QVBoxLayout(self.right_panel)
             right_layout.setContentsMargins(0, 0, 0, 0)
             right_layout.setSpacing(10)
@@ -714,7 +792,7 @@ def run_gui() -> int:
             self.workflow_splitter.addWidget(self.right_panel)
             self.workflow_splitter.setStretchFactor(0, 1)
             self.workflow_splitter.setStretchFactor(1, 2)
-            self.workflow_splitter.setSizes([540, 760])
+            self.workflow_splitter.setSizes([420, 760])
 
             self.paths_section = CollapsibleSection("Paths", expanded=False)
             paths_group = QWidget()
@@ -759,24 +837,26 @@ def run_gui() -> int:
             setup_layout.setContentsMargins(0, 0, 0, 0)
             setup_layout.setSpacing(8)
 
-            setup_buttons_row_1 = QHBoxLayout()
-            setup_buttons_row_1.setSpacing(8)
+            setup_buttons_row_1 = QGridLayout()
+            setup_buttons_row_1.setHorizontalSpacing(8)
+            setup_buttons_row_1.setVerticalSpacing(8)
             self.init_workspace_button = QPushButton("Init Workspace")
             self.create_folders_button = QPushButton("Create Folders")
             self.open_texture_editor_button = QPushButton("Open File In Texture Editor")
-            setup_buttons_row_1.addWidget(self.init_workspace_button)
-            setup_buttons_row_1.addWidget(self.create_folders_button)
-            setup_buttons_row_1.addWidget(self.open_texture_editor_button)
+            setup_buttons_row_1.addWidget(self.init_workspace_button, 0, 0)
+            setup_buttons_row_1.addWidget(self.create_folders_button, 0, 1)
+            setup_buttons_row_1.addWidget(self.open_texture_editor_button, 1, 0, 1, 2)
             setup_layout.addLayout(setup_buttons_row_1)
 
-            setup_buttons_row_2 = QHBoxLayout()
-            setup_buttons_row_2.setSpacing(8)
+            setup_buttons_row_2 = QGridLayout()
+            setup_buttons_row_2.setHorizontalSpacing(8)
+            setup_buttons_row_2.setVerticalSpacing(8)
             self.download_chainner_button = QPushButton("Open chaiNNer Download Page")
             self.download_chainner_button.setToolTip("Open the official chaiNNer download page in your default browser.")
             self.download_texconv_button = QPushButton("Open texconv Download Page")
             self.download_texconv_button.setToolTip("Open the official DirectXTex releases page in your default browser.")
-            setup_buttons_row_2.addWidget(self.download_chainner_button)
-            setup_buttons_row_2.addWidget(self.download_texconv_button)
+            setup_buttons_row_2.addWidget(self.download_chainner_button, 0, 0, 1, 2)
+            setup_buttons_row_2.addWidget(self.download_texconv_button, 1, 0, 1, 2)
             setup_layout.addLayout(setup_buttons_row_2)
 
             setup_buttons_row_3 = QHBoxLayout()
@@ -794,6 +874,16 @@ def run_gui() -> int:
             )
             setup_buttons_row_4.addWidget(self.import_ncnn_models_button)
             setup_layout.addLayout(setup_buttons_row_4)
+            for button in (
+                self.init_workspace_button,
+                self.create_folders_button,
+                self.open_texture_editor_button,
+                self.download_chainner_button,
+                self.download_texconv_button,
+                self.download_ncnn_button,
+                self.import_ncnn_models_button,
+            ):
+                button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
             setup_hint = QLabel(
                 "Direct backends can be prepared here. The setup buttons open official external download or install pages "
@@ -1424,7 +1514,7 @@ def run_gui() -> int:
 
             self.compare_list = QListWidget()
             self.compare_list.setSelectionMode(QAbstractItemView.SingleSelection)
-            self.compare_list.setMinimumWidth(240)
+            self.compare_list.setMinimumWidth(220)
             self.compare_splitter.addWidget(self.compare_list)
 
             preview_container = QWidget()
@@ -1554,11 +1644,11 @@ def run_gui() -> int:
             self.archive_splitter.setChildrenCollapsible(False)
             archive_tab_layout.addWidget(self.archive_splitter, stretch=1)
 
-            archive_controls_group = QGroupBox("Archive Controls")
-            archive_controls_group.setMinimumWidth(360)
-            archive_controls_group.setMaximumWidth(500)
-            archive_controls_layout = QVBoxLayout(archive_controls_group)
-            archive_controls_layout.setContentsMargins(12, 16, 12, 12)
+            archive_controls_group = FlatSectionPanel("Archive Controls")
+            archive_controls_group.setMinimumWidth(320)
+            archive_controls_group.setMaximumWidth(460)
+            archive_controls_layout = archive_controls_group.body_layout
+            archive_controls_layout.setContentsMargins(12, 12, 12, 12)
             archive_controls_layout.setSpacing(8)
 
             archive_hint = QLabel(
@@ -1724,7 +1814,7 @@ def run_gui() -> int:
                 self.archive_open_in_editor_button,
                 self.archive_resolve_in_research_button,
             ):
-                button.setMinimumHeight(32)
+                button.setMinimumHeight(28)
                 button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             archive_actions_row.addWidget(self.archive_extract_selected_button, 0, 0)
             archive_actions_row.addWidget(self.archive_extract_filtered_button, 0, 1)
@@ -1772,8 +1862,8 @@ def run_gui() -> int:
             self.archive_controls_scroll = QScrollArea()
             self.archive_controls_scroll.setWidgetResizable(True)
             self.archive_controls_scroll.setFrameShape(QFrame.NoFrame)
-            self.archive_controls_scroll.setMinimumWidth(360)
-            self.archive_controls_scroll.setMaximumWidth(540)
+            self.archive_controls_scroll.setMinimumWidth(320)
+            self.archive_controls_scroll.setMaximumWidth(500)
             archive_controls_wrapper = QWidget()
             archive_controls_wrapper_layout = QVBoxLayout(archive_controls_wrapper)
             archive_controls_wrapper_layout.setContentsMargins(0, 0, 0, 0)
@@ -1783,10 +1873,9 @@ def run_gui() -> int:
             self.archive_controls_scroll.setWidget(archive_controls_wrapper)
             self.archive_splitter.addWidget(self.archive_controls_scroll)
 
-            archive_files_group = QGroupBox("Archive Files")
-            archive_files_group.setMinimumWidth(300)
-            archive_files_layout = QVBoxLayout(archive_files_group)
-            archive_files_layout.setContentsMargins(10, 12, 10, 10)
+            archive_files_group = FlatSectionPanel("Archive Files")
+            archive_files_group.setMinimumWidth(260)
+            archive_files_layout = archive_files_group.body_layout
             archive_files_layout.setSpacing(0)
 
             self.archive_tree = QTreeWidget()
@@ -1810,10 +1899,9 @@ def run_gui() -> int:
             archive_files_layout.addWidget(self.archive_tree)
             self.archive_splitter.addWidget(archive_files_group)
 
-            archive_preview_group = QGroupBox("Archive Preview")
-            archive_preview_group.setMinimumWidth(340)
-            archive_preview_container_layout = QVBoxLayout(archive_preview_group)
-            archive_preview_container_layout.setContentsMargins(10, 12, 10, 10)
+            archive_preview_group = FlatSectionPanel("Archive Preview")
+            archive_preview_group.setMinimumWidth(300)
+            archive_preview_container_layout = archive_preview_group.body_layout
             archive_preview_container_layout.setSpacing(10)
 
             archive_preview_header = QVBoxLayout()
@@ -1901,7 +1989,7 @@ def run_gui() -> int:
             self.archive_splitter.setStretchFactor(0, 1)
             self.archive_splitter.setStretchFactor(1, 2)
             self.archive_splitter.setStretchFactor(2, 3)
-            self.archive_splitter.setSizes([420, 420, 760])
+            self.archive_splitter.setSizes([360, 360, 760])
             self.main_tabs.addTab(self.archive_browser_tab, "Archive Browser")
 
             self.text_search_tab = TextSearchTab(
@@ -1966,6 +2054,7 @@ def run_gui() -> int:
                 get_archive_entries=lambda: self.archive_entries,
                 get_current_config=self.collect_config,
             )
+            self.texture_editor_tab.sync_ui_font_from_application()
             self.texture_editor_tab.status_message_requested.connect(
                 lambda message, is_error: self.set_status_message(message, error=is_error)
             )
@@ -2107,6 +2196,7 @@ def run_gui() -> int:
             if geometry:
                 self.restoreGeometry(geometry)
             QTimer.singleShot(0, self._apply_responsive_window_defaults)
+            QTimer.singleShot(140, self._schedule_column_autofit)
             QTimer.singleShot(120, self._show_first_run_guide_if_needed)
             QTimer.singleShot(260, self._maybe_autoload_archive_on_startup)
 
@@ -2564,12 +2654,15 @@ def run_gui() -> int:
             app = QApplication.instance()
             if app is None:
                 return
-            self.current_theme_key = apply_app_theme(app, resolved_theme_key)
+            self.current_theme_key = apply_app_theme(app, self.settings, resolved_theme_key)
+            apply_window_data_fonts(self)
             self.log_highlighter.set_theme(self.current_theme_key)
             self.archive_log_highlighter.set_theme(self.current_theme_key)
             self.text_search_tab.set_theme(self.current_theme_key)
             self.research_tab.set_theme(self.current_theme_key)
-            self.settings_tab.set_theme_selection(self.current_theme_key)
+            self.texture_editor_tab.sync_ui_font(app.font())
+            self.settings_tab.sync_appearance_controls(self.current_theme_key)
+            self._schedule_column_autofit()
             self.schedule_settings_save()
 
         def _preference_bool(self, key: str, default: bool) -> bool:
@@ -2598,33 +2691,26 @@ def run_gui() -> int:
 
         def _apply_default_splitter_sizes(self, total_width: int) -> None:
             self.workflow_splitter.setSizes(
-                [
-                    max(360, int(total_width * 0.34)),
-                    max(400, int(total_width * 0.66)),
-                ]
+                build_responsive_splitter_sizes(total_width, [34, 66], [320, 420])
             )
             available_right_height = max(420, self.height() - 260)
             progress_min_height = getattr(self, "progress_group_min_height", 190)
-            progress_height = min(
-                max(progress_min_height, int(available_right_height * 0.18)),
-                max(progress_min_height, 210),
+            self.workflow_right_splitter.setSizes(
+                build_responsive_splitter_sizes(
+                    available_right_height,
+                    [18, 82],
+                    [progress_min_height, 320],
+                )
             )
-            bottom_height = max(320, available_right_height - progress_height)
-            self.workflow_right_splitter.setSizes([progress_height, bottom_height])
             self.compare_splitter.setSizes(
-                [
-                    max(220, int(total_width * 0.22)),
-                    max(520, int(total_width * 0.78)),
-                ]
+                build_responsive_splitter_sizes(total_width, [22, 78], [220, 520])
             )
             self.archive_splitter.setSizes(
-                [
-                    max(360, int(total_width * 0.23)),
-                    max(300, int(total_width * 0.29)),
-                    max(340, int(total_width * 0.48)),
-                ]
+                build_responsive_splitter_sizes(total_width, [23, 29, 48], [320, 260, 300])
             )
-            self.text_search_tab.set_splitter_sizes([430, 380, 860])
+            self.replace_assistant_tab.apply_responsive_splitter_sizes(total_width)
+            self.research_tab.apply_responsive_splitter_sizes(total_width)
+            self.text_search_tab.apply_responsive_splitter_sizes(total_width)
 
         def _apply_saved_splitter_sizes_if_enabled(self, total_width: int) -> None:
             self._apply_default_splitter_sizes(total_width)
@@ -2642,16 +2728,49 @@ def run_gui() -> int:
                     if splitter is self.workflow_right_splitter and len(sizes) >= 2:
                         available_right_height = max(420, self.height() - 260)
                         progress_min_height = getattr(self, "progress_group_min_height", 190)
-                        progress_height = min(
-                            max(progress_min_height, sizes[0]),
-                            max(progress_min_height, available_right_height - 320),
+                        sizes = clamp_splitter_sizes(
+                            available_right_height,
+                            sizes,
+                            [progress_min_height, 320],
+                            fallback_weights=[18, 82],
                         )
-                        sizes = [progress_height, max(320, available_right_height - progress_height)]
+                    elif splitter is self.workflow_splitter:
+                        sizes = clamp_splitter_sizes(total_width, sizes, [320, 420], fallback_weights=[34, 66])
+                    elif splitter is self.compare_splitter:
+                        sizes = clamp_splitter_sizes(total_width, sizes, [220, 520], fallback_weights=[22, 78])
+                    elif splitter is self.archive_splitter:
+                        sizes = clamp_splitter_sizes(
+                            total_width,
+                            sizes,
+                            [320, 260, 300],
+                            fallback_weights=[23, 29, 48],
+                        )
                     splitter.setSizes(sizes)
 
             text_search_sizes = self._load_saved_splitter_sizes("ui/text_search_splitter_sizes")
             if text_search_sizes:
                 self.text_search_tab.set_splitter_sizes(text_search_sizes)
+            replace_assistant_sizes = self._load_saved_splitter_sizes("ui/replace_assistant_splitter_sizes")
+            if replace_assistant_sizes:
+                self.replace_assistant_tab.set_splitter_sizes(replace_assistant_sizes, total_width=total_width)
+            research_main_sizes = self._load_saved_splitter_sizes("ui/research_main_splitter_sizes")
+            if research_main_sizes:
+                self.research_tab.set_main_splitter_sizes(research_main_sizes, total_width=total_width)
+            research_groups_sizes = self._load_saved_splitter_sizes("ui/research_groups_splitter_sizes")
+            if research_groups_sizes:
+                self.research_tab.set_groups_splitter_sizes(research_groups_sizes, total_width=total_width)
+            research_unknown_sizes = self._load_saved_splitter_sizes("ui/research_unknown_splitter_sizes")
+            if research_unknown_sizes:
+                self.research_tab.set_unknown_splitter_sizes(research_unknown_sizes, total_width=total_width)
+            research_reference_sizes = self._load_saved_splitter_sizes("ui/research_reference_splitter_sizes")
+            if research_reference_sizes:
+                self.research_tab.set_reference_splitter_sizes(research_reference_sizes, total_width=total_width)
+            research_analysis_sizes = self._load_saved_splitter_sizes("ui/research_analysis_splitter_sizes")
+            if research_analysis_sizes:
+                self.research_tab.set_analysis_splitter_sizes(research_analysis_sizes, total_width=total_width)
+            research_notes_sizes = self._load_saved_splitter_sizes("ui/research_notes_splitter_sizes")
+            if research_notes_sizes:
+                self.research_tab.set_notes_splitter_sizes(research_notes_sizes, total_width=total_width)
 
         def _maybe_autoload_archive_on_startup(self) -> None:
             if self.show_quick_start_on_launch:
@@ -2696,6 +2815,60 @@ def run_gui() -> int:
             )
             total_width = max(self.width() - 64, self.minimumWidth())
             self._apply_saved_splitter_sizes_if_enabled(total_width)
+            self._schedule_column_autofit()
+
+        def _schedule_column_autofit(self) -> None:
+            if self._shutting_down:
+                return
+            self._column_autofit_timer.start()
+
+        def _fit_tree_columns(
+            self,
+            tree: QTreeWidget,
+            *,
+            stretch_column: int,
+            min_widths: Dict[int, int],
+        ) -> None:
+            header = tree.header()
+            if header is None or tree.columnCount() <= 0:
+                return
+            viewport_width = max(tree.viewport().width(), tree.width() - 24, 0)
+            if viewport_width <= 0:
+                return
+            tree.setUpdatesEnabled(False)
+            try:
+                fixed_width = 0
+                for column in range(tree.columnCount()):
+                    if column == stretch_column:
+                        continue
+                    width = max(min_widths.get(column, 72), header.sectionSize(column))
+                    header.resizeSection(column, width)
+                    fixed_width += width
+                stretch_width = max(min_widths.get(stretch_column, 180), viewport_width - fixed_width - 12)
+                header.resizeSection(stretch_column, stretch_width)
+            finally:
+                tree.setUpdatesEnabled(True)
+
+        def _autofit_archive_tree_columns(self) -> None:
+            header = self.archive_tree.header()
+            if header is None:
+                return
+            font_metrics = header.fontMetrics()
+            min_widths = {
+                0: 280,
+                1: max(82, font_metrics.horizontalAdvance("Folder") + 28),
+                2: max(96, font_metrics.horizontalAdvance("9999.9 KB") + 28),
+                3: max(96, font_metrics.horizontalAdvance("9999.9 KB") + 28),
+                4: max(72, font_metrics.horizontalAdvance("Partial") + 28),
+                5: max(132, font_metrics.horizontalAdvance("0009/20.pamt") + 28),
+            }
+            self._fit_tree_columns(self.archive_tree, stretch_column=0, min_widths=min_widths)
+
+        def _apply_column_autofit(self) -> None:
+            self._autofit_archive_tree_columns()
+            self.replace_assistant_tab.auto_fit_columns()
+            self.text_search_tab.auto_fit_columns()
+            self.research_tab.auto_fit_columns()
 
         def _add_combo_choice(self, combo: QComboBox, label: str, value: str) -> None:
             combo.addItem(label, value)
@@ -2801,6 +2974,13 @@ def run_gui() -> int:
             self.workflow_right_splitter.splitterMoved.connect(lambda *_args: self.schedule_settings_save())
             self.compare_splitter.splitterMoved.connect(lambda *_args: self.schedule_settings_save())
             self.archive_splitter.splitterMoved.connect(lambda *_args: self.schedule_settings_save())
+            self.replace_assistant_tab.main_splitter.splitterMoved.connect(lambda *_args: self.schedule_settings_save())
+            self.research_tab.main_splitter.splitterMoved.connect(lambda *_args: self.schedule_settings_save())
+            self.research_tab.groups_splitter.splitterMoved.connect(lambda *_args: self.schedule_settings_save())
+            self.research_tab.unknown_splitter.splitterMoved.connect(lambda *_args: self.schedule_settings_save())
+            self.research_tab.reference_splitter.splitterMoved.connect(lambda *_args: self.schedule_settings_save())
+            self.research_tab.analysis_splitter.splitterMoved.connect(lambda *_args: self.schedule_settings_save())
+            self.research_tab.notes_splitter.splitterMoved.connect(lambda *_args: self.schedule_settings_save())
             self.text_search_tab.main_splitter.splitterMoved.connect(lambda *_args: self.schedule_settings_save())
             self.setup_section.toggled.connect(self.schedule_settings_save)
             self.paths_section.toggled.connect(self.schedule_settings_save)
@@ -2970,6 +3150,34 @@ def run_gui() -> int:
                 )
                 self.settings.setValue("ui/archive_splitter_sizes", ",".join(str(value) for value in self.archive_splitter.sizes()))
                 self.settings.setValue("ui/text_search_splitter_sizes", ",".join(str(value) for value in self.text_search_tab.splitter_sizes()))
+                self.settings.setValue(
+                    "ui/replace_assistant_splitter_sizes",
+                    ",".join(str(value) for value in self.replace_assistant_tab.splitter_sizes()),
+                )
+                self.settings.setValue(
+                    "ui/research_main_splitter_sizes",
+                    ",".join(str(value) for value in self.research_tab.main_splitter_sizes()),
+                )
+                self.settings.setValue(
+                    "ui/research_groups_splitter_sizes",
+                    ",".join(str(value) for value in self.research_tab.groups_splitter_sizes()),
+                )
+                self.settings.setValue(
+                    "ui/research_unknown_splitter_sizes",
+                    ",".join(str(value) for value in self.research_tab.unknown_splitter_sizes()),
+                )
+                self.settings.setValue(
+                    "ui/research_reference_splitter_sizes",
+                    ",".join(str(value) for value in self.research_tab.reference_splitter_sizes()),
+                )
+                self.settings.setValue(
+                    "ui/research_analysis_splitter_sizes",
+                    ",".join(str(value) for value in self.research_tab.analysis_splitter_sizes()),
+                )
+                self.settings.setValue(
+                    "ui/research_notes_splitter_sizes",
+                    ",".join(str(value) for value in self.research_tab.notes_splitter_sizes()),
+                )
             self.settings.setValue("sections/setup_expanded", self.setup_section.toggle_button.isChecked())
             self.settings.setValue("sections/paths_expanded", self.paths_section.toggle_button.isChecked())
             self.settings.setValue("sections/settings_expanded", self.settings_section.toggle_button.isChecked())
@@ -3572,7 +3780,7 @@ def run_gui() -> int:
         def open_ncnn_model_catalog(self) -> None:
             dialog = QDialog(self)
             dialog.setWindowTitle("NCNN Model Catalog")
-            dialog.resize(860, 560)
+            dialog.resize(780, 540)
 
             layout = QVBoxLayout(dialog)
             layout.setContentsMargins(14, 14, 14, 14)
@@ -3614,10 +3822,10 @@ def run_gui() -> int:
             catalog_tree.setRootIsDecorated(True)
             catalog_tree.setUniformRowHeights(True)
             catalog_tree.setIndentation(18)
-            catalog_tree.setMinimumWidth(320)
+            catalog_tree.setMinimumWidth(280)
             details_view = QPlainTextEdit()
             details_view.setReadOnly(True)
-            details_view.setMinimumWidth(420)
+            details_view.setMinimumWidth(340)
             content_row.addWidget(catalog_tree, stretch=1)
             content_row.addWidget(details_view, stretch=2)
 
@@ -5123,7 +5331,7 @@ def run_gui() -> int:
                 pure_path = pure_path.with_suffix(".dds")
             return pure_path.as_posix()
 
-        def _resolve_original_dds_from_archive_cache(self, relative_path_text: str) -> Optional[Path]:
+        def _find_archive_entry_for_workflow_relative_path(self, relative_path_text: str) -> Optional[ArchiveEntry]:
             if not self.archive_entries:
                 return None
             try:
@@ -5145,6 +5353,14 @@ def run_gui() -> int:
                     continue
                 if normalized_package_root and entry.pamt_path.parent.name.strip().casefold() != normalized_package_root:
                     continue
+                return entry
+            return None
+
+        def _resolve_original_dds_from_archive_cache(self, relative_path_text: str) -> Optional[Path]:
+            entry = self._find_archive_entry_for_workflow_relative_path(relative_path_text)
+            if entry is None:
+                return None
+            try:
                 try:
                     source_path, _note = ensure_archive_preview_source(entry)
                 except Exception:
@@ -5152,7 +5368,8 @@ def run_gui() -> int:
                 if source_path.exists() and source_path.is_file():
                     return source_path.expanduser().resolve()
                 return None
-            return None
+            except Exception:
+                return None
 
         def _prompt_texture_editor_workflow_target(
             self,
@@ -5289,18 +5506,30 @@ def run_gui() -> int:
             box.exec()
             return box.clickedButton() != cancel_button
 
-        def _prompt_texture_editor_workflow_root_action(self, root_path: Path) -> Optional[bool]:
+        def _prompt_texture_editor_workflow_root_action(
+            self,
+            root_path: Path,
+            *,
+            root_label: str,
+            staged_item_label: str,
+            keep_existing_note: str = "",
+        ) -> Optional[bool]:
             if not self._directory_has_contents(root_path):
                 return False
             box = QMessageBox(self)
-            box.setWindowTitle("Texture Editor PNG Root Already Contains Files")
+            box.setWindowTitle(f"{root_label} Already Contains Files")
             box.setIcon(QMessageBox.Question)
-            box.setText("Texture Editor PNG root already contains files or folders.")
-            box.setInformativeText(
-                f"{root_path}\n\n"
-                "Choose whether to clear it before staging this Texture Editor export.\n"
-                "Choose Keep Existing to leave the current contents in place, or Cancel to stop."
-            )
+            box.setText(f"{root_label} already contains files or folders.")
+            info_lines = [
+                str(root_path),
+                "",
+                f"Choose whether to clear it before staging this {staged_item_label}.",
+            ]
+            note_text = str(keep_existing_note or "").strip()
+            if note_text:
+                info_lines.append(note_text)
+            info_lines.append("Choose Keep Existing to leave the current contents in place, or Cancel to stop.")
+            box.setInformativeText("\n".join(info_lines))
             clear_button = box.addButton("Clear Root", QMessageBox.DestructiveRole)
             keep_button = box.addButton("Keep Existing", QMessageBox.AcceptRole)
             cancel_button = box.addButton(QMessageBox.Cancel)
@@ -5504,7 +5733,11 @@ def run_gui() -> int:
                 texture_editor_png_root.expanduser()
                 / Path(PurePosixPath(relative_path)).with_suffix(".png")
             )
-            clear_texture_editor_root = self._prompt_texture_editor_workflow_root_action(texture_editor_png_root.expanduser())
+            clear_texture_editor_root = self._prompt_texture_editor_workflow_root_action(
+                texture_editor_png_root.expanduser(),
+                root_label="Texture Editor PNG root",
+                staged_item_label="Texture Editor export",
+            )
             if clear_texture_editor_root is None:
                 self.set_status_message("Texture Editor export to Texture Workflow cancelled.")
                 return
@@ -5512,6 +5745,17 @@ def run_gui() -> int:
                 self.set_status_message("Texture Editor export to Texture Workflow cancelled.")
                 return
             original_destination = original_root.expanduser() / Path(PurePosixPath(relative_path)).with_suffix(".dds")
+            clear_original_root = self._prompt_texture_editor_workflow_root_action(
+                original_root.expanduser(),
+                root_label="Original DDS root",
+                staged_item_label="matching original DDS",
+                keep_existing_note=(
+                    "Choose Clear Root if you want to remove stale DDS files before sending this texture to Texture Workflow."
+                ),
+            )
+            if clear_original_root is None:
+                self.set_status_message("Texture Editor export to Texture Workflow cancelled.")
+                return
             self.main_tabs.setCurrentWidget(self.workflow_tab)
             self.content_tabs.setCurrentIndex(0)
             self._set_texture_editor_export_progress("Staging flattened PNG for Texture Workflow...")
@@ -5523,7 +5767,16 @@ def run_gui() -> int:
                     raise FileNotFoundError(f"Texture Editor export not found: {resolved_source}")
                 assert original_dds_source is not None
                 resolved_original_dds = original_dds_source.expanduser().resolve()
-                if not resolved_original_dds.exists():
+                archive_entry = self._find_archive_entry_for_workflow_relative_path(relative_path)
+                original_root_resolved = original_root.expanduser().resolve()
+                original_bytes_from_source: Optional[bytes] = None
+                if clear_original_root and resolved_original_dds.exists():
+                    try:
+                        if resolved_original_dds.is_relative_to(original_root_resolved):
+                            original_bytes_from_source = resolved_original_dds.read_bytes()
+                    except Exception:
+                        original_bytes_from_source = None
+                if not resolved_original_dds.exists() and archive_entry is None and original_bytes_from_source is None:
                     raise FileNotFoundError(f"Texture Editor original DDS source not found: {resolved_original_dds}")
                 final_destination = resolved_destination.expanduser()
                 if clear_texture_editor_root:
@@ -5535,12 +5788,28 @@ def run_gui() -> int:
                 on_log(f"Copying Texture Editor export into Texture Editor PNG root: {resolved_source.name} -> {final_destination}")
                 shutil.copy2(resolved_source, final_destination)
                 final_original_destination = original_destination.expanduser()
+                if clear_original_root:
+                    final_original_root = original_root.expanduser()
+                    final_original_root.mkdir(parents=True, exist_ok=True)
+                    on_log(f"Clearing Original DDS root before staging source DDS: {final_original_root}")
+                    clear_directory_contents(final_original_root)
                 final_original_destination.parent.mkdir(parents=True, exist_ok=True)
-                if not final_original_destination.exists():
+                if final_original_destination.exists():
+                    on_log(
+                        f"Refreshing matching original DDS in workflow source root: {resolved_original_dds.name} -> {final_original_destination}"
+                    )
+                else:
                     on_log(
                         f"Staging matching original DDS into workflow source root: {resolved_original_dds.name} -> {final_original_destination}"
                     )
+                if original_bytes_from_source is not None:
+                    final_original_destination.write_bytes(original_bytes_from_source)
+                elif resolved_original_dds.exists():
                     shutil.copy2(resolved_original_dds, final_original_destination)
+                elif archive_entry is not None:
+                    extract_archive_entry(archive_entry, final_original_destination)
+                else:
+                    raise FileNotFoundError(f"Texture Editor original DDS source not found: {resolved_original_dds}")
                 return {
                     "destination": str(final_destination),
                     "source": str(resolved_source),
@@ -7441,18 +7710,12 @@ def run_gui() -> int:
             app.setWindowIcon(app_icon)
     startup_settings = create_settings()
     startup_theme = str(startup_settings.value("appearance/theme", DEFAULT_UI_THEME))
-    apply_app_theme(app, startup_theme)
-
-    log_font = QFont("Consolas")
-    if not log_font.exactMatch():
-        log_font = QFont("Courier New")
+    apply_app_theme(app, startup_settings, startup_theme)
 
     window = MainWindow()
     if not app.windowIcon().isNull():
         window.setWindowIcon(app.windowIcon())
-    window.log_view.setFont(log_font)
-    window.archive_log_view.setFont(log_font)
-    window.text_search_tab.log_view.setFont(log_font)
+    apply_window_data_fonts(window)
     window.show()
     return app.exec()
 

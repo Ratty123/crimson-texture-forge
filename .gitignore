@@ -17,6 +17,8 @@ tmp_*/
 *.zip
 build_importtime.log
 pyinstaller_importtime.log
+_ui_smoke.ini
+archive_scan_cache_probe/
 
 .DS_Store
 Thumbs.db

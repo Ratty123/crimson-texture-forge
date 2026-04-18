@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import math
 import os
 import pickle
 import re
@@ -2037,6 +2038,267 @@ def build_archive_entry_detail_text(entry: ArchiveEntry, extra_detail: str = "")
     return "\n".join(lines)
 
 
+def _decode_dds_fourcc(fourcc: bytes) -> str:
+    if not fourcc:
+        return "-"
+    try:
+        text = fourcc.decode("ascii", errors="strict")
+    except Exception:
+        text = ""
+    if text and all(32 <= ord(ch) <= 126 for ch in text):
+        return text
+    return "0x" + fourcc.hex().upper()
+
+
+def _decode_dds_resource_dimension(value: int) -> str:
+    return {
+        0: "Unknown",
+        1: "Buffer",
+        2: "Texture1D",
+        3: "Texture2D",
+        4: "Texture3D",
+    }.get(int(value), f"Unknown ({value})")
+
+
+def _decode_dds_alpha_mode(value: int) -> str:
+    return {
+        0: "Unknown",
+        1: "Straight",
+        2: "Premultiplied",
+        3: "Opaque",
+        4: "Custom",
+    }.get(int(value), f"Unknown ({value})")
+
+
+def _decode_flag_names(value: int, mapping: Sequence[Tuple[int, str]]) -> str:
+    names = [label for mask, label in mapping if value & mask]
+    return ", ".join(names) if names else "-"
+
+
+def _format_u32_list(values: Sequence[int]) -> str:
+    if not values:
+        return "-"
+    return ", ".join(f"0x{int(value):08X}" for value in values)
+
+
+def _format_hex_dump(data: bytes) -> str:
+    if not data:
+        return "-"
+    lines: List[str] = []
+    for offset in range(0, len(data), 16):
+        chunk = data[offset : offset + 16]
+        hex_part = " ".join(f"{byte:02X}" for byte in chunk)
+        ascii_part = "".join(chr(byte) if 32 <= byte <= 126 else "." for byte in chunk)
+        lines.append(f"  {offset:04X}  {hex_part:<47}  {ascii_part}")
+    return "\n".join(lines)
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _dds_resource_type_from_caps(caps2: int) -> str:
+    if caps2 & 0x00000200:
+        return "Cubemap"
+    if caps2 & 0x00200000:
+        return "Texture3D"
+    return "Texture2D"
+
+
+def build_dds_header_detail_text(dds_path: Path, dds_info: Optional[DdsInfo] = None) -> str:
+    resolved_info = dds_info if dds_info is not None else parse_dds(dds_path)
+    with dds_path.open("rb") as handle:
+        blob = handle.read(148)
+    if len(blob) < 128 or blob[:4] != DDS_MAGIC:
+        raise ValueError("Missing DDS header.")
+
+    header_magic = blob[:4]
+    header = blob[4:128]
+    header_size = struct.unpack_from("<I", header, 0)[0]
+    header_flags = struct.unpack_from("<I", header, 4)[0]
+    pitch_or_linear_size = struct.unpack_from("<I", header, 16)[0]
+    depth = struct.unpack_from("<I", header, 20)[0]
+    reserved1 = list(struct.unpack_from("<11I", header, 28))
+    pf_flags = struct.unpack_from("<I", header, 76)[0]
+    fourcc = header[80:84]
+    rgb_bit_count = struct.unpack_from("<I", header, 84)[0]
+    r_mask = struct.unpack_from("<I", header, 88)[0]
+    g_mask = struct.unpack_from("<I", header, 92)[0]
+    b_mask = struct.unpack_from("<I", header, 96)[0]
+    a_mask = struct.unpack_from("<I", header, 100)[0]
+    caps = struct.unpack_from("<I", header, 104)[0]
+    caps2 = struct.unpack_from("<I", header, 108)[0]
+    caps3 = struct.unpack_from("<I", header, 112)[0]
+    caps4 = struct.unpack_from("<I", header, 116)[0]
+    texture_type_hint = classify_texture_type(str(dds_path))
+    is_dx10 = fourcc == b"DX10" and len(blob) >= 148
+    dxgi_format = struct.unpack_from("<I", blob, 128)[0] if is_dx10 else 0
+    resource_dimension = struct.unpack_from("<I", blob, 132)[0] if is_dx10 else 0
+    misc_flag = struct.unpack_from("<I", blob, 136)[0] if is_dx10 else 0
+    array_size = struct.unpack_from("<I", blob, 140)[0] if is_dx10 else 1
+    misc_flags2 = struct.unpack_from("<I", blob, 144)[0] if is_dx10 else 0
+    resource_type = _decode_dds_resource_dimension(resource_dimension) if is_dx10 else _dds_resource_type_from_caps(caps2)
+    expected_mips = max(1, int(math.floor(math.log2(max(1, resolved_info.width, resolved_info.height, depth or 1)))) + 1)
+    block_bytes = _dds_bytes_per_block(dxgi_format, fourcc)
+    cube_face_count = 1
+    if is_dx10 and (misc_flag & 0x4):
+        cube_face_count = 6
+    elif caps2 & 0x00000200:
+        cube_face_count = sum(
+            1
+            for mask in (0x00000400, 0x00000800, 0x00001000, 0x00002000, 0x00004000, 0x00008000)
+            if caps2 & mask
+        ) or 6
+    surface_instance_count = max(1, array_size) * max(1, cube_face_count)
+    top_level_surface_bytes_text = "-"
+    total_surface_bytes_text = "-"
+    try:
+        cur_w = max(1, resolved_info.width)
+        cur_h = max(1, resolved_info.height)
+        top_level_surface_bytes = _dds_surface_size(
+            cur_w,
+            cur_h,
+            dxgi_format,
+            fourcc,
+            pf_flags=pf_flags,
+            rgb_bit_count=rgb_bit_count,
+            pitch_or_linear_size=pitch_or_linear_size,
+            mip_level=0,
+        )
+        total_surface_bytes = 0
+        for mip_index in range(max(1, resolved_info.mip_count)):
+            total_surface_bytes += _dds_surface_size(
+                cur_w,
+                cur_h,
+                dxgi_format,
+                fourcc,
+                pf_flags=pf_flags,
+                rgb_bit_count=rgb_bit_count,
+                pitch_or_linear_size=pitch_or_linear_size,
+                mip_level=mip_index,
+            )
+            cur_w = max(1, cur_w >> 1)
+            cur_h = max(1, cur_h >> 1)
+        top_level_surface_bytes *= surface_instance_count
+        total_surface_bytes *= surface_instance_count
+        top_level_surface_bytes_text = f"{top_level_surface_bytes:,}"
+        total_surface_bytes_text = f"{total_surface_bytes:,}"
+    except Exception:
+        pass
+    file_sha256 = _sha256_path(dds_path)
+    header_bytes = blob[:148] if is_dx10 else blob[:128]
+    ddsd_flags = _decode_flag_names(
+        header_flags,
+        (
+            (0x00000001, "CAPS"),
+            (0x00000002, "HEIGHT"),
+            (0x00000004, "WIDTH"),
+            (0x00000008, "PITCH"),
+            (0x00001000, "PIXELFORMAT"),
+            (0x00020000, "MIPMAPCOUNT"),
+            (0x00080000, "LINEARSIZE"),
+            (0x00800000, "DEPTH"),
+        ),
+    )
+    pixel_flag_names = _decode_flag_names(
+        pf_flags,
+        (
+            (DDPF_ALPHAPIXELS, "ALPHAPIXELS"),
+            (DDPF_ALPHA, "ALPHA"),
+            (DDPF_FOURCC, "FOURCC"),
+            (DDPF_RGB, "RGB"),
+            (DDPF_LUMINANCE, "LUMINANCE"),
+        ),
+    )
+    caps_names = _decode_flag_names(
+        caps,
+        (
+            (0x00000008, "COMPLEX"),
+            (0x00001000, "TEXTURE"),
+            (0x00400000, "MIPMAP"),
+        ),
+    )
+    caps2_names = _decode_flag_names(
+        caps2,
+        (
+            (0x00000200, "CUBEMAP"),
+            (0x00000400, "CUBEMAP_POSITIVEX"),
+            (0x00000800, "CUBEMAP_NEGATIVEX"),
+            (0x00001000, "CUBEMAP_POSITIVEY"),
+            (0x00002000, "CUBEMAP_NEGATIVEY"),
+            (0x00004000, "CUBEMAP_POSITIVEZ"),
+            (0x00008000, "CUBEMAP_NEGATIVEZ"),
+            (0x00200000, "VOLUME"),
+        ),
+    )
+
+    lines = [
+        "DDS metadata:",
+        f"- Format: {resolved_info.texconv_format}",
+        f"- Dimensions: {resolved_info.width}x{resolved_info.height}",
+        f"- Mip levels: {resolved_info.mip_count}",
+        f"- Mip chain complete: {'Yes' if resolved_info.mip_count >= expected_mips else 'No'} ({resolved_info.mip_count}/{expected_mips} expected)",
+        f"- Alpha: {'Yes' if resolved_info.has_alpha else 'No'}",
+        f"- Colorspace intent: {resolved_info.colorspace_intent}",
+        f"- Precision-sensitive: {'Yes' if resolved_info.precision_sensitive else 'No'}",
+        f"- Texture type hint: {texture_type_hint}",
+        f"- Resource type: {resource_type}",
+        f"- DX10 header present: {'Yes' if is_dx10 else 'No'}",
+        f"- DDS magic: {header_magic.decode('ascii', errors='replace')!r}",
+        f"- Header size field: {header_size}",
+        f"- Header flags: 0x{header_flags:08X}",
+        f"- Header flag names: {ddsd_flags}",
+        f"- Pitch / linear size: {pitch_or_linear_size:,}",
+        f"- Depth: {depth or 1}",
+        f"- Pixel format flags: 0x{pf_flags:08X}",
+        f"- Pixel format names: {pixel_flag_names}",
+        f"- FOURCC: {_decode_dds_fourcc(fourcc)}",
+        f"- RGB bit count: {rgb_bit_count}",
+        f"- Channel masks: R=0x{r_mask:08X} G=0x{g_mask:08X} B=0x{b_mask:08X} A=0x{a_mask:08X}",
+        f"- Caps: 0x{caps:08X}",
+        f"- Caps names: {caps_names}",
+        f"- Caps2: 0x{caps2:08X}",
+        f"- Caps2 names: {caps2_names}",
+        f"- Caps3: 0x{caps3:08X}",
+        f"- Caps4: 0x{caps4:08X}",
+        f"- Block compression: {f'{block_bytes} bytes per 4x4 block' if block_bytes is not None else 'Uncompressed / direct pixel layout'}",
+        f"- Surface instances: {surface_instance_count}",
+        f"- Estimated top-level surface bytes: {top_level_surface_bytes_text}",
+        f"- Estimated total surface bytes across listed mips: {total_surface_bytes_text}",
+        f"- Resolved DDS file size: {dds_path.stat().st_size:,} bytes",
+        f"- SHA-256: {file_sha256}",
+        f"- Reserved1 values: {_format_u32_list(reserved1)}",
+    ]
+
+    if is_dx10:
+        lines.extend(
+            [
+                "- DX10 header:",
+                f"  - DXGI format id: {dxgi_format}",
+                f"  - Resource dimension: {_decode_dds_resource_dimension(resource_dimension)}",
+                f"  - Array size: {array_size}",
+                f"  - Misc flag: 0x{misc_flag:08X}",
+                f"  - Misc flags2: 0x{misc_flags2:08X}",
+                f"  - Alpha mode: {_decode_dds_alpha_mode(misc_flags2 & 0x7)}",
+                f"  - Texture cube flag: {'Yes' if (misc_flag & 0x4) else 'No'}",
+            ]
+        )
+    lines.extend(
+        [
+            "- Header hex dump:",
+            _format_hex_dump(header_bytes),
+        ]
+    )
+    return "\n".join(lines)
+
+
 def ensure_archive_preview_source(entry: ArchiveEntry) -> Tuple[Path, str]:
     try:
         pamt_stat = entry.pamt_path.stat()
@@ -2248,6 +2510,11 @@ def build_archive_preview_result(
             dds_info: Optional[DdsInfo] = None
             try:
                 dds_info = parse_dds(source_path)
+                metadata_summary = (
+                    f"{metadata_summary} | {dds_info.texconv_format} | "
+                    f"{dds_info.width}x{dds_info.height} | Mips {dds_info.mip_count}"
+                )
+                extra_detail_parts.append(build_dds_header_detail_text(source_path, dds_info))
             except Exception as exc:
                 extra_detail_parts.append(f"DDS metadata unavailable: {exc}")
             if "PartialDDS" in note_flags:

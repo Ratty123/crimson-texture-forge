@@ -12,12 +12,16 @@ import cv2
 import numpy as np
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, QSettings, QSize, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import (
+    QAction,
     QBrush,
     QColor,
+    QFont,
+    QFontMetrics,
     QIcon,
     QImage,
     QKeySequence,
     QMouseEvent,
+    QPalette,
     QPainter,
     QPainterPath,
     QPen,
@@ -25,6 +29,7 @@ from PySide6.QtGui import (
     QShortcut,
 )
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QColorDialog,
     QComboBox,
@@ -42,6 +47,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QMenu,
     QPushButton,
     QKeySequenceEdit,
     QScrollArea,
@@ -130,6 +136,7 @@ from crimson_forge_toolkit.models import (
     TextureEditorToolSettings,
     TextureEditorWorkspace,
 )
+from crimson_forge_toolkit.ui.widgets import build_responsive_splitter_sizes
 
 
 def _rgba_array_to_qimage(array: np.ndarray) -> QImage:
@@ -139,15 +146,21 @@ def _rgba_array_to_qimage(array: np.ndarray) -> QImage:
     return image.copy()
 
 
-def _create_tool_icon(tool_key: str) -> QIcon:
+def _create_tool_icon(tool_key: str, palette: Optional[QPalette] = None) -> QIcon:
     size = 20
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing, True)
-    accent = QColor("#74C1FF")
-    primary = QColor("#DCE6F5")
-    subtle = QColor("#7F8DA3")
+    app = QApplication.instance()
+    resolved_palette = QPalette(palette or (app.palette() if app is not None else QPalette()))
+    accent = QColor(resolved_palette.color(QPalette.Highlight))
+    primary = QColor(resolved_palette.color(QPalette.ButtonText))
+    subtle = QColor(resolved_palette.color(QPalette.PlaceholderText))
+    if not subtle.isValid() or subtle.alpha() == 0:
+        subtle = QColor(primary)
+        subtle.setAlpha(170)
+    accent.setAlpha(230)
 
     def _pen(color: QColor, width: float = 1.8, *, dashed: bool = False) -> QPen:
         pen = QPen(color, width)
@@ -230,9 +243,12 @@ def _create_tool_icon(tool_key: str) -> QIcon:
         gradient_path.lineTo(16, 6)
         painter.setPen(_pen(primary, 1.4))
         painter.drawLine(4, 14, 16, 6)
-        painter.setBrush(QBrush(QColor("#74C1FF")))
+        painter.setBrush(QBrush(accent))
         painter.drawEllipse(3, 13, 3, 3)
-        painter.setBrush(QBrush(QColor("#FFD27A")))
+        warm = QColor(accent)
+        warm = warm.lighter(130 if primary.lightness() < 160 else 85)
+        warm.setAlpha(220)
+        painter.setBrush(QBrush(warm))
         painter.drawEllipse(14, 5, 3, 3)
     elif tool_key == "smudge":
         painter.setPen(_pen(primary, 1.5))
@@ -243,9 +259,14 @@ def _create_tool_icon(tool_key: str) -> QIcon:
         painter.drawEllipse(12, 4, 4, 7)
     elif tool_key == "dodge_burn":
         painter.setPen(_pen(primary, 1.5))
-        painter.setBrush(QBrush(QColor("#FFC36E")))
+        warm = QColor(accent)
+        warm = warm.lighter(140 if primary.lightness() < 160 else 90)
+        warm.setAlpha(220)
+        painter.setBrush(QBrush(warm))
         painter.drawEllipse(3, 8, 6, 6)
-        painter.setBrush(QBrush(QColor("#64748B")))
+        cool = QColor(subtle)
+        cool.setAlpha(220)
+        painter.setBrush(QBrush(cool))
         painter.drawEllipse(11, 6, 6, 8)
         painter.setPen(_pen(accent, 1.3))
         painter.drawLine(8, 11, 12, 10)
@@ -318,7 +339,7 @@ class CollapsibleSection(QWidget):
         self.toggle_button.setChecked(expanded)
         self.toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.toggle_button.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
-        self.toggle_button.setMinimumHeight(28)
+        self.toggle_button.setMinimumHeight(26)
         self.toggle_button.setObjectName("SectionToggle")
         self.toggle_button.clicked.connect(self.set_expanded)
         layout.addWidget(self.toggle_button)
@@ -682,6 +703,8 @@ class TextureEditorCanvas(QWidget):
         self._split_percent = 50
         self._grid_enabled = False
         self._grid_size = 64
+        self._grid_color = QColor("#74C1FF")
+        self._grid_opacity = 42
         self._guides_enabled = False
         self._vertical_guides: Tuple[int, ...] = ()
         self._horizontal_guides: Tuple[int, ...] = ()
@@ -787,9 +810,19 @@ class TextureEditorCanvas(QWidget):
         self._split_percent = percent
         self.update()
 
-    def set_grid_state(self, *, enabled: bool, grid_size: int) -> None:
+    def set_grid_state(
+        self,
+        *,
+        enabled: bool,
+        grid_size: int,
+        grid_color: Optional[QColor] = None,
+        grid_opacity: int = 42,
+    ) -> None:
         self._grid_enabled = bool(enabled)
         self._grid_size = max(2, int(grid_size))
+        if grid_color is not None and grid_color.isValid():
+            self._grid_color = QColor(grid_color)
+        self._grid_opacity = max(5, min(100, int(grid_opacity)))
         self.update()
 
     def set_guide_state(
@@ -1041,8 +1074,13 @@ class TextureEditorCanvas(QWidget):
 
     def _update_display_geometry(self) -> None:
         if self._image is None:
-            self.resize(1, 1)
+            if self._scroll_area is not None:
+                viewport = self._scroll_area.viewport().size()
+                self.resize(max(280, viewport.width() - 12), max(220, viewport.height() - 12))
+            else:
+                self.resize(420, 300)
             self._display_scale = 1.0
+            self.update()
             return
         width = max(1, self._image.width())
         height = max(1, self._image.height())
@@ -1267,8 +1305,14 @@ class TextureEditorCanvas(QWidget):
         if self._grid_enabled and self._grid_size > 1:
             grid_step = float(self._grid_size) * max(0.01, self._display_scale)
             if grid_step >= 6.0:
-                minor_pen = QPen(QColor(255, 255, 255, 18), 1)
-                major_pen = QPen(QColor(116, 193, 255, 26), 1)
+                base_color = QColor(self._grid_color if self._grid_color.isValid() else QColor("#74C1FF"))
+                opacity_ratio = max(0.05, min(1.0, float(self._grid_opacity) / 100.0))
+                minor_color = QColor(base_color)
+                major_color = QColor(base_color)
+                minor_color.setAlpha(max(8, int(round(255.0 * opacity_ratio * 0.38))))
+                major_color.setAlpha(max(minor_color.alpha() + 12, int(round(255.0 * opacity_ratio * 0.72))))
+                minor_pen = QPen(minor_color, 1)
+                major_pen = QPen(major_color, 1)
                 x = grid_step
                 line_index = 1
                 while x < target_rect.width():
@@ -1697,12 +1741,6 @@ class TextureEditorTab(QWidget):
                 font-weight: 600;
                 background-color: rgba(255, 255, 255, 0.01);
             }
-            QPushButton {
-                min-height: 24px;
-                padding: 3px 8px;
-                border-radius: 6px;
-                font-size: 12px;
-            }
             QPushButton#EditorPanelButton {
                 background-color: rgba(255, 255, 255, 0.02);
                 border: 1px solid rgba(128, 146, 179, 0.12);
@@ -1725,38 +1763,10 @@ class TextureEditorTab(QWidget):
                 border-radius: 6px;
                 border: 1px solid rgba(128, 146, 179, 0.12);
                 background-color: rgba(255, 255, 255, 0.02);
-                padding: 4px 6px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                subcontrol-position: top left;
-                left: 8px;
-                padding: 0 6px;
-                color: #E7EDF7;
-                background-color: transparent;
-            }
-            QToolButton {
-                text-align: left;
-                padding: 5px 8px;
-                border-radius: 5px;
-            }
-            QToolButton#SectionToggle {
-                font-weight: 600;
-                padding: 4px 8px;
-                border-radius: 6px;
-                color: #E7EDF7;
-                background-color: rgba(255, 255, 255, 0.018);
-                border: 1px solid rgba(128, 146, 179, 0.12);
-            }
-            QToolButton#SectionToggle:hover {
-                background-color: rgba(255, 255, 255, 0.03);
-                border: 1px solid rgba(128, 146, 179, 0.18);
             }
             QToolButton#EditorToolButton {
                 background-color: rgba(255, 255, 255, 0.012);
                 border: 1px solid rgba(255, 255, 255, 0.04);
-                padding: 3px 6px;
-                font-size: 12px;
             }
             QToolButton#EditorToolButton:checked {
                 background-color: rgba(116, 193, 255, 0.18);
@@ -1771,11 +1781,6 @@ class TextureEditorTab(QWidget):
                 border: 1px solid rgba(128, 146, 179, 0.08);
                 border-radius: 10px;
                 background-color: rgba(255, 255, 255, 0.012);
-            }
-            QFrame#EditorActionPane QPushButton {
-                min-height: 22px;
-                padding: 2px 8px;
-                font-size: 12px;
             }
             QWidget#EditorLeftSidebar, QWidget#EditorInspectorSidebar {
                 background-color: rgba(255, 255, 255, 0.012);
@@ -1808,28 +1813,7 @@ class TextureEditorTab(QWidget):
         self.document_tab_bar.setDrawBase(False)
         self.document_tab_bar.setExpanding(False)
         self.document_tab_bar.hide()
-        self.document_tab_bar.setStyleSheet(
-            """
-            QTabBar::tab {
-                background-color: rgba(255, 255, 255, 0.018);
-                border: 1px solid rgba(128, 146, 179, 0.10);
-                border-bottom: none;
-                padding: 5px 10px;
-                min-width: 96px;
-                max-width: 180px;
-                margin-right: 2px;
-                border-top-left-radius: 6px;
-                border-top-right-radius: 6px;
-                color: #C9D6EA;
-                font-size: 12px;
-            }
-            QTabBar::tab:selected {
-                background-color: rgba(255, 255, 255, 0.05);
-                border-color: rgba(116, 193, 255, 0.22);
-                color: #F2F6FF;
-            }
-            """
-        )
+        self._apply_document_tab_bar_style(self.font())
         self.open_file_button = QPushButton("Open Image...")
         self.open_archive_button = QPushButton("Browse Archive")
         self.open_compare_button = QPushButton("Open In Compare")
@@ -1859,7 +1843,7 @@ class TextureEditorTab(QWidget):
         self.status_label.setObjectName("StatusLabel")
         self.status_label.setWordWrap(True)
         self.status_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-        self.status_label.setMinimumHeight(54)
+        self.status_label.setMinimumHeight(36)
 
         self.main_splitter = QSplitter(Qt.Horizontal)
         self.main_splitter.setChildrenCollapsible(False)
@@ -1868,45 +1852,51 @@ class TextureEditorTab(QWidget):
 
         self.tool_panel = QWidget()
         self.tool_panel.setObjectName("EditorLeftSidebar")
-        self.tool_panel.setMinimumWidth(210)
-        self.tool_panel.setMaximumWidth(290)
+        self.tool_panel.setMinimumWidth(200)
+        self.tool_panel.setMaximumWidth(220)
         tool_layout = QVBoxLayout(self.tool_panel)
         tool_layout.setContentsMargins(12, 12, 12, 12)
-        tool_layout.setSpacing(10)
-        title = QLabel("Texture Editor")
-        title.setStyleSheet("font-size: 15px; font-weight: 600;")
-        tool_layout.addWidget(title)
-
-        subtitle = QLabel(
-            "Open DDS or other image files directly for visible-texture editing. DDS sources are decoded into a layered editing document here, and Save/Send actions export a flattened PNG intermediate back into Replace Assistant or Texture Workflow."
-        )
-        subtitle.setWordWrap(True)
-        subtitle.setObjectName("HintLabel")
-        subtitle.setStyleSheet("font-size: 12px; line-height: 1.25;")
-        tool_layout.addWidget(subtitle)
+        tool_layout.setSpacing(8)
         left_actions_body = QFrame()
         left_actions_body.setObjectName("EditorActionPane")
         left_actions_layout = QVBoxLayout(left_actions_body)
         left_actions_layout.setContentsMargins(8, 8, 8, 8)
         left_actions_layout.setSpacing(6)
-        file_actions = QGridLayout()
-        file_actions.setHorizontalSpacing(8)
-        file_actions.setVerticalSpacing(8)
-        file_actions.addWidget(self.open_file_button, 0, 0)
-        file_actions.addWidget(self.open_archive_button, 1, 0)
-        file_actions.addWidget(self.open_compare_button, 2, 0)
-        file_actions.addWidget(self.open_project_button, 3, 0)
-        file_actions.addWidget(self.save_project_button, 4, 0)
-        file_actions.addWidget(self.save_png_button, 5, 0)
-        file_actions.addWidget(self.send_replace_button, 6, 0)
-        file_actions.addWidget(self.send_workflow_button, 7, 0)
-        left_actions_layout.addLayout(file_actions)
+        self.actions_menu_button = QToolButton()
+        self.actions_menu_button.setText("Actions")
+        self.actions_menu_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.actions_menu_button.setPopupMode(QToolButton.InstantPopup)
+        self.actions_menu_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.actions_menu_button.setObjectName("EditorPanelButton")
+        self.actions_menu = QMenu(self.actions_menu_button)
+        self.action_open_file = QAction("Open Image...", self)
+        self.action_open_archive = QAction("Browse Archive", self)
+        self.action_open_project = QAction("Open Project...", self)
+        self.action_save_project = QAction("Save Project", self)
+        self.action_export_png = QAction("Export PNG", self)
+        self.action_send_replace = QAction("Send To Replace Assistant", self)
+        self.action_send_workflow = QAction("Send To Texture Workflow", self)
+        for action in (
+            self.action_open_file,
+            self.action_open_archive,
+            self.action_open_project,
+        ):
+            self.actions_menu.addAction(action)
+        self.actions_menu.addSeparator()
+        for action in (
+            self.action_save_project,
+            self.action_export_png,
+            self.action_send_replace,
+            self.action_send_workflow,
+        ):
+            self.actions_menu.addAction(action)
+        self.actions_menu_button.setMenu(self.actions_menu)
+        left_actions_layout.addWidget(self.actions_menu_button)
         edit_actions = QGridLayout()
         edit_actions.setHorizontalSpacing(8)
         edit_actions.setVerticalSpacing(6)
         edit_label = QLabel("Edit")
         edit_label.setObjectName("HintLabel")
-        edit_label.setStyleSheet("font-size: 12px;")
         self.shortcuts_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         edit_actions.addWidget(edit_label, 0, 0, 1, 2)
         edit_actions.addWidget(self.undo_button, 1, 0)
@@ -1920,8 +1910,8 @@ class TextureEditorTab(QWidget):
         tool_group = QGroupBox("Tools")
         tool_group.setObjectName("EditorToolGroup")
         tool_group_layout = QVBoxLayout(tool_group)
-        tool_group_layout.setContentsMargins(10, 16, 10, 10)
-        tool_group_layout.setSpacing(6)
+        tool_group_layout.setContentsMargins(8, 12, 8, 8)
+        tool_group_layout.setSpacing(4)
         for tool_key, label in (
             ("paint", "Paint"),
             ("erase", "Erase"),
@@ -1945,8 +1935,8 @@ class TextureEditorTab(QWidget):
             button.setCheckable(True)
             button.setObjectName("EditorToolButton")
             button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-            button.setIconSize(QSize(18, 18))
-            button.setMinimumHeight(30)
+            button.setIconSize(QSize(16, 16))
+            button.setMinimumHeight(22)
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             button.setAutoRaise(False)
             button.setToolTip(label)
@@ -1959,18 +1949,23 @@ class TextureEditorTab(QWidget):
         self.left_scroll.setObjectName("EditorSidebarScroll")
         self.left_scroll.setWidgetResizable(True)
         self.left_scroll.setFrameShape(QFrame.NoFrame)
+        self.left_scroll.setMinimumWidth(218)
+        self.left_scroll.setMaximumWidth(246)
+        self.left_scroll.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.left_scroll.setWidget(self.tool_panel)
         self.main_splitter.addWidget(self.left_scroll)
 
         self.canvas_panel = QWidget()
         self.canvas_panel.setObjectName("EditorCanvasPane")
-        self.canvas_panel.setMinimumWidth(720)
+        self.canvas_panel.setMinimumWidth(480)
         canvas_layout = QVBoxLayout(self.canvas_panel)
         canvas_layout.setContentsMargins(12, 12, 12, 12)
         canvas_layout.setSpacing(10)
         canvas_layout.addWidget(self.document_tab_bar)
-        zoom_row = QHBoxLayout()
-        zoom_row.setContentsMargins(4, 2, 4, 0)
+        self.canvas_toolbar = QFrame()
+        self.canvas_toolbar.setObjectName("EditorActionPane")
+        zoom_row = QHBoxLayout(self.canvas_toolbar)
+        zoom_row.setContentsMargins(8, 6, 8, 4)
         zoom_row.setSpacing(6)
         self.zoom_out_button = QPushButton("-")
         self.zoom_fit_button = QPushButton("Fit")
@@ -1978,7 +1973,7 @@ class TextureEditorTab(QWidget):
         self.zoom_in_button = QPushButton("+")
         self.zoom_label = QLabel("Fit")
         self.zoom_label.setObjectName("HintLabel")
-        self.zoom_label.setMinimumWidth(56)
+        self.zoom_label.setMinimumWidth(44)
         self.zoom_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.view_mode_combo = QComboBox()
         self.view_mode_combo.addItem("Edited", "edited")
@@ -1988,24 +1983,37 @@ class TextureEditorTab(QWidget):
         self.view_mode_combo.addItem("Green", "green")
         self.view_mode_combo.addItem("Blue", "blue")
         self.view_mode_combo.addItem("Alpha", "alpha")
-        self.view_mode_combo.setMinimumWidth(110)
+        self.view_mode_combo.setMinimumWidth(96)
         self.view_mode_label = QLabel("View")
         self.view_mode_label.setObjectName("HintLabel")
         self.compare_split_slider = QSlider(Qt.Horizontal)
         self.compare_split_slider.setRange(5, 95)
         self.compare_split_slider.setValue(50)
-        self.compare_split_slider.setFixedWidth(90)
+        self.compare_split_slider.setMinimumWidth(72)
+        self.compare_split_slider.setMaximumWidth(110)
         self.compare_split_slider.setVisible(False)
         self.grid_checkbox = QCheckBox("Grid")
         self.grid_size_spin = QSpinBox()
         self.grid_size_spin.setRange(4, 1024)
         self.grid_size_spin.setSingleStep(4)
         self.grid_size_spin.setValue(64)
-        self.grid_size_spin.setFixedWidth(70)
-        self.zoom_out_button.setFixedSize(34, 28)
-        self.zoom_fit_button.setFixedSize(44, 28)
-        self.zoom_100_button.setFixedSize(54, 28)
-        self.zoom_in_button.setFixedSize(34, 28)
+        self.grid_size_spin.setMinimumWidth(60)
+        self.grid_size_spin.setMaximumWidth(80)
+        self.grid_color_button = QToolButton()
+        self.grid_color_button.setFixedSize(24, 24)
+        self.grid_color_button.setToolTip("Grid color")
+        self.grid_color_button.setAutoRaise(False)
+        self.grid_opacity_spin = QSpinBox()
+        self.grid_opacity_spin.setRange(5, 100)
+        self.grid_opacity_spin.setSuffix("%")
+        self.grid_opacity_spin.setValue(42)
+        self.grid_opacity_spin.setToolTip("Grid opacity")
+        self.grid_opacity_spin.setMinimumWidth(64)
+        self.grid_opacity_spin.setMaximumWidth(72)
+        self.zoom_out_button.setMinimumSize(32, 28)
+        self.zoom_fit_button.setMinimumSize(42, 28)
+        self.zoom_100_button.setMinimumSize(52, 28)
+        self.zoom_in_button.setMinimumSize(32, 28)
         zoom_row.addWidget(self.zoom_out_button)
         zoom_row.addWidget(self.zoom_fit_button)
         zoom_row.addWidget(self.zoom_100_button)
@@ -2018,8 +2026,10 @@ class TextureEditorTab(QWidget):
         zoom_row.addSpacing(6)
         zoom_row.addWidget(self.grid_checkbox)
         zoom_row.addWidget(self.grid_size_spin)
+        zoom_row.addWidget(self.grid_color_button)
+        zoom_row.addWidget(self.grid_opacity_spin)
         zoom_row.addStretch(1)
-        canvas_layout.addLayout(zoom_row)
+        canvas_layout.addWidget(self.canvas_toolbar)
         self.canvas = TextureEditorCanvas()
         self.canvas_scroll = QScrollArea()
         self.canvas_scroll.setWidgetResizable(False)
@@ -2073,21 +2083,19 @@ class TextureEditorTab(QWidget):
 
         self.right_panel = QWidget()
         self.right_panel.setObjectName("EditorInspectorSidebar")
-        self.right_panel.setMinimumWidth(236)
+        self.right_panel.setMinimumWidth(210)
         right_layout = QVBoxLayout(self.right_panel)
         right_layout.setContentsMargins(12, 12, 12, 12)
         right_layout.setSpacing(10)
         settings_title = QLabel("Settings")
-        settings_title.setStyleSheet("font-size: 15px; font-weight: 600;")
+        settings_title.setStyleSheet("font-weight: 600;")
         right_layout.addWidget(settings_title)
         self.metadata_browser = QTextBrowser()
         self.metadata_browser.setOpenExternalLinks(False)
         self.metadata_browser.setMinimumHeight(120)
         self.metadata_browser.setFrameShape(QFrame.NoFrame)
         self.metadata_browser.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.metadata_browser.setStyleSheet(
-            "background: transparent; border: none; font-size: 12px; line-height: 1.25;"
-        )
+        self.metadata_browser.setStyleSheet("background: transparent; border: none;")
         metadata_body = QFrame()
         metadata_body.setObjectName("EditorSectionBody")
         metadata_layout = QVBoxLayout(metadata_body)
@@ -2885,14 +2893,14 @@ class TextureEditorTab(QWidget):
         self.right_scroll = QScrollArea()
         self.right_scroll.setWidgetResizable(True)
         self.right_scroll.setFrameShape(QFrame.NoFrame)
-        self.right_scroll.setMinimumWidth(240)
-        self.right_scroll.setMaximumWidth(320)
+        self.right_scroll.setMinimumWidth(210)
+        self.right_scroll.setMaximumWidth(290)
         self.right_scroll.setWidget(self.right_panel)
         self.main_splitter.addWidget(self.right_scroll)
-        self.main_splitter.setStretchFactor(0, 1)
+        self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 8)
         self.main_splitter.setStretchFactor(2, 2)
-        self.main_splitter.setSizes([220, 1560, 260])
+        self.main_splitter.setSizes(build_responsive_splitter_sizes(2040, [11, 74, 15], [218, 480, 210]))
 
         self._connect_signals()
         self._rebuild_brush_preset_combo(preserve_key="custom")
@@ -2901,6 +2909,131 @@ class TextureEditorTab(QWidget):
         self._settings_ready = True
         self._rebuild_shortcuts()
         self._refresh_ui()
+        self._apply_font_sensitive_metrics(self.font())
+        QTimer.singleShot(0, self._apply_responsive_splitter_defaults)
+
+    def _apply_responsive_splitter_defaults(self) -> None:
+        total_width = max(self.width() - 32, sum([218, 480, 210]))
+        if self.document is None:
+            left_width = 226
+            self.main_splitter.setSizes([left_width, max(520, total_width - left_width), 0])
+            return
+        self.main_splitter.setSizes(
+            build_responsive_splitter_sizes(total_width, [11, 74, 15], [218, 480, 210])
+        )
+
+    def _apply_document_tab_bar_style(self, font: QFont) -> None:
+        metrics = QFontMetrics(font)
+        pad_y = max(3, metrics.height() // 5)
+        pad_x = max(8, metrics.averageCharWidth())
+        min_width = max(88, metrics.horizontalAdvance("Document") + 22)
+        max_width = max(min_width + 40, metrics.horizontalAdvance("VeryLongDocumentName.png") + 20)
+        self.document_tab_bar.setStyleSheet(
+            f"""
+            QTabBar::tab {{
+                background-color: rgba(255, 255, 255, 0.018);
+                border: 1px solid rgba(128, 146, 179, 0.10);
+                border-bottom: none;
+                padding: {pad_y}px {pad_x}px;
+                min-width: {min_width}px;
+                max-width: {max_width}px;
+                margin-right: 2px;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                color: #C9D6EA;
+            }}
+            QTabBar::tab:selected {{
+                background-color: rgba(255, 255, 255, 0.05);
+                border-color: rgba(116, 193, 255, 0.22);
+                color: #F2F6FF;
+            }}
+            """
+        )
+
+    def _apply_font_sensitive_metrics(self, font: QFont) -> None:
+        metrics = QFontMetrics(font)
+        standard_button_height = max(24, metrics.height() + 8)
+        compact_button_height = max(22, metrics.height() + 6)
+        tool_button_height = max(22, metrics.height() + 6)
+        tool_icon_size = max(14, min(18, metrics.height() + 2))
+
+        self._apply_document_tab_bar_style(font)
+        self.actions_menu_button.setMinimumHeight(standard_button_height)
+        for button in (
+            self.open_file_button,
+            self.open_archive_button,
+            self.open_compare_button,
+            self.open_project_button,
+            self.save_project_button,
+            self.save_png_button,
+            self.send_replace_button,
+            self.send_workflow_button,
+            self.shortcuts_button,
+        ):
+            button.setMinimumHeight(standard_button_height)
+        for button in (
+            self.undo_button,
+            self.redo_button,
+            self.history_restore_button,
+            self.history_clear_button,
+        ):
+            button.setMinimumHeight(compact_button_height)
+        self._refresh_tool_button_icons()
+        for button in self.tool_buttons.values():
+            button.setMinimumHeight(tool_button_height)
+            button.setIconSize(QSize(tool_icon_size, tool_icon_size))
+
+    def _refresh_tool_button_icons(self) -> None:
+        palette = QApplication.palette()
+        for tool_key, button in self.tool_buttons.items():
+            button.setIcon(_create_tool_icon(tool_key, palette))
+
+    def sync_ui_font(self, font: QFont) -> None:
+        applied_font = QFont(font)
+        self.setFont(applied_font)
+        for widget in (
+            self.document_tab_bar,
+            self.left_scroll,
+            self.tool_panel,
+            self.canvas_panel,
+            self.right_panel,
+            self.right_scroll,
+            self.actions_menu_button,
+        ):
+            widget.setFont(applied_font)
+        self.actions_menu.setFont(applied_font)
+        self.metadata_browser.document().setDefaultFont(applied_font)
+        self._apply_font_sensitive_metrics(applied_font)
+        self._refresh_metadata()
+
+    def sync_ui_font_from_application(self) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        self.sync_ui_font(app.font())
+
+    def _apply_empty_state_layout(self, has_doc: bool) -> None:
+        self.canvas_toolbar.setVisible(has_doc)
+        self.canvas_status_strip.setVisible(has_doc)
+        right_sidebar_was_visible = self.right_scroll.isVisible()
+        right_handle = self.main_splitter.handle(2)
+        self.right_panel.setVisible(has_doc)
+        self.right_scroll.setVisible(has_doc)
+        if has_doc:
+            self.right_scroll.setMinimumWidth(210)
+            self.right_scroll.setMaximumWidth(290)
+            right_handle.setVisible(True)
+            right_handle.setEnabled(True)
+        else:
+            self.right_scroll.setMinimumWidth(0)
+            self.right_scroll.setMaximumWidth(0)
+            right_handle.setVisible(False)
+            right_handle.setEnabled(False)
+            total_width = max(self.width() - 32, 760)
+            left_width = 226
+            self.main_splitter.setSizes([left_width, max(520, total_width - left_width), 0])
+        if has_doc and not right_sidebar_was_visible:
+            QTimer.singleShot(0, self._apply_responsive_splitter_defaults)
 
     def _connect_signals(self) -> None:
         self.document_tab_bar.currentChanged.connect(self._handle_document_tab_changed)
@@ -2913,6 +3046,13 @@ class TextureEditorTab(QWidget):
         self.save_png_button.clicked.connect(self.save_flattened_png_dialog)
         self.send_replace_button.clicked.connect(self.send_to_replace_assistant)
         self.send_workflow_button.clicked.connect(self.send_to_texture_workflow)
+        self.action_open_file.triggered.connect(self.open_file_dialog)
+        self.action_open_archive.triggered.connect(self.request_browse_archive)
+        self.action_open_project.triggered.connect(self.open_project_dialog)
+        self.action_save_project.triggered.connect(self.save_project_dialog)
+        self.action_export_png.triggered.connect(self.save_flattened_png_dialog)
+        self.action_send_replace.triggered.connect(self.send_to_replace_assistant)
+        self.action_send_workflow.triggered.connect(self.send_to_texture_workflow)
         self.undo_button.clicked.connect(self.undo)
         self.redo_button.clicked.connect(self.redo)
         self.shortcuts_button.clicked.connect(self.open_shortcuts_dialog)
@@ -2924,6 +3064,8 @@ class TextureEditorTab(QWidget):
         self.compare_split_slider.valueChanged.connect(self._handle_compare_split_changed)
         self.grid_checkbox.toggled.connect(self._handle_grid_state_changed)
         self.grid_size_spin.valueChanged.connect(self._handle_grid_state_changed)
+        self.grid_color_button.clicked.connect(self._pick_grid_color)
+        self.grid_opacity_spin.valueChanged.connect(self._handle_grid_state_changed)
         for tool_key, button in self.tool_buttons.items():
             button.clicked.connect(lambda checked=False, key=tool_key: self._set_active_tool(key))
         self.canvas.stroke_committed.connect(self._handle_canvas_stroke)
@@ -3329,6 +3471,12 @@ class TextureEditorTab(QWidget):
         self.compare_split_slider.setValue(int(self.settings.value("texture_editor/compare_split", 50)))
         self.grid_checkbox.setChecked(bool(self.settings.value("texture_editor/grid_enabled", False)))
         self.grid_size_spin.setValue(int(self.settings.value("texture_editor/grid_size", 64)))
+        self._set_grid_color(
+            QColor(str(self.settings.value("texture_editor/grid_color", "#74C1FF"))),
+            save=False,
+            apply=False,
+        )
+        self.grid_opacity_spin.setValue(int(self.settings.value("texture_editor/grid_opacity", 42)))
         self._last_open_dir = str(self.settings.value("texture_editor/last_open_dir", str(self.base_dir)))
         self._last_save_dir = str(self.settings.value("texture_editor/last_save_dir", str(self.base_dir)))
         mode = str(self.settings.value("texture_editor/recolor_mode", "tint"))
@@ -3384,6 +3532,8 @@ class TextureEditorTab(QWidget):
         self.settings.setValue("texture_editor/compare_split", self.compare_split_slider.value())
         self.settings.setValue("texture_editor/grid_enabled", self.grid_checkbox.isChecked())
         self.settings.setValue("texture_editor/grid_size", self.grid_size_spin.value())
+        self.settings.setValue("texture_editor/grid_color", self._grid_color.name(QColor.HexRgb))
+        self.settings.setValue("texture_editor/grid_opacity", self.grid_opacity_spin.value())
         self.settings.setValue("texture_editor/last_open_dir", self._last_open_dir)
         self.settings.setValue("texture_editor/last_save_dir", self._last_save_dir)
         
@@ -3969,6 +4119,8 @@ class TextureEditorTab(QWidget):
             "compare_split": int(self.compare_split_slider.value()),
             "grid_enabled": bool(self.grid_checkbox.isChecked()),
             "grid_size": int(self.grid_size_spin.value()),
+            "grid_color": self._grid_color.name(QColor.HexRgb),
+            "grid_opacity": int(self.grid_opacity_spin.value()),
             "show_rulers": bool(self._show_rulers),
             "show_guides": bool(self._show_guides),
             "vertical_guides": list(self._vertical_guides),
@@ -4012,6 +4164,10 @@ class TextureEditorTab(QWidget):
         self.grid_size_spin.blockSignals(True)
         self.grid_size_spin.setValue(int(state.get("grid_size", self.grid_size_spin.value())))
         self.grid_size_spin.blockSignals(False)
+        self._set_grid_color(QColor(str(state.get("grid_color", self._grid_color.name(QColor.HexRgb)))), save=False, apply=False)
+        self.grid_opacity_spin.blockSignals(True)
+        self.grid_opacity_spin.setValue(int(state.get("grid_opacity", self.grid_opacity_spin.value())))
+        self.grid_opacity_spin.blockSignals(False)
         self.show_rulers_checkbox.blockSignals(True)
         self.show_guides_checkbox.blockSignals(True)
         self.show_rulers_checkbox.setChecked(bool(state.get("show_rulers", True)))
@@ -4776,12 +4932,41 @@ class TextureEditorTab(QWidget):
         self.canvas.set_grid_state(
             enabled=self.grid_checkbox.isChecked(),
             grid_size=self.grid_size_spin.value(),
+            grid_color=self._grid_color,
+            grid_opacity=self.grid_opacity_spin.value(),
         )
         self._refresh_navigation_overlays()
         document_key = self._active_document_key()
         if document_key:
             self.workspace.document_view_state[document_key] = self._capture_view_state()
         self._save_settings()
+
+    def _set_grid_color(self, color: QColor, *, save: bool = True, apply: bool = True) -> None:
+        resolved = QColor(color) if color.isValid() else QColor("#74C1FF")
+        self._grid_color = resolved
+        self._update_grid_color_button()
+        if apply:
+            self._handle_grid_state_changed()
+        elif save:
+            self._save_settings()
+
+    def _update_grid_color_button(self) -> None:
+        color = QColor(self._grid_color if self._grid_color.isValid() else QColor("#74C1FF"))
+        self.grid_color_button.setStyleSheet(
+            "QToolButton {"
+            f"background-color: {color.name(QColor.HexRgb)};"
+            "border: 1px solid rgba(220, 230, 245, 0.35);"
+            "border-radius: 4px;"
+            "}"
+        )
+        self.grid_color_button.setText("")
+        self.grid_color_button.setToolTip(f"Grid color: {color.name(QColor.HexRgb).upper()}")
+
+    def _pick_grid_color(self) -> None:
+        chosen = QColorDialog.getColor(self._grid_color, self, "Select grid color")
+        if not chosen.isValid():
+            return
+        self._set_grid_color(chosen)
 
     def _handle_canvas_viewport_changed(self, *_args) -> None:
         self._refresh_zoom_indicators()
@@ -6415,6 +6600,8 @@ class TextureEditorTab(QWidget):
         self.canvas.set_grid_state(
             enabled=self.grid_checkbox.isChecked(),
             grid_size=self.grid_size_spin.value(),
+            grid_color=self._grid_color,
+            grid_opacity=self.grid_opacity_spin.value(),
         )
         self._refresh_zoom_indicators()
         self._refresh_navigation_overlays()
@@ -6434,7 +6621,7 @@ class TextureEditorTab(QWidget):
         def _cell_text(value: str) -> str:
             text = value.strip() or "-"
             return (
-                "<div style='white-space:pre-wrap; word-break:break-word; color:#D8E1EE; font-size:12px; line-height:1.25;'>"
+                "<div style='white-space:pre-wrap; word-break:break-word; color:#D8E1EE; line-height:1.25;'>"
                 f"{html.escape(text)}</div>"
             )
 
@@ -6442,15 +6629,15 @@ class TextureEditorTab(QWidget):
         if semantics_text == "unknown/unknown":
             semantics_text = "Unknown"
         refined_html = [
-            f"<div style='font-size:13px; font-weight:600; color:#E7EDF7; margin-bottom:2px; line-height:1.2;'>{html.escape(self.document.title)}</div>",
-            f"<div style='margin-bottom:8px; color:#B4C0D4; font-size:11px; line-height:1.2;'>{self.document.width}x{self.document.height} px</div>",
+            f"<div style='font-weight:600; color:#E7EDF7; margin-bottom:2px; line-height:1.2;'>{html.escape(self.document.title)}</div>",
+            f"<div style='margin-bottom:8px; color:#B4C0D4; line-height:1.2;'>{self.document.width}x{self.document.height} px</div>",
             "<table style='width:100%; border-collapse:separate; border-spacing:0 6px;'>",
-            f"<tr><td style='width:96px; vertical-align:top; color:#E7EDF7; font-weight:600; font-size:12px;'>Origin</td><td>{_cell_text(binding.launch_origin or 'file')}</td></tr>",
-            f"<tr><td style='width:96px; vertical-align:top; color:#E7EDF7; font-weight:600; font-size:12px;'>Source</td><td>{_cell_text(binding.source_path)}</td></tr>",
-            f"<tr><td style='width:96px; vertical-align:top; color:#E7EDF7; font-weight:600; font-size:12px;'>Relative path</td><td>{_cell_text(binding.relative_path or binding.archive_relative_path)}</td></tr>",
-            f"<tr><td style='width:96px; vertical-align:top; color:#E7EDF7; font-weight:600; font-size:12px;'>Package</td><td>{_cell_text(binding.package_root)}</td></tr>",
-            f"<tr><td style='width:96px; vertical-align:top; color:#E7EDF7; font-weight:600; font-size:12px;'>Original DDS</td><td>{_cell_text(binding.original_dds_path)}</td></tr>",
-            f"<tr><td style='width:96px; vertical-align:top; color:#E7EDF7; font-weight:600; font-size:12px;'>Semantics</td><td>{_cell_text(semantics_text)}</td></tr>",
+            f"<tr><td style='width:96px; vertical-align:top; color:#E7EDF7; font-weight:600;'>Origin</td><td>{_cell_text(binding.launch_origin or 'file')}</td></tr>",
+            f"<tr><td style='width:96px; vertical-align:top; color:#E7EDF7; font-weight:600;'>Source</td><td>{_cell_text(binding.source_path)}</td></tr>",
+            f"<tr><td style='width:96px; vertical-align:top; color:#E7EDF7; font-weight:600;'>Relative path</td><td>{_cell_text(binding.relative_path or binding.archive_relative_path)}</td></tr>",
+            f"<tr><td style='width:96px; vertical-align:top; color:#E7EDF7; font-weight:600;'>Package</td><td>{_cell_text(binding.package_root)}</td></tr>",
+            f"<tr><td style='width:96px; vertical-align:top; color:#E7EDF7; font-weight:600;'>Original DDS</td><td>{_cell_text(binding.original_dds_path)}</td></tr>",
+            f"<tr><td style='width:96px; vertical-align:top; color:#E7EDF7; font-weight:600;'>Semantics</td><td>{_cell_text(semantics_text)}</td></tr>",
             "</table>",
         ]
         self.metadata_browser.setHtml("".join(refined_html))
@@ -6856,6 +7043,17 @@ class TextureEditorTab(QWidget):
             self.image_rotate_right_button,
         ):
             button.setEnabled((has_doc if button not in {self.open_file_button, self.open_archive_button, self.open_project_button} else True) and not busy)
+        self.actions_menu_button.setEnabled(not busy)
+        for button, action in (
+            (self.open_file_button, self.action_open_file),
+            (self.open_archive_button, self.action_open_archive),
+            (self.open_project_button, self.action_open_project),
+            (self.save_project_button, self.action_save_project),
+            (self.save_png_button, self.action_export_png),
+            (self.send_replace_button, self.action_send_replace),
+            (self.send_workflow_button, self.action_send_workflow),
+        ):
+            action.setEnabled(button.isEnabled())
         self.image_crop_selection_button.setEnabled(bool(has_doc and not busy and self.document.selection.mode != "none" and self.document.floating_selection is None))
         self.image_trim_button.setEnabled(bool(has_doc and not busy and self.document.floating_selection is None))
         self.image_resize_button.setEnabled(bool(has_doc and not busy and self.document.floating_selection is None))
@@ -6882,6 +7080,8 @@ class TextureEditorTab(QWidget):
         self.compare_split_slider.setEnabled(has_doc and not busy and str(self.view_mode_combo.currentData() or "edited") == "split")
         self.grid_checkbox.setEnabled(has_doc and not busy)
         self.grid_size_spin.setEnabled(has_doc and not busy and self.grid_checkbox.isChecked())
+        self.grid_color_button.setEnabled(has_doc and not busy and self.grid_checkbox.isChecked())
+        self.grid_opacity_spin.setEnabled(has_doc and not busy and self.grid_checkbox.isChecked())
         self.navigator_widget.setEnabled(has_doc and not busy)
         self.show_rulers_checkbox.setEnabled(has_doc and not busy)
         self.show_guides_checkbox.setEnabled(has_doc and not busy)
@@ -6992,7 +7192,10 @@ class TextureEditorTab(QWidget):
         self.clear_clone_source_button.setEnabled(
             has_doc and not busy and self.current_tool_settings.clone_source_point is not None
         )
+        self._apply_empty_state_layout(has_doc)
         self.channels_section.setVisible(has_doc)
+        self.metadata_section.setVisible(has_doc)
+        self.navigator_section.setVisible(has_doc)
         self.image_section.setVisible(has_doc)
         self.transform_float_layer_button.setEnabled(has_doc and not busy and self.document is not None and bool(self.document.active_layer_id))
         self.transform_section.setVisible(has_doc)

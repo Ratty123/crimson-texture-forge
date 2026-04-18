@@ -81,7 +81,13 @@ from crimson_forge_toolkit.core.research import (
 )
 from crimson_forge_toolkit.core.pipeline import describe_processing_path_kind
 from crimson_forge_toolkit.models import AppConfig, ArchiveEntry, ArchivePreviewResult
-from crimson_forge_toolkit.ui.widgets import PreviewLabel, PreviewScrollArea
+from crimson_forge_toolkit.ui.widgets import (
+    FlatSectionPanel,
+    PreviewLabel,
+    PreviewScrollArea,
+    clamp_splitter_sizes,
+    build_responsive_splitter_sizes,
+)
 
 
 def _shutdown_thread(thread: Optional[QThread], *, grace_ms: int = 2000, force_ms: int = 2000) -> None:
@@ -445,6 +451,12 @@ class ResearchTab(QWidget):
         self.pending_unknown_preview_request: Optional[tuple[int, Optional[ArchiveEntry]]] = None
         self.unknown_preview_fit_to_view = True
         self.unknown_preview_zoom_factor = 1.0
+        self.archive_picker_preview_thread: Optional[QThread] = None
+        self.archive_picker_preview_worker: Optional[UnknownResolverPreviewWorker] = None
+        self.archive_picker_preview_request_id = 0
+        self.pending_archive_picker_preview_request: Optional[tuple[int, Optional[ArchiveEntry]]] = None
+        self.archive_picker_preview_fit_to_view = True
+        self.archive_picker_preview_zoom_factor = 1.0
         self.research_payload: Dict[str, object] = {}
         self.reference_payload: Dict[str, object] = {}
         self.pending_mip_focus_relative_path = ""
@@ -494,13 +506,13 @@ class ResearchTab(QWidget):
         top_row.setSpacing(6)
         self.refresh_button = QPushButton("Refresh Research")
         self.refresh_status_label = QLabel("Ready. Use the current archive scan and compare roots.")
-        self.refresh_status_label.setWordWrap(False)
+        self.refresh_status_label.setWordWrap(True)
         self.refresh_status_label.setObjectName("HintLabel")
         self.refresh_progress = QProgressBar()
         self.refresh_progress.setRange(0, 1)
         self.refresh_progress.setValue(0)
         self.refresh_progress.setFormat("Idle")
-        self.refresh_progress.setMaximumWidth(220)
+        self.refresh_progress.setMaximumWidth(180)
         self.refresh_progress.setMaximumHeight(18)
         top_row.addWidget(self.refresh_button)
         top_row.addWidget(self.refresh_status_label, stretch=1)
@@ -526,7 +538,7 @@ class ResearchTab(QWidget):
         self.right_panel_stack.addWidget(self.archive_picker_group)
         self.right_panel_stack.addWidget(self.analysis_detail_group)
         self.main_splitter.addWidget(self.right_panel_stack)
-        self.main_splitter.setSizes([1180, 620])
+        self.main_splitter.setSizes(build_responsive_splitter_sizes(1800, [65, 35], [720, 360]))
 
         self.refresh_button.clicked.connect(self.refresh_research)
         self.ui_constraint_refresh_button.clicked.connect(self.refresh_ui_constraints)
@@ -580,8 +592,10 @@ class ResearchTab(QWidget):
         self._populate_notes_tree()
         self._handle_research_subtab_changed(self.tab_widget.currentIndex())
         self._clear_unknown_preview("Select an unknown DDS file to preview it here.")
+        self._clear_archive_picker_preview("Select a file in Archive Files to preview it here.")
         self.archive_picker_refresh_pending = True
         self.defer_archive_picker_refresh = False
+        QTimer.singleShot(0, self._apply_responsive_splitter_defaults)
 
     def set_theme(self, _theme_key: str) -> None:
         return
@@ -597,7 +611,15 @@ class ResearchTab(QWidget):
             self.resolve_worker.stop()
         if self.unknown_preview_worker is not None:
             self.unknown_preview_worker.stop()
-        for thread in (self.refresh_thread, self.ui_constraint_thread, self.resolve_thread, self.unknown_preview_thread):
+        if self.archive_picker_preview_worker is not None:
+            self.archive_picker_preview_worker.stop()
+        for thread in (
+            self.refresh_thread,
+            self.ui_constraint_thread,
+            self.resolve_thread,
+            self.unknown_preview_thread,
+            self.archive_picker_preview_thread,
+        ):
             _shutdown_thread(thread)
 
     def refresh_archive_picker(self) -> None:
@@ -795,12 +817,16 @@ class ResearchTab(QWidget):
         entry = self._current_archive_picker_entry() if current is not None else None
         if entry is not None:
             self.archive_picker_status_label.setText(f"Selected: {entry.path} ({entry.package_label})")
+            self._render_archive_picker_preview_for_entry(entry)
             return
         if current is not None and self._archive_picker_item_kind(current) == "folder":
             folder_key = self._archive_picker_folder_key(current)
             folder_text = "/".join(folder_key) if folder_key else "/"
             count = len(self.archive_picker_folder_entry_indexes.get(folder_key, []))
             self.archive_picker_status_label.setText(f"Folder: {folder_text} ({count:,} file(s))")
+            self._show_archive_picker_folder_preview(folder_text, count)
+            return
+        self._clear_archive_picker_preview("Select a file in Archive Files to preview it here.")
 
     def use_selected_archive_picker_for_reference(self) -> None:
         self._ensure_archive_picker_ready()
@@ -817,6 +843,180 @@ class ResearchTab(QWidget):
             self.status_message_requested.emit("Select a file in Research -> Archive Files first.", True)
             return
         self._populate_note_target("archive", entry.path)
+
+    def _set_archive_picker_preview_image_controls_enabled(self, enabled: bool) -> None:
+        self.archive_picker_preview_zoom_out_button.setEnabled(enabled)
+        self.archive_picker_preview_zoom_fit_button.setEnabled(enabled)
+        self.archive_picker_preview_zoom_100_button.setEnabled(enabled)
+        self.archive_picker_preview_zoom_in_button.setEnabled(enabled)
+        if not enabled:
+            self.archive_picker_preview_zoom_value.setText("-")
+        else:
+            self._update_archive_picker_preview_zoom_label()
+
+    def _update_archive_picker_preview_zoom_label(self) -> None:
+        if self.archive_picker_preview_fit_to_view:
+            self.archive_picker_preview_zoom_value.setText("Fit")
+        else:
+            self.archive_picker_preview_zoom_value.setText(
+                f"{int(round(self.archive_picker_preview_zoom_factor * 100))}%"
+            )
+
+    def _apply_archive_picker_preview_zoom(self) -> None:
+        self.archive_picker_preview_label.set_fit_to_view(self.archive_picker_preview_fit_to_view)
+        self.archive_picker_preview_label.set_zoom_factor(self.archive_picker_preview_zoom_factor)
+        self._update_archive_picker_preview_zoom_label()
+
+    def _set_archive_picker_preview_fit_mode(self) -> None:
+        self.archive_picker_preview_fit_to_view = True
+        self._apply_archive_picker_preview_zoom()
+
+    def _set_archive_picker_preview_zoom_factor(self, zoom_factor: float) -> None:
+        self.archive_picker_preview_fit_to_view = False
+        self.archive_picker_preview_zoom_factor = min(max(zoom_factor, 0.1), 16.0)
+        self._apply_archive_picker_preview_zoom()
+
+    def _adjust_archive_picker_preview_zoom(self, step: int) -> None:
+        current_zoom = (
+            self.archive_picker_preview_label.current_display_scale()
+            if self.archive_picker_preview_fit_to_view
+            else self.archive_picker_preview_zoom_factor
+        )
+        zoom_steps = [0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0]
+        closest_index = min(range(len(zoom_steps)), key=lambda idx: abs(zoom_steps[idx] - current_zoom))
+        next_index = min(max(closest_index + step, 0), len(zoom_steps) - 1)
+        self._set_archive_picker_preview_zoom_factor(zoom_steps[next_index])
+
+    def _clear_archive_picker_preview(self, message: str) -> None:
+        self.archive_picker_preview_request_id += 1
+        self.pending_archive_picker_preview_request = None
+        self.archive_picker_preview_title_label.setText("Select an archive file")
+        self.archive_picker_preview_meta_label.setText(message)
+        self.archive_picker_preview_warning_label.clear()
+        self.archive_picker_preview_warning_label.setVisible(False)
+        self.archive_picker_preview_info_edit.setPlainText(message)
+        self.archive_picker_preview_text_edit.clear()
+        self.archive_picker_preview_details_edit.clear()
+        self.archive_picker_preview_label.clear_preview(message)
+        self.archive_picker_preview_stack.setCurrentWidget(self.archive_picker_preview_info_edit)
+        self.archive_picker_preview_tabs.setCurrentIndex(0)
+        self._set_archive_picker_preview_image_controls_enabled(False)
+
+    def _show_archive_picker_folder_preview(self, folder_text: str, count: int) -> None:
+        message = f"Folder: {folder_text}\nFiles: {count:,}"
+        self.archive_picker_preview_title_label.setText(folder_text or "/")
+        self.archive_picker_preview_meta_label.setText(f"Folder | {count:,} file(s)")
+        self.archive_picker_preview_warning_label.clear()
+        self.archive_picker_preview_warning_label.setVisible(False)
+        self.archive_picker_preview_info_edit.setPlainText(message)
+        self.archive_picker_preview_details_edit.setPlainText(message)
+        self.archive_picker_preview_label.clear_preview("Select a file to preview it here.")
+        self.archive_picker_preview_stack.setCurrentWidget(self.archive_picker_preview_info_edit)
+        self.archive_picker_preview_tabs.setCurrentIndex(0)
+        self._set_archive_picker_preview_image_controls_enabled(False)
+
+    def _render_archive_picker_preview_for_entry(self, entry: Optional[ArchiveEntry]) -> None:
+        request_id = self.archive_picker_preview_request_id + 1
+        self.archive_picker_preview_request_id = request_id
+        if entry is None:
+            self.pending_archive_picker_preview_request = None
+            self._clear_archive_picker_preview("Select a file in Archive Files to preview it here.")
+            return
+
+        self.archive_picker_preview_title_label.setText(entry.basename)
+        self.archive_picker_preview_meta_label.setText("Loading preview...")
+        self.archive_picker_preview_warning_label.clear()
+        self.archive_picker_preview_warning_label.setVisible(False)
+        self.archive_picker_preview_info_edit.setPlainText("Preparing preview...")
+        self.archive_picker_preview_details_edit.setPlainText("Preparing preview...")
+        self.archive_picker_preview_stack.setCurrentWidget(self.archive_picker_preview_info_edit)
+        self.pending_archive_picker_preview_request = None
+
+        texconv_text = self.get_texconv_path().strip()
+        texconv_path = Path(texconv_text).expanduser() if texconv_text else None
+        if self.archive_picker_preview_thread is not None:
+            self.pending_archive_picker_preview_request = (request_id, entry)
+            if self.archive_picker_preview_worker is not None:
+                self.archive_picker_preview_worker.stop()
+            return
+        self._start_archive_picker_preview_worker(request_id, texconv_path, entry)
+
+    def _start_archive_picker_preview_worker(
+        self,
+        request_id: int,
+        texconv_path: Optional[Path],
+        entry: Optional[ArchiveEntry],
+    ) -> None:
+        worker = UnknownResolverPreviewWorker(request_id, texconv_path, entry)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._handle_archive_picker_preview_ready)
+        worker.error.connect(self._handle_archive_picker_preview_error)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._cleanup_archive_picker_preview_refs)
+        self.archive_picker_preview_worker = worker
+        self.archive_picker_preview_thread = thread
+        thread.start()
+
+    def _handle_archive_picker_preview_ready(self, request_id: int, payload: object) -> None:
+        if request_id != self.archive_picker_preview_request_id:
+            return
+        if isinstance(payload, ArchivePreviewResult):
+            self._apply_archive_picker_preview_result(payload)
+
+    def _handle_archive_picker_preview_error(self, request_id: int, message: str) -> None:
+        if request_id != self.archive_picker_preview_request_id:
+            return
+        self._clear_archive_picker_preview(f"Preview failed: {message}")
+
+    def _cleanup_archive_picker_preview_refs(self) -> None:
+        self.archive_picker_preview_worker = None
+        self.archive_picker_preview_thread = None
+        if self.pending_archive_picker_preview_request is None:
+            return
+        request_id, entry = self.pending_archive_picker_preview_request
+        self.pending_archive_picker_preview_request = None
+        texconv_text = self.get_texconv_path().strip()
+        texconv_path = Path(texconv_text).expanduser() if texconv_text else None
+        self.archive_picker_preview_request_id = request_id
+        self._start_archive_picker_preview_worker(request_id, texconv_path, entry)
+
+    def _apply_archive_picker_preview_result(self, result: ArchivePreviewResult) -> None:
+        title = result.title or "Selected Preview"
+        metadata_summary = result.metadata_summary or "Preview ready."
+        detail_text = result.detail_text or metadata_summary
+        self.archive_picker_preview_title_label.setText(title)
+        self.archive_picker_preview_meta_label.setText(metadata_summary)
+        self.archive_picker_preview_warning_label.setText(result.warning_text)
+        self.archive_picker_preview_warning_label.setVisible(bool(result.warning_text))
+        self.archive_picker_preview_info_edit.setPlainText(detail_text)
+        self.archive_picker_preview_details_edit.setPlainText(detail_text)
+        if result.preferred_view == "image" and (result.preview_image is not None or result.preview_image_path):
+            if result.preview_image is not None:
+                self.archive_picker_preview_label.set_preview_image(result.preview_image, title or "Preview image")
+            else:
+                self.archive_picker_preview_label.set_preview_image_path(
+                    result.preview_image_path, title or "Preview image"
+                )
+            self.archive_picker_preview_stack.setCurrentWidget(self.archive_picker_preview_scroll)
+            self.archive_picker_preview_tabs.setCurrentIndex(0)
+            self._set_archive_picker_preview_image_controls_enabled(True)
+            self._apply_archive_picker_preview_zoom()
+            return
+        if result.preferred_view == "text" and result.preview_text:
+            self.archive_picker_preview_text_edit.setPlainText(result.preview_text)
+            self.archive_picker_preview_stack.setCurrentWidget(self.archive_picker_preview_text_edit)
+            self.archive_picker_preview_tabs.setCurrentIndex(0)
+            self.archive_picker_preview_label.clear_preview("No image preview available.")
+            self._set_archive_picker_preview_image_controls_enabled(False)
+            return
+        self.archive_picker_preview_label.clear_preview("No image preview available.")
+        self.archive_picker_preview_stack.setCurrentWidget(self.archive_picker_preview_info_edit)
+        self.archive_picker_preview_tabs.setCurrentIndex(0)
+        self._set_archive_picker_preview_image_controls_enabled(False)
 
     def _build_archive_snapshot_cache_key(self, entries: Sequence[ArchiveEntry]) -> str:
         if not entries:
@@ -880,7 +1080,8 @@ class ResearchTab(QWidget):
         group_actions.addWidget(self.texture_group_status_label)
         groups_layout.addLayout(group_actions)
 
-        groups_splitter = QSplitter(Qt.Horizontal)
+        self.groups_splitter = QSplitter(Qt.Horizontal)
+        groups_splitter = self.groups_splitter
         groups_splitter.setChildrenCollapsible(False)
         groups_layout.addWidget(groups_splitter, stretch=1)
 
@@ -924,7 +1125,7 @@ class ResearchTab(QWidget):
         self.classifier_tree.header().resizeSection(3, 120)
         classifier_layout.addWidget(self.classifier_tree)
         groups_splitter.addWidget(classifier_group)
-        groups_splitter.setSizes([620, 760])
+        groups_splitter.setSizes(build_responsive_splitter_sizes(1380, [44, 56], [520, 360]))
         sub_tabs.addTab(groups_tab, "Groups")
 
         unknown_tab = QWidget()
@@ -967,7 +1168,8 @@ class ResearchTab(QWidget):
         unknown_filter_row.addWidget(self.unknown_clear_family_selection_button)
         unknown_layout.addLayout(unknown_filter_row)
 
-        unknown_splitter = QSplitter(Qt.Horizontal)
+        self.unknown_splitter = QSplitter(Qt.Horizontal)
+        unknown_splitter = self.unknown_splitter
         unknown_splitter.setChildrenCollapsible(False)
         unknown_layout.addWidget(unknown_splitter, stretch=1)
 
@@ -1120,7 +1322,7 @@ class ResearchTab(QWidget):
         self.unknown_preview_stack.addWidget(self.unknown_preview_scroll)
         self.unknown_preview_stack.addWidget(self.unknown_preview_info_edit)
         unknown_preview_layout.addWidget(self.unknown_preview_stack, stretch=1)
-        unknown_preview_group.setMinimumWidth(520)
+        unknown_preview_group.setMinimumWidth(400)
         unknown_splitter.addWidget(unknown_preview_group)
 
         unknown_details_group = QGroupBox("Details")
@@ -1133,9 +1335,9 @@ class ResearchTab(QWidget):
             "Select a DDS review item to inspect suggestions, sidecars, DDS facts, and approval guidance."
         )
         unknown_details_layout.addWidget(self.unknown_detail_edit, stretch=1)
-        unknown_details_group.setMinimumWidth(360)
+        unknown_details_group.setMinimumWidth(300)
         unknown_splitter.addWidget(unknown_details_group)
-        unknown_splitter.setSizes([620, 980, 540])
+        unknown_splitter.setSizes(build_responsive_splitter_sizes(2160, [28, 47, 25], [360, 400, 300]))
         self.classification_review_tab = unknown_tab
         sub_tabs.addTab(unknown_tab, "Classification Review")
 
@@ -1189,7 +1391,8 @@ class ResearchTab(QWidget):
         controls_layout.addWidget(self.reference_progress)
         reference_layout.addWidget(reference_controls)
 
-        reference_splitter = QSplitter(Qt.Horizontal)
+        self.reference_splitter = QSplitter(Qt.Horizontal)
+        reference_splitter = self.reference_splitter
         reference_splitter.setChildrenCollapsible(False)
         reference_layout.addWidget(reference_splitter, stretch=1)
 
@@ -1225,7 +1428,7 @@ class ResearchTab(QWidget):
         self.sidecar_tree.header().resizeSection(3, 120)
         sidecar_layout.addWidget(self.sidecar_tree)
         reference_splitter.addWidget(sidecar_group)
-        reference_splitter.setSizes([780, 760])
+        reference_splitter.setSizes(build_responsive_splitter_sizes(1540, [52, 48], [520, 360]))
         sub_tabs.addTab(reference_tab, "References")
 
         ui_constraints_tab = QWidget()
@@ -1255,7 +1458,7 @@ class ResearchTab(QWidget):
         self.ui_constraint_progress.setRange(0, 1)
         self.ui_constraint_progress.setValue(0)
         self.ui_constraint_progress.setFormat("Idle")
-        self.ui_constraint_progress.setMaximumWidth(220)
+        self.ui_constraint_progress.setMaximumWidth(180)
         self.ui_constraint_progress.setMaximumHeight(18)
         ui_constraints_actions.addWidget(self.ui_constraint_refresh_button)
         ui_constraints_actions.addWidget(self.ui_constraint_status_label, stretch=1)
@@ -1297,10 +1500,9 @@ class ResearchTab(QWidget):
 
         return tab
 
-    def _build_archive_picker_group(self) -> QGroupBox:
-        group = QGroupBox("Archive Files")
-        layout = QVBoxLayout(group)
-        layout.setContentsMargins(10, 12, 10, 10)
+    def _build_archive_picker_group(self) -> QWidget:
+        group = FlatSectionPanel("Archive Files")
+        layout = group.body_layout
         layout.setSpacing(8)
 
         picker_hint = QLabel(
@@ -1326,6 +1528,14 @@ class ResearchTab(QWidget):
         self.archive_picker_status_label.setObjectName("HintLabel")
         layout.addWidget(self.archive_picker_status_label)
 
+        self.archive_picker_splitter = QSplitter(Qt.Horizontal)
+        self.archive_picker_splitter.setChildrenCollapsible(False)
+        self.archive_picker_splitter.setHandleWidth(8)
+
+        tree_container = QWidget()
+        tree_layout = QVBoxLayout(tree_container)
+        tree_layout.setContentsMargins(0, 0, 0, 0)
+        tree_layout.setSpacing(0)
         self.archive_picker_tree = QTreeWidget()
         self.archive_picker_tree.setHeaderLabels(["Name", "Type", "Package"])
         self.archive_picker_tree.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -1337,7 +1547,77 @@ class ResearchTab(QWidget):
         self.archive_picker_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.archive_picker_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.archive_picker_tree.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        layout.addWidget(self.archive_picker_tree, stretch=1)
+        tree_layout.addWidget(self.archive_picker_tree)
+        self.archive_picker_splitter.addWidget(tree_container)
+
+        preview_group = FlatSectionPanel("Selected Preview")
+        preview_layout = preview_group.body_layout
+        preview_layout.setSpacing(8)
+
+        preview_title_row = QHBoxLayout()
+        preview_title_row.setSpacing(8)
+        self.archive_picker_preview_title_label = QLabel("Select an archive file")
+        self.archive_picker_preview_title_label.setWordWrap(True)
+        self.archive_picker_preview_zoom_out_button = QPushButton("-")
+        self.archive_picker_preview_zoom_fit_button = QPushButton("Fit")
+        self.archive_picker_preview_zoom_100_button = QPushButton("100%")
+        self.archive_picker_preview_zoom_in_button = QPushButton("+")
+        self.archive_picker_preview_zoom_value = QLabel("Fit")
+        self.archive_picker_preview_zoom_value.setObjectName("HintLabel")
+        preview_title_row.addWidget(self.archive_picker_preview_title_label, stretch=1)
+        preview_title_row.addWidget(self.archive_picker_preview_zoom_out_button)
+        preview_title_row.addWidget(self.archive_picker_preview_zoom_fit_button)
+        preview_title_row.addWidget(self.archive_picker_preview_zoom_100_button)
+        preview_title_row.addWidget(self.archive_picker_preview_zoom_in_button)
+        preview_title_row.addWidget(self.archive_picker_preview_zoom_value)
+        preview_layout.addLayout(preview_title_row)
+
+        self.archive_picker_preview_meta_label = QLabel("Select a file in Archive Files to preview it here.")
+        self.archive_picker_preview_meta_label.setWordWrap(True)
+        self.archive_picker_preview_meta_label.setObjectName("HintLabel")
+        preview_layout.addWidget(self.archive_picker_preview_meta_label)
+
+        self.archive_picker_preview_warning_label = QLabel("")
+        self.archive_picker_preview_warning_label.setWordWrap(True)
+        self.archive_picker_preview_warning_label.setObjectName("WarningText")
+        self.archive_picker_preview_warning_label.setVisible(False)
+        preview_layout.addWidget(self.archive_picker_preview_warning_label)
+
+        self.archive_picker_preview_stack = QStackedWidget()
+        self.archive_picker_preview_label = PreviewLabel("Select a file to preview it here.")
+        self.archive_picker_preview_scroll = PreviewScrollArea()
+        self.archive_picker_preview_scroll.setWidgetResizable(False)
+        self.archive_picker_preview_scroll.setAlignment(Qt.AlignCenter)
+        self.archive_picker_preview_scroll.setWidget(self.archive_picker_preview_label)
+        self.archive_picker_preview_label.attach_scroll_area(self.archive_picker_preview_scroll)
+        self.archive_picker_preview_label.set_wheel_zoom_handler(self._adjust_archive_picker_preview_zoom)
+        self.archive_picker_preview_text_edit = QPlainTextEdit()
+        self.archive_picker_preview_text_edit.setReadOnly(True)
+        self.archive_picker_preview_info_edit = QPlainTextEdit()
+        self.archive_picker_preview_info_edit.setReadOnly(True)
+        self.archive_picker_preview_stack.addWidget(self.archive_picker_preview_scroll)
+        self.archive_picker_preview_stack.addWidget(self.archive_picker_preview_text_edit)
+        self.archive_picker_preview_stack.addWidget(self.archive_picker_preview_info_edit)
+
+        self.archive_picker_preview_details_edit = QPlainTextEdit()
+        self.archive_picker_preview_details_edit.setReadOnly(True)
+        self.archive_picker_preview_tabs = QTabWidget()
+        preview_tab = QWidget()
+        preview_tab_layout = QVBoxLayout(preview_tab)
+        preview_tab_layout.setContentsMargins(0, 0, 0, 0)
+        preview_tab_layout.setSpacing(0)
+        preview_tab_layout.addWidget(self.archive_picker_preview_stack)
+        details_tab = QWidget()
+        details_tab_layout = QVBoxLayout(details_tab)
+        details_tab_layout.setContentsMargins(0, 0, 0, 0)
+        details_tab_layout.setSpacing(0)
+        details_tab_layout.addWidget(self.archive_picker_preview_details_edit)
+        self.archive_picker_preview_tabs.addTab(preview_tab, "Preview")
+        self.archive_picker_preview_tabs.addTab(details_tab, "Details")
+        preview_layout.addWidget(self.archive_picker_preview_tabs, stretch=1)
+        self.archive_picker_splitter.addWidget(preview_group)
+        self.archive_picker_splitter.setSizes(build_responsive_splitter_sizes(1200, [55, 45], [360, 300]))
+        layout.addWidget(self.archive_picker_splitter, stretch=1)
 
         self.archive_picker_refresh_button.clicked.connect(self.refresh_archive_picker)
         self.archive_picker_use_reference_button.clicked.connect(self.use_selected_archive_picker_for_reference)
@@ -1349,6 +1629,10 @@ class ResearchTab(QWidget):
             if self._archive_picker_item_kind(item) == "file"
             else None
         )
+        self.archive_picker_preview_zoom_fit_button.clicked.connect(self._set_archive_picker_preview_fit_mode)
+        self.archive_picker_preview_zoom_100_button.clicked.connect(lambda: self._set_archive_picker_preview_zoom_factor(1.0))
+        self.archive_picker_preview_zoom_out_button.clicked.connect(lambda: self._adjust_archive_picker_preview_zoom(-1))
+        self.archive_picker_preview_zoom_in_button.clicked.connect(lambda: self._adjust_archive_picker_preview_zoom(1))
         return group
 
     def _build_texture_tab(self) -> QWidget:
@@ -1384,7 +1668,8 @@ class ResearchTab(QWidget):
         self.analysis_context_label.setObjectName("HintLabel")
         layout.addWidget(self.analysis_context_label)
 
-        splitter = QSplitter(Qt.Horizontal)
+        self.analysis_splitter = QSplitter(Qt.Horizontal)
+        splitter = self.analysis_splitter
         splitter.setChildrenCollapsible(False)
         layout.addWidget(splitter, stretch=1)
 
@@ -1466,7 +1751,7 @@ class ResearchTab(QWidget):
         budget_layout.addWidget(self.budget_tabs, stretch=1)
         splitter.addWidget(budget_group)
 
-        splitter.setSizes([560, 560, 620])
+        splitter.setSizes(build_responsive_splitter_sizes(1740, [32, 32, 36], [320, 320, 360]))
         self.mip_tree.currentItemChanged.connect(self._handle_mip_selection_changed)
         self.normal_tree.currentItemChanged.connect(self._handle_normal_selection_changed)
         self.budget_file_tree.currentItemChanged.connect(self._handle_budget_selection_changed)
@@ -1500,7 +1785,8 @@ class ResearchTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
 
-        splitter = QSplitter(Qt.Horizontal)
+        self.notes_splitter = QSplitter(Qt.Horizontal)
+        splitter = self.notes_splitter
         splitter.setChildrenCollapsible(False)
         layout.addWidget(splitter, stretch=1)
 
@@ -1561,8 +1847,136 @@ class ResearchTab(QWidget):
         self.notes_tree.header().resizeSection(2, 180)
         list_layout.addWidget(self.notes_tree)
         splitter.addWidget(list_group)
-        splitter.setSizes([720, 680])
+        splitter.setSizes(build_responsive_splitter_sizes(1400, [52, 48], [360, 360]))
         return tab
+
+    def apply_responsive_splitter_sizes(self, total_width: Optional[int] = None) -> None:
+        total_width = total_width or max(self.width() - 32, sum([720, 360]))
+        self.main_splitter.setSizes(build_responsive_splitter_sizes(total_width, [65, 35], [720, 360]))
+        if hasattr(self, "groups_splitter"):
+            self.groups_splitter.setSizes(
+                build_responsive_splitter_sizes(max(total_width - 80, 880), [44, 56], [520, 360])
+            )
+        if hasattr(self, "unknown_splitter"):
+            self.unknown_splitter.setSizes(
+                build_responsive_splitter_sizes(max(total_width + 200, 1060), [28, 47, 25], [360, 400, 300])
+            )
+        if hasattr(self, "reference_splitter"):
+            self.reference_splitter.setSizes(
+                build_responsive_splitter_sizes(max(total_width - 40, 880), [52, 48], [520, 360])
+            )
+        if hasattr(self, "analysis_splitter"):
+            self.analysis_splitter.setSizes(
+                build_responsive_splitter_sizes(max(total_width + 120, 1000), [32, 32, 36], [320, 320, 360])
+            )
+        if hasattr(self, "notes_splitter"):
+            self.notes_splitter.setSizes(
+                build_responsive_splitter_sizes(max(total_width - 80, 720), [52, 48], [360, 360])
+            )
+
+    def _auto_fit_tree_columns(
+        self,
+        tree: QTreeWidget,
+        *,
+        stretch_column: int,
+        min_widths: Dict[int, int],
+    ) -> None:
+        header = tree.header()
+        if header is None or tree.columnCount() <= 0:
+            return
+        viewport_width = max(tree.viewport().width(), tree.width() - 24, 0)
+        if viewport_width <= 0:
+            return
+        tree.setUpdatesEnabled(False)
+        try:
+            fixed_width = 0
+            for column in range(tree.columnCount()):
+                if column == stretch_column:
+                    continue
+                width = max(min_widths.get(column, 72), header.sectionSize(column))
+                header.resizeSection(column, width)
+                fixed_width += width
+            header.resizeSection(
+                stretch_column,
+                max(min_widths.get(stretch_column, 220), viewport_width - fixed_width - 12),
+            )
+        finally:
+            tree.setUpdatesEnabled(True)
+
+    def auto_fit_columns(self) -> None:
+        self._auto_fit_tree_columns(self.archive_picker_tree, stretch_column=0, min_widths={0: 260, 1: 90, 2: 110})
+        self._auto_fit_tree_columns(self.texture_group_tree, stretch_column=0, min_widths={0: 280, 1: 86, 2: 150, 3: 120})
+        self._auto_fit_tree_columns(self.classifier_tree, stretch_column=0, min_widths={0: 280, 1: 110, 2: 90, 3: 120, 4: 220})
+        self._auto_fit_tree_columns(self.unknown_group_tree, stretch_column=0, min_widths={0: 280, 1: 180, 2: 120, 3: 120})
+        self._auto_fit_tree_columns(self.unknown_member_tree, stretch_column=0, min_widths={0: 260, 1: 90, 2: 110, 3: 90, 4: 110, 5: 220})
+        self._auto_fit_tree_columns(self.reference_tree, stretch_column=0, min_widths={0: 260, 1: 220, 2: 90, 3: 180, 4: 80, 5: 110})
+        self._auto_fit_tree_columns(self.sidecar_tree, stretch_column=0, min_widths={0: 280, 1: 140, 2: 90, 3: 110, 4: 180})
+        self._auto_fit_tree_columns(self.ui_constraint_tree, stretch_column=0, min_widths={0: 260, 1: 220, 2: 90, 3: 90, 4: 180})
+        self._auto_fit_tree_columns(self.heatmap_tree, stretch_column=0, min_widths={0: 300, 1: 120, 2: 110, 3: 110, 4: 110, 5: 110})
+        self._auto_fit_tree_columns(self.mip_tree, stretch_column=0, min_widths={0: 280, 1: 120, 2: 120, 3: 80, 4: 200})
+        self._auto_fit_tree_columns(self.normal_tree, stretch_column=0, min_widths={0: 280, 1: 120, 2: 110, 3: 90, 4: 220})
+        self._auto_fit_tree_columns(self.budget_file_tree, stretch_column=0, min_widths={0: 280, 1: 100, 2: 80, 3: 120, 4: 100, 5: 80})
+        self._auto_fit_tree_columns(self.budget_class_tree, stretch_column=0, min_widths={0: 180, 1: 90, 2: 110, 3: 90, 4: 100})
+        self._auto_fit_tree_columns(self.budget_group_tree, stretch_column=0, min_widths={0: 240, 1: 90, 2: 110, 3: 90, 4: 80, 5: 100})
+        self._auto_fit_tree_columns(self.budget_profile_tree, stretch_column=0, min_widths={0: 180, 1: 110, 2: 90, 3: 90, 4: 90})
+        self._auto_fit_tree_columns(self.notes_tree, stretch_column=0, min_widths={0: 280, 1: 160, 2: 160, 3: 120})
+
+    def _apply_responsive_splitter_defaults(self) -> None:
+        self.apply_responsive_splitter_sizes()
+
+    def set_main_splitter_sizes(self, sizes: Sequence[int], *, total_width: Optional[int] = None) -> None:
+        available_width = total_width or max(self.width() - 32, sum([720, 360]))
+        self.main_splitter.setSizes(
+            clamp_splitter_sizes(available_width, sizes, [720, 360], fallback_weights=[65, 35])
+        )
+
+    def set_groups_splitter_sizes(self, sizes: Sequence[int], *, total_width: Optional[int] = None) -> None:
+        available_width = max((total_width or max(self.width() - 32, sum([720, 360]))) - 80, 880)
+        self.groups_splitter.setSizes(
+            clamp_splitter_sizes(available_width, sizes, [520, 360], fallback_weights=[44, 56])
+        )
+
+    def set_unknown_splitter_sizes(self, sizes: Sequence[int], *, total_width: Optional[int] = None) -> None:
+        available_width = max((total_width or max(self.width() - 32, sum([720, 360]))) + 200, 1060)
+        self.unknown_splitter.setSizes(
+            clamp_splitter_sizes(available_width, sizes, [360, 400, 300], fallback_weights=[28, 47, 25])
+        )
+
+    def set_reference_splitter_sizes(self, sizes: Sequence[int], *, total_width: Optional[int] = None) -> None:
+        available_width = max((total_width or max(self.width() - 32, sum([720, 360]))) - 40, 880)
+        self.reference_splitter.setSizes(
+            clamp_splitter_sizes(available_width, sizes, [520, 360], fallback_weights=[52, 48])
+        )
+
+    def set_analysis_splitter_sizes(self, sizes: Sequence[int], *, total_width: Optional[int] = None) -> None:
+        available_width = max((total_width or max(self.width() - 32, sum([720, 360]))) + 120, 1000)
+        self.analysis_splitter.setSizes(
+            clamp_splitter_sizes(available_width, sizes, [320, 320, 360], fallback_weights=[32, 32, 36])
+        )
+
+    def set_notes_splitter_sizes(self, sizes: Sequence[int], *, total_width: Optional[int] = None) -> None:
+        available_width = max((total_width or max(self.width() - 32, sum([720, 360]))) - 80, 720)
+        self.notes_splitter.setSizes(
+            clamp_splitter_sizes(available_width, sizes, [360, 360], fallback_weights=[52, 48])
+        )
+
+    def main_splitter_sizes(self) -> List[int]:
+        return self.main_splitter.sizes()
+
+    def groups_splitter_sizes(self) -> List[int]:
+        return self.groups_splitter.sizes()
+
+    def unknown_splitter_sizes(self) -> List[int]:
+        return self.unknown_splitter.sizes()
+
+    def reference_splitter_sizes(self) -> List[int]:
+        return self.reference_splitter.sizes()
+
+    def analysis_splitter_sizes(self) -> List[int]:
+        return self.analysis_splitter.sizes()
+
+    def notes_splitter_sizes(self) -> List[int]:
+        return self.notes_splitter.sizes()
 
     def refresh_research(self) -> None:
         if self.refresh_thread is not None:

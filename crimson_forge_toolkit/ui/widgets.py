@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -66,6 +66,166 @@ def ensure_app_wheel_guard(app: Optional[QApplication]) -> None:
         return
     _wheel_guard = NonIntrusiveWheelGuard(app)
     app.installEventFilter(_wheel_guard)
+
+
+def _rebalance_splitter_sizes(
+    sizes: Sequence[int],
+    minimums: Sequence[int],
+    target_total: int,
+    weights: Optional[Sequence[int]] = None,
+) -> List[int]:
+    count = min(len(sizes), len(minimums))
+    if count <= 0:
+        return []
+    target_total = max(int(target_total), 1)
+    safe_weights = [max(1, int(weights[index])) for index in range(count)] if weights else [1] * count
+    normalized = [max(int(minimums[index]), int(sizes[index])) for index in range(count)]
+    minimum_total = sum(int(minimums[index]) for index in range(count))
+    if target_total <= minimum_total:
+        return [max(1, int(minimums[index])) for index in range(count)]
+
+    total = sum(normalized)
+    if total < target_total:
+        slack = target_total - total
+        order = sorted(range(count), key=lambda index: (safe_weights[index], normalized[index]), reverse=True)
+        cursor = 0
+        while slack > 0:
+            target_index = order[cursor % count]
+            normalized[target_index] += 1
+            slack -= 1
+            cursor += 1
+        return normalized
+
+    excess = total - target_total
+    if excess <= 0:
+        return normalized
+
+    while excess > 0:
+        order = sorted(
+            range(count),
+            key=lambda index: (normalized[index] - int(minimums[index]), safe_weights[index], normalized[index]),
+            reverse=True,
+        )
+        changed = False
+        for target_index in order:
+            available = normalized[target_index] - int(minimums[target_index])
+            if available <= 0:
+                continue
+            reduction = min(available, max(1, excess // max(1, count)))
+            normalized[target_index] -= reduction
+            excess -= reduction
+            changed = True
+            if excess <= 0:
+                break
+        if not changed:
+            break
+    return normalized
+
+
+def build_responsive_splitter_sizes(
+    total_span: int,
+    weights: Sequence[int],
+    minimums: Sequence[int],
+) -> List[int]:
+    count = min(len(weights), len(minimums))
+    if count <= 0:
+        return []
+    safe_weights = [max(1, int(weights[index])) for index in range(count)]
+    safe_minimums = [max(1, int(minimums[index])) for index in range(count)]
+    target_total = max(int(total_span), sum(safe_minimums), count)
+    weight_total = max(sum(safe_weights), 1)
+    sizes = [
+        max(
+            safe_minimums[index],
+            int(round((target_total * safe_weights[index]) / weight_total)),
+        )
+        for index in range(count)
+    ]
+    return _rebalance_splitter_sizes(sizes, safe_minimums, target_total, safe_weights)
+
+
+def clamp_splitter_sizes(
+    total_span: int,
+    sizes: Sequence[int],
+    minimums: Sequence[int],
+    *,
+    fallback_weights: Optional[Sequence[int]] = None,
+) -> List[int]:
+    count = len(minimums)
+    if count <= 0:
+        return []
+    safe_minimums = [max(1, int(value)) for value in minimums]
+    target_total = max(int(total_span), sum(safe_minimums), count)
+    if len(sizes) < count:
+        return build_responsive_splitter_sizes(
+            target_total,
+            fallback_weights or [1] * count,
+            safe_minimums,
+        )
+    candidate = []
+    for index in range(count):
+        try:
+            value = int(sizes[index])
+        except (TypeError, ValueError):
+            return build_responsive_splitter_sizes(
+                target_total,
+                fallback_weights or [1] * count,
+                safe_minimums,
+            )
+        if value <= 0:
+            return build_responsive_splitter_sizes(
+                target_total,
+                fallback_weights or [1] * count,
+                safe_minimums,
+            )
+        candidate.append(value)
+    current_total = sum(candidate)
+    if current_total <= 0:
+        return build_responsive_splitter_sizes(
+            target_total,
+            fallback_weights or [1] * count,
+            safe_minimums,
+        )
+    if current_total != target_total:
+        scale = target_total / current_total
+        candidate = [max(1, int(round(value * scale))) for value in candidate]
+    return _rebalance_splitter_sizes(
+        candidate,
+        safe_minimums,
+        target_total,
+        fallback_weights or [1] * count,
+    )
+
+
+class FlatSectionPanel(QWidget):
+    """Simple titled panel without QGroupBox title-over-border rendering."""
+
+    def __init__(self, title: str, *, body_margins: Tuple[int, int, int, int] = (10, 10, 10, 10), body_spacing: int = 8):
+        super().__init__()
+        self.setObjectName("FlatSectionPanel")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 4, 0, 0)
+        outer_layout.setSpacing(2)
+
+        self.header_widget = QWidget()
+        self.header_widget.setObjectName("FlatSectionHeader")
+        header_layout = QHBoxLayout(self.header_widget)
+        header_layout.setContentsMargins(14, 0, 0, 0)
+        header_layout.setSpacing(0)
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("FlatSectionTitle")
+        self.title_label.setWordWrap(True)
+        header_layout.addWidget(self.title_label, alignment=Qt.AlignLeft | Qt.AlignTop)
+        header_layout.addStretch(1)
+        outer_layout.addWidget(self.header_widget)
+
+        self.body_frame = QFrame()
+        self.body_frame.setObjectName("FlatSectionBody")
+        self.body_layout = QVBoxLayout(self.body_frame)
+        self.body_layout.setContentsMargins(*body_margins)
+        self.body_layout.setSpacing(body_spacing)
+        outer_layout.addWidget(self.body_frame, stretch=1)
 
 
 class PreviewLabel(QLabel):
@@ -638,7 +798,7 @@ class CodePreviewEditor(QPlainTextEdit):
         super().__init__(parent)
         self.theme_key = theme_key
         self._match_selections: list[QTextEdit.ExtraSelection] = []
-        self._editor_font_size = 10
+        self._editor_font_size = max(8, self.font().pointSize())
         self.line_number_area = _LineNumberArea(self)
         self.syntax_highlighter = PreviewSyntaxHighlighter(self.document(), theme_key)
         self.setReadOnly(True)
@@ -764,6 +924,14 @@ class CodePreviewEditor(QPlainTextEdit):
         self._apply_editor_font(font)
         return self._editor_font_size
 
+    def apply_font_preferences(self, font: QFont, *, preserve_size: bool = False) -> None:
+        updated_font = QFont(font)
+        if preserve_size:
+            updated_font.setPointSize(self._editor_font_size)
+        else:
+            self._editor_font_size = max(8, min(22, updated_font.pointSize()))
+        self._apply_editor_font(updated_font)
+
     def center_on_span(self, start: int, end: int) -> None:
         cursor = self.textCursor()
         cursor.setPosition(max(0, start))
@@ -811,6 +979,8 @@ class LogHighlighter(QSyntaxHighlighter):
 
     def __init__(self, document, theme_key: str):
         super().__init__(document)
+        self.current_theme_key = theme_key
+        self._bold_enabled = True
         self.timestamp_format = QTextCharFormat()
         self.error_format = QTextCharFormat()
         self.warning_format = QTextCharFormat()
@@ -831,6 +1001,7 @@ class LogHighlighter(QSyntaxHighlighter):
         self.set_theme(theme_key)
 
     def set_theme(self, theme_key: str) -> None:
+        self.current_theme_key = theme_key
         theme = get_theme(theme_key)
         light = _theme_is_light(theme_key)
 
@@ -843,7 +1014,7 @@ class LogHighlighter(QSyntaxHighlighter):
         ) -> QTextCharFormat:
             fmt = QTextCharFormat()
             fmt.setForeground(QColor(color))
-            if bold:
+            if bold and self._bold_enabled:
                 fmt.setFontWeight(QFont.Bold)
             fmt.setFontItalic(italic)
             if background is not None:
@@ -891,6 +1062,10 @@ class LogHighlighter(QSyntaxHighlighter):
             for texture_type, color in texture_palette.items()
         }
         self.rehighlight()
+
+    def set_bold_enabled(self, enabled: bool) -> None:
+        self._bold_enabled = bool(enabled)
+        self.set_theme(self.current_theme_key)
 
     def highlightBlock(self, text: str) -> None:  # type: ignore[override]
         lowered = text.lower()
@@ -1002,14 +1177,17 @@ class QuickStartDialog(QDialog):
         super().__init__(parent)
         self.parent_window = parent
         self.setWindowTitle("Quick Start")
-        self.resize(780, 620)
+        self.setMinimumSize(560, 460)
+        self.resize(720, 560)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
 
         title_label = QLabel("First-run guide")
-        title_label.setStyleSheet("font-size: 16px; font-weight: 600;")
+        title_font = QFont(self.font())
+        title_font.setBold(True)
+        title_label.setFont(title_font)
         layout.addWidget(title_label)
 
         intro_label = QLabel(
@@ -1083,7 +1261,7 @@ class QuickStartDialog(QDialog):
               <li>Brush presets, custom saved presets, brush tips, roundness/angle/smoothing controls, and patterned brush footprints are there to make paint/erase/clone/heal/smudge/dodge-burn work feel more like a real texture editor instead of one fixed round brush.</li>
               <li><b>Gradient</b>, <b>Patch</b>, <b>Smudge</b>, and <b>Dodge/Burn</b> are meant for common texture cleanup and blending tasks that would otherwise push you into Photoshop.</li>
               <li>Use the <b>Channels</b> section when you only want to paint/fill/recolor into `RGB`, `Alpha`, or a subset of channels.</li>
-              <li>Use <b>Open in Compare</b> from the editor if you want to review the edited texture against the original source.</li>
+              <li>When you want to review results, use the main <b>Compare</b> tab after sending the edited output into <b>Replace Assistant</b> or <b>Texture Workflow</b>.</li>
               <li>When you are happy with the edit, send it to <b>Replace Assistant</b> for one-off replacement packaging or <b>Texture Workflow</b> for the wider DDS rebuild pipeline.</li>
             </ul>
             <h3>Common failure causes</h3>
@@ -1128,14 +1306,17 @@ class AboutDialog(QDialog):
     def __init__(self, parent, *, title: str, html: str):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(760, 620)
+        self.setMinimumSize(540, 440)
+        self.resize(720, 560)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
 
         title_label = QLabel(title)
-        title_label.setStyleSheet("font-size: 16px; font-weight: 600;")
+        title_font = QFont(self.font())
+        title_font.setBold(True)
+        title_label.setFont(title_font)
         layout.addWidget(title_label)
 
         browser = QTextBrowser()

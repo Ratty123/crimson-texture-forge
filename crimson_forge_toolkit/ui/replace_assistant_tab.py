@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QGridLayout,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -80,7 +81,20 @@ from crimson_forge_toolkit.models import (
     ReplaceAssistantReviewItem,
     TextureEditorSourceBinding,
 )
-from crimson_forge_toolkit.ui.widgets import PreviewLabel, PreviewScrollArea
+from crimson_forge_toolkit.ui.widgets import (
+    FlatSectionPanel,
+    PreviewLabel,
+    PreviewScrollArea,
+    clamp_splitter_sizes,
+    build_responsive_splitter_sizes,
+)
+
+
+def _shutdown_thread(thread: Optional[QThread], *, grace_ms: int = 1200) -> None:
+    if thread is None:
+        return
+    thread.quit()
+    thread.wait(grace_ms)
 
 
 class ReplaceAssistantPreviewWorker(QObject):
@@ -510,7 +524,7 @@ class ReplaceAssistantReviewDialog(QDialog):
         self.pending_item: Optional[ReplaceAssistantReviewItem] = None
 
         self.setWindowTitle("Replace Assistant Review")
-        self.resize(1480, 900)
+        self.resize(1320, 820)
 
         root_layout = QHBoxLayout(self)
         root_layout.setContentsMargins(10, 10, 10, 10)
@@ -525,7 +539,7 @@ class ReplaceAssistantReviewDialog(QDialog):
         queue_hint.setObjectName("HintLabel")
         queue_layout.addWidget(queue_hint)
         self.item_list = QListWidget()
-        self.item_list.setMinimumWidth(320)
+        self.item_list.setMinimumWidth(280)
         self.item_list.setAlternatingRowColors(True)
         self.item_list.setTextElideMode(Qt.ElideMiddle)
         for item in self.review_items:
@@ -588,7 +602,7 @@ class ReplaceAssistantReviewDialog(QDialog):
         output_layout.addWidget(self.metadata_browser, stretch=0)
         output_layout.addWidget(self.details_browser, stretch=1)
         compare_splitter.addWidget(output_panel)
-        compare_splitter.setSizes([700, 780])
+        compare_splitter.setSizes(build_responsive_splitter_sizes(1480, [47, 53], [320, 360]))
 
         self.item_list.currentRowChanged.connect(self._handle_row_changed)
 
@@ -835,23 +849,11 @@ class ReplaceAssistantTab(QWidget):
 
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(10, 10, 10, 10)
-        root_layout.setSpacing(8)
-
-        title = QLabel("Replace Assistant")
-        title.setStyleSheet("font-size: 16px; font-weight: 600;")
-        root_layout.addWidget(title)
-
-        subtitle = QLabel(
-            "Import edited PNG or DDS files, match them to the original game DDS, preview the result, and export a mod-ready loose package."
-        )
-        subtitle.setWordWrap(True)
-        subtitle.setObjectName("HintLabel")
-        root_layout.addWidget(subtitle)
+        root_layout.setSpacing(6)
 
         self.summary_label = QLabel("No files imported yet.")
         self.summary_label.setWordWrap(True)
         self.summary_label.setObjectName("HintLabel")
-        root_layout.addWidget(self.summary_label)
 
         button_row = QHBoxLayout()
         button_row.setSpacing(8)
@@ -873,6 +875,7 @@ class ReplaceAssistantTab(QWidget):
         button_row.addWidget(self.clear_all_button)
         button_row.addStretch(1)
         root_layout.addLayout(button_row)
+        root_layout.addWidget(self.summary_label)
 
         self.main_splitter = QSplitter(Qt.Horizontal)
         self.main_splitter.setChildrenCollapsible(False)
@@ -883,22 +886,36 @@ class ReplaceAssistantTab(QWidget):
         queue_layout = QVBoxLayout(self.queue_panel)
         queue_layout.setContentsMargins(0, 0, 0, 0)
         queue_layout.setSpacing(8)
-        queue_group = QGroupBox("Replace Queue")
-        queue_group_layout = QVBoxLayout(queue_group)
-        queue_group_layout.setContentsMargins(10, 12, 10, 10)
-        queue_group_layout.setSpacing(8)
+        queue_group = FlatSectionPanel("Replace Queue")
+        queue_group_layout = queue_group.body_layout
         self.queue_tree = QTreeWidget()
         self.queue_tree.setRootIsDecorated(False)
         self.queue_tree.setAlternatingRowColors(True)
         self.queue_tree.setUniformRowHeights(True)
         self.queue_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.queue_tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.queue_tree.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.queue_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.queue_tree.setTextElideMode(Qt.ElideMiddle)
         self.queue_tree.setHeaderLabels(["Edited File", "Original", "Package", "Kind", "Status"])
-        self.queue_tree.header().resizeSection(0, 280)
-        self.queue_tree.header().resizeSection(1, 220)
-        self.queue_tree.header().resizeSection(2, 90)
-        self.queue_tree.header().resizeSection(3, 70)
-        self.queue_tree.header().resizeSection(4, 220)
+        queue_header = self.queue_tree.header()
+        queue_header.setStretchLastSection(False)
+        queue_header.setSectionsMovable(True)
+        queue_header.setSectionsClickable(True)
+        queue_header.setMinimumSectionSize(72)
+        queue_header.setSectionResizeMode(0, QHeaderView.Interactive)
+        queue_header.setSectionResizeMode(1, QHeaderView.Interactive)
+        queue_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        queue_header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        queue_header.setSectionResizeMode(4, QHeaderView.Interactive)
+        queue_header.resizeSection(0, 320)
+        queue_header.resizeSection(1, 260)
+        queue_header.resizeSection(2, 90)
+        queue_header.resizeSection(3, 70)
+        queue_header.resizeSection(4, 220)
+        self.queue_tree.setToolTip(
+            "Columns can be resized or reordered. Use the horizontal scrollbar when the queue is narrower than the full column set."
+        )
         queue_group_layout.addWidget(self.queue_tree)
         queue_layout.addWidget(queue_group)
         self.main_splitter.addWidget(self.queue_panel)
@@ -907,10 +924,8 @@ class ReplaceAssistantTab(QWidget):
         preview_layout = QVBoxLayout(self.preview_panel)
         preview_layout.setContentsMargins(0, 0, 0, 0)
         preview_layout.setSpacing(8)
-        preview_group = QGroupBox("Preview")
-        preview_group_layout = QVBoxLayout(preview_group)
-        preview_group_layout.setContentsMargins(10, 12, 10, 10)
-        preview_group_layout.setSpacing(8)
+        preview_group = FlatSectionPanel("Preview")
+        preview_group_layout = preview_group.body_layout
         preview_title_row = QHBoxLayout()
         preview_title_row.setSpacing(8)
         self.preview_title_label = QLabel("Select an imported file")
@@ -938,8 +953,8 @@ class ReplaceAssistantTab(QWidget):
         self.preview_warning_label.setVisible(False)
         preview_group_layout.addWidget(self.preview_warning_label)
         self.preview_label = PreviewLabel("Select a file to preview it here.")
-        self.preview_label.setMinimumHeight(420)
-        self.preview_label.setMinimumWidth(420)
+        self.preview_label.setMinimumHeight(320)
+        self.preview_label.setMinimumWidth(320)
         self.preview_scroll = PreviewScrollArea()
         self.preview_scroll.setWidgetResizable(False)
         self.preview_scroll.setAlignment(Qt.AlignCenter)
@@ -955,13 +970,13 @@ class ReplaceAssistantTab(QWidget):
         self.main_splitter.addWidget(self.preview_panel)
 
         self.settings_panel = QWidget()
-        self.settings_panel.setMinimumWidth(620)
+        self.settings_panel.setMinimumWidth(420)
         settings_layout = QVBoxLayout(self.settings_panel)
         settings_layout.setContentsMargins(0, 0, 0, 0)
         settings_layout.setSpacing(8)
 
-        build_group = QGroupBox("Build Settings")
-        build_layout = QGridLayout(build_group)
+        build_group = FlatSectionPanel("Build Settings", body_margins=(10, 10, 10, 10), body_spacing=0)
+        build_layout = QGridLayout()
         build_layout.setHorizontalSpacing(10)
         build_layout.setVerticalSpacing(8)
         build_layout.setColumnMinimumWidth(0, 136)
@@ -999,10 +1014,11 @@ class ReplaceAssistantTab(QWidget):
         build_layout.addWidget(self.mirror_workflow_button, 5, 0)
         build_layout.addWidget(self.build_package_button, 5, 1)
         build_layout.addWidget(self.open_output_folder_button, 6, 0, 1, 2)
+        build_group.body_layout.addLayout(build_layout)
         settings_layout.addWidget(build_group)
 
-        package_group = QGroupBox("Package Info")
-        package_layout = QGridLayout(package_group)
+        package_group = FlatSectionPanel("Package Info", body_margins=(10, 10, 10, 10), body_spacing=0)
+        package_layout = QGridLayout()
         package_layout.setHorizontalSpacing(10)
         package_layout.setVerticalSpacing(8)
         package_layout.setColumnMinimumWidth(0, 110)
@@ -1022,10 +1038,11 @@ class ReplaceAssistantTab(QWidget):
         package_layout.addWidget(self.package_description_edit, 3, 1)
         package_layout.addWidget(QLabel("Nexus URL"), 4, 0)
         package_layout.addWidget(self.package_nexus_edit, 4, 1)
+        package_group.body_layout.addLayout(package_layout)
         settings_layout.addWidget(package_group)
 
-        self.ncnn_group = QGroupBox("Direct Upscale Controls (NCNN only)")
-        ncnn_layout = QGridLayout(self.ncnn_group)
+        self.ncnn_group = FlatSectionPanel("Direct Upscale Controls (NCNN only)", body_margins=(10, 10, 10, 10), body_spacing=0)
+        ncnn_layout = QGridLayout()
         ncnn_layout.setHorizontalSpacing(10)
         ncnn_layout.setVerticalSpacing(8)
         ncnn_layout.setColumnMinimumWidth(0, 136)
@@ -1101,6 +1118,7 @@ class ReplaceAssistantTab(QWidget):
         ncnn_layout.addWidget(self.enable_automatic_texture_rules_checkbox, 8, 0, 1, 2)
         ncnn_layout.addWidget(self.enable_unsafe_technical_override_checkbox, 9, 0, 1, 2)
         ncnn_layout.addWidget(self.retry_smaller_tile_checkbox, 10, 0, 1, 2)
+        self.ncnn_group.body_layout.addLayout(ncnn_layout)
         settings_layout.addWidget(self.ncnn_group)
 
         self.progress_bar = QProgressBar()
@@ -1122,15 +1140,16 @@ class ReplaceAssistantTab(QWidget):
         self.settings_scroll = QScrollArea()
         self.settings_scroll.setWidgetResizable(True)
         self.settings_scroll.setWidget(self.settings_panel)
+        self.settings_scroll.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.settings_scroll.setMinimumWidth(640)
+        self.settings_scroll.setMinimumWidth(420)
         self.main_splitter.addWidget(self.settings_scroll)
-        self.queue_panel.setMinimumWidth(360)
-        self.preview_panel.setMinimumWidth(520)
+        self.queue_panel.setMinimumWidth(280)
+        self.preview_panel.setMinimumWidth(360)
         self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 1)
         self.main_splitter.setStretchFactor(2, 0)
-        self.main_splitter.setSizes([420, 680, 700])
+        self.main_splitter.setSizes(build_responsive_splitter_sizes(1800, [24, 34, 42], [280, 360, 420]))
 
         self.add_files_button.clicked.connect(self.import_files)
         self.add_folder_button.clicked.connect(self.import_folder)
@@ -1191,6 +1210,66 @@ class ReplaceAssistantTab(QWidget):
         self._sync_build_mode_visibility()
         self._update_summary()
         self._update_controls()
+        QTimer.singleShot(0, self._apply_responsive_splitter_defaults)
+
+    def _apply_responsive_splitter_defaults(self) -> None:
+        total_width = max(self.width() - 32, sum([280, 360, 420]))
+        self.main_splitter.setSizes(
+            build_responsive_splitter_sizes(total_width, [24, 34, 42], [280, 360, 420])
+        )
+
+    def set_splitter_sizes(self, sizes: Sequence[int], *, total_width: Optional[int] = None) -> None:
+        if not sizes:
+            return
+        available_width = total_width or max(self.width() - 32, sum([280, 360, 420]))
+        self.main_splitter.setSizes(
+            clamp_splitter_sizes(
+                available_width,
+                sizes,
+                [280, 360, 420],
+                fallback_weights=[24, 34, 42],
+            )
+        )
+
+    def splitter_sizes(self) -> List[int]:
+        return self.main_splitter.sizes()
+
+    def apply_responsive_splitter_sizes(self, total_width: Optional[int] = None) -> None:
+        available_width = total_width or max(self.width() - 32, sum([280, 360, 420]))
+        self.main_splitter.setSizes(
+            build_responsive_splitter_sizes(available_width, [24, 34, 42], [280, 360, 420])
+        )
+
+    def auto_fit_columns(self) -> None:
+        header = self.queue_tree.header()
+        if header is None or self.queue_tree.columnCount() <= 0:
+            return
+        viewport_width = max(self.queue_tree.viewport().width(), self.queue_tree.width() - 24, 0)
+        if viewport_width <= 0:
+            return
+        minimums = {
+            0: 260,
+            1: 220,
+            2: 96,
+            3: 72,
+            4: 160,
+        }
+        self.queue_tree.setUpdatesEnabled(False)
+        try:
+            for column in (2, 3):
+                self.queue_tree.resizeColumnToContents(column)
+                header.resizeSection(column, max(minimums[column], header.sectionSize(column)))
+            reserved = header.sectionSize(2) + header.sectionSize(3)
+            remaining = max(0, viewport_width - reserved - 12)
+            preferred = {
+                0: max(minimums[0], int(remaining * 0.42)),
+                1: max(minimums[1], int(remaining * 0.31)),
+                4: max(minimums[4], remaining - int(remaining * 0.42) - int(remaining * 0.31)),
+            }
+            for column in (0, 1, 4):
+                header.resizeSection(column, preferred[column])
+        finally:
+            self.queue_tree.setUpdatesEnabled(True)
 
     def _add_combo_choice(self, combo: QComboBox, label: str, value: str) -> None:
         combo.addItem(label, value)
@@ -1258,13 +1337,7 @@ class ReplaceAssistantTab(QWidget):
         if self.build_worker is not None:
             self.build_worker.stop()
         for thread in (self.preview_thread, self.import_thread, self.match_thread, self.ui_constraint_thread, self.build_thread):
-            if thread is None:
-                continue
-            thread.quit()
-            if thread.wait(250):
-                continue
-            thread.terminate()
-            thread.wait(150)
+            _shutdown_thread(thread)
 
     def schedule_settings_save(self) -> None:
         if not self._settings_ready:
@@ -2047,7 +2120,8 @@ class ReplaceAssistantTab(QWidget):
         self.append_log("Auto-matching edited files against archive/original DDS paths...")
         try:
             self._ensure_archive_index_current()
-            for item in self.items:
+            ambiguous_indices: List[int] = []
+            for index, item in enumerate(self.items):
                 matched = match_replace_assistant_original(item.source_path, self.archive_index)
                 if matched.archive_entry is not None or matched.original_dds_path is not None:
                     item.matched_original = matched
@@ -2061,6 +2135,8 @@ class ReplaceAssistantTab(QWidget):
                     item.status = "unresolved"
                     item.status_detail = matched.match_reason or "unmatched"
                     item.warning = matched.match_reason if matched.match_reason.startswith("ambiguous") else ""
+                    if matched.match_reason.startswith("ambiguous"):
+                        ambiguous_indices.append(index)
             self._refresh_queue_tree()
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setValue(1)
@@ -2073,6 +2149,8 @@ class ReplaceAssistantTab(QWidget):
             self.append_log(
                 f"Auto-match complete. Matched {matched_count:,} item(s), unresolved {unresolved_count:,}."
             )
+            if ambiguous_indices:
+                self._prompt_resolve_ambiguous_items(ambiguous_indices)
             self.preview_refresh_suspended = False
             if refresh_preview and self.queue_tree.currentItem() is not None:
                 self._handle_selection_changed(self.queue_tree.currentItem(), None)
@@ -2081,6 +2159,64 @@ class ReplaceAssistantTab(QWidget):
             self._handle_import_error(str(exc))
         finally:
             self._update_controls()
+
+    def _prompt_resolve_ambiguous_items(self, indices: Sequence[int]) -> None:
+        ambiguous_indices = [index for index in indices if 0 <= index < len(self.items)]
+        if not ambiguous_indices:
+            return
+        count = len(ambiguous_indices)
+        box = QMessageBox(self)
+        box.setWindowTitle("Choose Original DDS")
+        box.setIcon(QMessageBox.Question)
+        if count == 1:
+            item = self.items[ambiguous_indices[0]]
+            box.setText("Multiple possible original DDS files were found for this edited file.")
+            box.setInformativeText(
+                f"{item.source_path.name}\n\n"
+                "The imported file does not contain a unique path match, so you need to choose the correct original DDS."
+            )
+        else:
+            box.setText(f"{count:,} imported file(s) matched multiple possible original DDS files.")
+            box.setInformativeText(
+                "These files do not contain a unique path match, so you need to choose the correct original DDS for each one."
+            )
+        choose_button = box.addButton("Choose Now", QMessageBox.AcceptRole)
+        later_button = box.addButton("Later", QMessageBox.RejectRole)
+        box.setDefaultButton(choose_button)
+        box.exec()
+        if box.clickedButton() != choose_button:
+            return
+        current_tree_item = self.queue_tree.currentItem()
+        current_source_key = str(current_tree_item.data(0, Qt.UserRole) or "") if current_tree_item is not None else ""
+        changed = False
+        for index in ambiguous_indices:
+            if not (0 <= index < len(self.items)):
+                continue
+            item = self.items[index]
+            entry = self._pick_archive_original(item)
+            if entry is None:
+                break
+            match_replace_assistant_item_to_archive_entry(item, entry)
+            changed = True
+        if not changed:
+            return
+        self._refresh_queue_tree()
+        if current_source_key:
+            for row in range(self.queue_tree.topLevelItemCount()):
+                row_item = self.queue_tree.topLevelItem(row)
+                if row_item is None:
+                    continue
+                if str(row_item.data(0, Qt.UserRole) or "") == current_source_key:
+                    self.queue_tree.setCurrentItem(row_item)
+                    break
+        matched_count = sum(1 for item in self.items if item.status == "matched")
+        unresolved_count = sum(1 for item in self.items if item.status == "unresolved")
+        self.status_label.setText(
+            f"Auto-match complete. Matched {matched_count:,} item(s), unresolved {unresolved_count:,}."
+        )
+        self.append_log(
+            f"Ambiguous match review updated. Matched {matched_count:,} item(s), unresolved {unresolved_count:,}."
+        )
 
     def _handle_auto_match_complete(self, payload: object, refresh_preview: bool) -> None:
         if not isinstance(payload, dict):

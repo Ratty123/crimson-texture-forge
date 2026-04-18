@@ -4,7 +4,12 @@ from typing import Dict
 
 from PySide6.QtGui import QColor, QPalette
 
-from crimson_forge_toolkit.constants import DEFAULT_UI_THEME
+from crimson_forge_toolkit.constants import (
+    DEFAULT_UI_DATA_FONT_SIZE,
+    DEFAULT_UI_DENSITY,
+    DEFAULT_UI_FONT_SIZE,
+    DEFAULT_UI_THEME,
+)
 
 UI_THEME_SCHEMES: Dict[str, Dict[str, str]] = {
     "graphite": {
@@ -196,6 +201,98 @@ def get_theme(key: str) -> Dict[str, str]:
     return UI_THEME_SCHEMES.get(key, UI_THEME_SCHEMES[DEFAULT_UI_THEME])
 
 
+def _clamp_font_size(value: int, default: int) -> int:
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError):
+        return int(default)
+    return max(9, min(16, numeric))
+
+
+def _density_metrics(density_key: str) -> Dict[str, int]:
+    density = (density_key or DEFAULT_UI_DENSITY).strip().lower()
+    if density == "comfortable":
+        return {
+            "menu_pad_y": 5,
+            "menu_pad_x": 10,
+            "menu_item_pad_y": 6,
+            "menu_item_pad_x": 12,
+            "group_margin_top": 18,
+            "group_pad_top": 12,
+            "group_title_pad_y": 1,
+            "group_title_pad_x": 8,
+            "section_pad_y": 8,
+            "section_pad_x": 10,
+            "field_pad_y": 6,
+            "field_pad_x": 9,
+            "list_pad_y": 4,
+            "list_pad_x": 6,
+            "header_pad_y": 6,
+            "header_pad_x": 8,
+            "button_pad_y": 7,
+            "button_pad_x": 12,
+            "button_min_h": 22,
+            "progress_min_h": 24,
+            "tab_pad_top": 8,
+            "tab_pad_bottom": 9,
+            "tab_pad_x": 14,
+            "tab_min_h": 24,
+        }
+    if density == "normal":
+        return {
+            "menu_pad_y": 4,
+            "menu_pad_x": 9,
+            "menu_item_pad_y": 5,
+            "menu_item_pad_x": 10,
+            "group_margin_top": 15,
+            "group_pad_top": 10,
+            "group_title_pad_y": 0,
+            "group_title_pad_x": 7,
+            "section_pad_y": 6,
+            "section_pad_x": 9,
+            "field_pad_y": 5,
+            "field_pad_x": 8,
+            "list_pad_y": 3,
+            "list_pad_x": 5,
+            "header_pad_y": 5,
+            "header_pad_x": 7,
+            "button_pad_y": 5,
+            "button_pad_x": 10,
+            "button_min_h": 18,
+            "progress_min_h": 20,
+            "tab_pad_top": 6,
+            "tab_pad_bottom": 7,
+            "tab_pad_x": 12,
+            "tab_min_h": 20,
+        }
+    return {
+        "menu_pad_y": 3,
+        "menu_pad_x": 8,
+        "menu_item_pad_y": 4,
+        "menu_item_pad_x": 9,
+        "group_margin_top": 13,
+        "group_pad_top": 8,
+        "group_title_pad_y": 0,
+        "group_title_pad_x": 6,
+        "section_pad_y": 5,
+        "section_pad_x": 8,
+        "field_pad_y": 4,
+        "field_pad_x": 7,
+        "list_pad_y": 2,
+        "list_pad_x": 5,
+        "header_pad_y": 4,
+        "header_pad_x": 6,
+        "button_pad_y": 4,
+        "button_pad_x": 8,
+        "button_min_h": 16,
+        "progress_min_h": 18,
+        "tab_pad_top": 5,
+        "tab_pad_bottom": 6,
+        "tab_pad_x": 10,
+        "tab_min_h": 18,
+    }
+
+
 def build_app_palette(theme_key: str) -> QPalette:
     theme = get_theme(theme_key)
     palette = QPalette()
@@ -219,11 +316,21 @@ def build_app_palette(theme_key: str) -> QPalette:
     return palette
 
 
-def build_app_stylesheet(theme_key: str) -> str:
+def build_app_stylesheet(
+    theme_key: str,
+    *,
+    base_font_size: int = DEFAULT_UI_FONT_SIZE,
+    data_font_size: int = DEFAULT_UI_DATA_FONT_SIZE,
+    density_key: str = DEFAULT_UI_DENSITY,
+) -> str:
     theme = get_theme(theme_key)
+    base_size = _clamp_font_size(base_font_size, DEFAULT_UI_FONT_SIZE)
+    table_size = _clamp_font_size(data_font_size, base_size)
+    hint_size = max(9, base_size - 1)
+    metrics = _density_metrics(density_key)
     return f"""
     QWidget {{
-        font-size: 12px;
+        font-size: {base_size}px;
         color: {theme["text"]};
     }}
     QMainWindow, QWidget#AppRoot {{
@@ -237,7 +344,7 @@ def build_app_stylesheet(theme_key: str) -> str:
     }}
     QMenuBar::item {{
         background: transparent;
-        padding: 5px 10px;
+        padding: {metrics["menu_pad_y"]}px {metrics["menu_pad_x"]}px;
         border-radius: 4px;
     }}
     QMenuBar::item:selected {{
@@ -250,7 +357,7 @@ def build_app_stylesheet(theme_key: str) -> str:
         padding: 4px;
     }}
     QMenu::item {{
-        padding: 6px 18px 6px 12px;
+        padding: {metrics["menu_item_pad_y"]}px 16px {metrics["menu_item_pad_y"]}px {metrics["menu_item_pad_x"]}px;
         border-radius: 4px;
     }}
     QMenu::item:selected {{
@@ -260,22 +367,41 @@ def build_app_stylesheet(theme_key: str) -> str:
     QLabel, QCheckBox, QToolButton {{
         background: transparent;
     }}
+    QWidget#FlatSectionPanel {{
+        background: {theme["surface"]};
+    }}
+    QWidget#FlatSectionHeader {{
+        background: transparent;
+    }}
+    QLabel#FlatSectionTitle {{
+        color: {theme["text_strong"]};
+        font-weight: 600;
+        background: transparent;
+        padding: 0px {metrics["group_title_pad_x"] + 2}px 1px {metrics["group_title_pad_x"] + 2}px;
+        border: none;
+    }}
+    QFrame#FlatSectionBody {{
+        background: {theme["surface"]};
+        border: 1px solid {theme["border"]};
+        border-radius: 5px;
+    }}
     QGroupBox {{
         border: 1px solid {theme["border"]};
         border-radius: 5px;
-        margin-top: 18px;
-        padding-top: 12px;
+        margin-top: {max(18, metrics["group_margin_top"] + 5)}px;
+        padding-top: {max(10, metrics["group_pad_top"] + 1)}px;
         font-weight: 600;
         background: {theme["surface"]};
     }}
     QGroupBox::title {{
         subcontrol-origin: margin;
         subcontrol-position: top left;
-        left: 12px;
-        top: 1px;
-        padding: 1px 8px 2px 8px;
+        left: 14px;
+        top: 0px;
+        margin: 0px;
+        padding: 0px {metrics["group_title_pad_x"] + 2}px 1px {metrics["group_title_pad_x"] + 2}px;
         color: {theme["text_strong"]};
-        background: {theme["surface"]};
+        background: transparent;
     }}
     QToolButton#SectionToggle {{
         text-align: left;
@@ -283,7 +409,7 @@ def build_app_stylesheet(theme_key: str) -> str:
         color: {theme["text_strong"]};
         border: 1px solid {theme["border"]};
         border-radius: 4px;
-        padding: 8px 10px;
+        padding: {metrics["section_pad_y"]}px {metrics["section_pad_x"]}px;
         font-weight: 600;
     }}
     QToolButton#SectionToggle:hover {{
@@ -301,7 +427,7 @@ def build_app_stylesheet(theme_key: str) -> str:
         background: {theme["field"]};
         border: 1px solid {theme["border_strong"]};
         border-radius: 4px;
-        padding: 6px 9px;
+        padding: {metrics["field_pad_y"]}px {metrics["field_pad_x"]}px;
         selection-background-color: {theme["accent"]};
         selection-color: #ffffff;
     }}
@@ -320,6 +446,7 @@ def build_app_stylesheet(theme_key: str) -> str:
         selection-color: {theme["text_strong"]};
     }}
     QListWidget, QTreeWidget {{
+        font-size: {table_size}px;
         background: {theme["field"]};
         border: 1px solid {theme["border_strong"]};
         border-radius: 4px;
@@ -333,7 +460,7 @@ def build_app_stylesheet(theme_key: str) -> str:
         background: transparent;
     }}
     QListWidget::item {{
-        padding: 4px 6px;
+        padding: {metrics["list_pad_y"] + 1}px {metrics["list_pad_x"]}px;
         border-radius: 3px;
     }}
     QListWidget::item:selected, QTreeWidget::item:selected {{
@@ -341,25 +468,26 @@ def build_app_stylesheet(theme_key: str) -> str:
         color: {theme["text_strong"]};
     }}
     QTreeWidget::item {{
-        padding: 3px 6px;
+        padding: {metrics["list_pad_y"]}px {metrics["list_pad_x"]}px;
     }}
     QLineEdit:focus, QPlainTextEdit:focus, QTextBrowser:focus, QComboBox:focus, QSpinBox:focus,
     QListWidget:focus, QTreeWidget:focus {{
         border: 1px solid {theme["accent"]};
     }}
     QHeaderView::section {{
+        font-size: {table_size}px;
         background: {theme["surface_alt"]};
         color: {theme["text_muted"]};
         border: none;
         border-right: 1px solid {theme["border"]};
-        padding: 6px 8px;
+        padding: {metrics["header_pad_y"]}px {metrics["header_pad_x"]}px;
     }}
     QPushButton {{
         background: {theme["button"]};
         border: 1px solid {theme["button_border"]};
         border-radius: 4px;
-        padding: 7px 12px;
-        min-height: 22px;
+        padding: {metrics["button_pad_y"]}px {metrics["button_pad_x"]}px;
+        min-height: {metrics["button_min_h"]}px;
     }}
     QPushButton:hover {{
         background: {theme["button_hover"]};
@@ -391,13 +519,14 @@ def build_app_stylesheet(theme_key: str) -> str:
         border-radius: 4px;
         background: {theme["field"]};
         text-align: center;
-        min-height: 24px;
+        min-height: {metrics["progress_min_h"]}px;
     }}
     QProgressBar::chunk {{
         border-radius: 3px;
         background: {theme["accent"]};
     }}
     QLabel#HintLabel {{
+        font-size: {hint_size}px;
         color: {theme["text_muted"]};
         background: transparent;
     }}
@@ -436,8 +565,8 @@ def build_app_stylesheet(theme_key: str) -> str:
     QTabBar::tab {{
         background: {theme["surface_alt"]};
         color: {theme["text_muted"]};
-        padding: 8px 14px 9px 14px;
-        min-height: 24px;
+        padding: {metrics["tab_pad_top"]}px {metrics["tab_pad_x"]}px {metrics["tab_pad_bottom"]}px {metrics["tab_pad_x"]}px;
+        min-height: {metrics["tab_min_h"]}px;
         border: 1px solid {theme["border"]};
         border-bottom: none;
         border-top-left-radius: 4px;

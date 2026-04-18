@@ -9,6 +9,32 @@ The format is intentionally simple:
 - `Fixed` for bug fixes
 - `Docs` for README, guide, or release-note changes
 
+## [0.6.5] - 2026-04-18
+
+### Added
+- Added persistent appearance controls for the whole app, including global font family, global font size, list/column font size, density, dedicated log/code font family, log/code font size, and optional bold emphasis for log/code views.
+- Added `Research > Archive Insights > Archive Files` preview/details support so selected archive DDS files can now be inspected in-place with the same preview/detail flow used by `Archive Browser`.
+- Expanded the archive-side DDS inspector with much richer metadata, including additional header flags, resource/cubemap/DX10 details, mip completeness, estimated surface bytes, hashes, and lower-level DDS header fields for deeper inspection.
+- Added simple `Texture Editor` grid visibility controls for color and opacity so the grid can stay readable on bright or low-contrast textures.
+- Added clearer ambiguous original selection during `Replace Assistant` auto-match when multiple archive DDS candidates share the same basename and no strong path context is available.
+
+### Changed
+- Refined the overall app UI to be denser and more coherent, with smaller controls, more consistent section headers, tighter spacing, better font application, and broader column autofit behavior when the app opens or appearance settings change.
+- Reworked the `Texture Editor` no-document layout into a narrower tools lane with a compact actions menu, smaller tool buttons, cleaner empty-state behavior, theme-aware icons, and less wasted screen space on smaller displays.
+- Improved workflow handoff behavior again so `Texture Editor -> Send to Texture Workflow` and `DDS To Workflow` make root-clear decisions at handoff time, stage the required source files more predictably, and keep the intended file focused when you move into `Texture Workflow`.
+- `Replace Assistant` queue and matching flows now use stronger path-aware `.png -> .dds` matching, clearer overflow handling in the queue columns, and better guidance when exact archive-path evidence is missing.
+- Research/archive-related preview panels, Archive Browser details, and section containers now share a more consistent presentation instead of mixing multiple header/box patterns that felt visually disconnected.
+
+### Fixed
+- Fixed a long list of workflow and review regressions across `Texture Workflow`, `Replace Assistant`, `Texture Editor`, `Compare`, `Research`, `Text Search`, and `Archive Browser`, including frozen or delayed preview handoff, fit-mode compare flicker, distorted compare previews, stale workflow root contents causing misleading compare lists, and several archive/preview UI stalls.
+- Fixed additional `Replace Assistant` stability issues around import, auto-match completion, preview refresh, post-build review, and post-worker cleanup so matching and package build flows no longer crash or lock up as easily.
+- Fixed classification/local-approval clarity issues so the app better distinguishes inferred roles from saved local approvals, routes workflow review to the correct DDS more reliably, and provides faster per-file local-save actions.
+- Fixed more `Texture Editor` issues around guide clearing, document metadata sizing, hidden tab close buttons, image/atlas action layout, light-theme tool icon visibility, grid visibility, and font consistency across the left and right editor panes.
+- Fixed several settings/runtime problems, including slow font-size stepping, typed font-size editing, missing imports and startup crashes, DDS-details exceptions, more accurate DDS surface estimates for arrays/cubemaps, and other late-cycle packaging/runtime errors.
+
+### Docs
+- Updated the README for `0.6.5`, refreshed the feature summary and screenshots, and replaced the old `docs/screenshots` set with current captures from the renamed and polished `Crimson Forge Toolkit` UI.
+
 ## [0.6.0] - 2026-04-16
 
 ### Added
